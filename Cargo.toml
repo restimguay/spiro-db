@@ -1,0 +1,25 @@
+[package]
+name = "spirodb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A fast embedded key-value storage engine, written from scratch in Rust"
+license = "MIT OR Apache-2.0"
+keywords = ["database", "key-value", "lsm", "storage", "embedded"]
+categories = ["database-implementations"]
+
+[[bin]]
+name = "spiro"
+path = "src/bin/spiro.rs"
+
+[[bin]]
+name = "spiro-server"
+path = "src/bin/spiro-server.rs"
+
+[[bin]]
+name = "spiro-bench"
+path = "src/bin/spiro-bench.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

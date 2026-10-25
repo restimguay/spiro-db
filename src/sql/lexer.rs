@@ -35,6 +35,12 @@ pub enum Token {
     Arrow,
     /// `->>`: a JSON member or element, as a value.
     LongArrow,
+    /// `~`, `~*`, `!~` and `!~*`: regular expression matches, the starred
+    /// ones ignoring case, the `!` ones negated.
+    Match {
+        negated: bool,
+        case_insensitive: bool,
+    },
     Eof,
 }
 
@@ -74,6 +80,10 @@ impl Token {
             Token::Concat => "||",
             Token::Arrow => "->",
             Token::LongArrow => "->>",
+            Token::Match { negated: false, case_insensitive: false } => "~",
+            Token::Match { negated: false, case_insensitive: true } => "~*",
+            Token::Match { negated: true, case_insensitive: false } => "!~",
+            Token::Match { negated: true, case_insensitive: true } => "!~*",
             _ => "",
         }
     }
@@ -242,6 +252,17 @@ pub fn tokenize(sql: &str) -> Result<Vec<Located>> {
                     ('=', Some('=')) => two(&mut lx, Token::Eq),
                     ('=', _) => Token::Eq,
                     ('!', Some('=')) => two(&mut lx, Token::NotEq),
+                    ('~', _) | ('!', Some('~')) => {
+                        let negated = c == '!';
+                        if negated {
+                            lx.bump();
+                        }
+                        let case_insensitive = lx.peek(0) == Some('*');
+                        if case_insensitive {
+                            lx.bump();
+                        }
+                        Token::Match { negated, case_insensitive }
+                    }
                     ('<', Some('=')) => two(&mut lx, Token::LtEq),
                     ('<', Some('>')) => two(&mut lx, Token::NotEq),
                     ('<', _) => Token::Lt,

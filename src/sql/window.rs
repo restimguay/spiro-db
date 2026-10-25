@@ -165,7 +165,7 @@ fn partition(
                             acc.add(aggregate, row(taken), env)?;
                             taken += 1;
                         }
-                        last = Some(acc.clone().finish());
+                        last = Some(acc.clone().finish()?);
                     }
                     out[part[i]] = last.clone().unwrap_or(Value::Null);
                 }
@@ -176,7 +176,7 @@ fn partition(
                     for j in lo..hi {
                         acc.add(aggregate, row(j), env)?;
                     }
-                    out[part[i]] = acc.finish();
+                    out[part[i]] = acc.finish()?;
                 }
             }
         }

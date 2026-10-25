@@ -12,7 +12,7 @@ use crate::error::{Error, Result, corruption};
 
 use super::ast::{
     AlterAction, CheckDef, ColumnDef, ConflictAction, CreateIndex, CreateTable, Delete, Expr, FkAction, ForeignKeyDef,
-    From, Insert, InsertSource, JoinKind, Select, SelectItem, SetOp, Statement, Update,
+    From, Insert, InsertSource, JoinKind, Select, SelectItem, SetOp, Statement, TableConstraint, Update,
 };
 use super::catalog::{self, Column, IndexSchema, ROW_PREFIX_LEN, TableSchema, ViewSchema};
 use super::datetime::{Kind, Moment};
@@ -23,8 +23,8 @@ use super::expr::{Accumulator, BExpr, Binder, Env, Scope};
 use super::integrity::{self, Child, ParentKey, Rules};
 use super::notify::MAX_PAYLOAD;
 use super::plan::{
-    Access, Compound, Derived, GroupPlan, JoinPlan, KeyBound, Recursive, SelectPlan, SortKey, TablePlan, choose_access,
-    index_covers, plan_from, plan_select,
+    Access, Compound, Derived, GroupPlan, JoinPlan, KeyBound, Recursive, SelectPlan, SortKey, TablePlan,
+    bind_statement_cte, choose_access, index_covers, plan_from, plan_select,
 };
 use super::txn::Txn;
 use super::value::{DataType, Value, sql_error};
@@ -113,6 +113,34 @@ pub fn execute(txn: &mut Txn, statement: &Statement, params: &[Value], plans: &P
             None => create_table(txn, create, &Binder { params, txn: None, outer: None, ctes: None }),
         },
         Statement::Truncate { tables, restart } => truncate(txn, tables, *restart),
+        Statement::With { ctes, body } => {
+            // Each part runs in turn, its rows readable by name in the
+            // parts after it and in the body.
+            let mut guards = Vec::with_capacity(ctes.len());
+            // Each part plans afresh: one statement's cache holds one plan.
+            for cte in ctes {
+                let rows = match execute(txn, &cte.statement, params, &PlanCache::default())? {
+                    QueryResult::Rows(rows) => rows,
+                    _ => return Err(sql_error(format!("WITH {} AS (...) must return rows: add RETURNING", cte.name))),
+                };
+                let columns = if cte.columns.is_empty() {
+                    rows.columns
+                } else if cte.columns.len() == rows.columns.len() {
+                    cte.columns.clone()
+                } else {
+                    return Err(sql_error(format!(
+                        "{} has {} columns, but {} names are given",
+                        cte.name,
+                        rows.columns.len(),
+                        cte.columns.len()
+                    )));
+                };
+                guards.push(bind_statement_cte(&cte.name, columns, rows.rows));
+            }
+            let result = execute(txn, body, params, &PlanCache::default());
+            drop(guards);
+            result
+        }
         Statement::DropTable { name, if_exists } => drop_table(txn, name, *if_exists),
         Statement::CreateIndex(create) => create_index(txn, create),
         Statement::AlterTable { table, action } => alter_table(txn, table, action, params),
@@ -382,7 +410,7 @@ fn index_rows(
                 row[c] = decode_key(&mut rest)?;
             }
         } else {
-            for _ in &index.columns {
+            for _ in 0..index.width() {
                 skip_key(&mut rest)?;
             }
         }
@@ -459,6 +487,7 @@ fn select_rows(txn: &Txn, plan: &Arc<SelectPlan>, env: &Env) -> Result<Rows> {
     let streaming = plan.grouping.is_none()
         && plan.windows.is_empty()
         && !plan.distinct
+        && plan.distinct_on.is_empty()
         && (plan.order_by.is_empty() || plan.presorted);
     let wanted = if streaming { limit.map(|l| l.saturating_add(offset)) } else { None };
 
@@ -489,6 +518,36 @@ fn select_rows(txn: &Txn, plan: &Arc<SelectPlan>, env: &Env) -> Result<Rows> {
             out.push(project(plan, row, env)?);
             return Ok(wanted.is_none_or(|n| out.len() < n));
         };
+        if let Some(sets) = &g.sets {
+            // A group for each grouping set, keyed by the set's number and
+            // its keys' values; the rest of the keys are NULL in it.
+            let n = g.keys.len() - 1;
+            let own = g.keys[..n].iter().map(|k| k.eval(row, env)).collect::<Result<Vec<_>>>()?;
+            for (s, set) in sets.iter().enumerate() {
+                key_bytes.clear();
+                key_values.clear();
+                encode_key(&mut key_bytes, &Value::Integer(s as i64));
+                let mut rolled_up = 0i64;
+                for (i, v) in own.iter().enumerate() {
+                    if set.contains(&i) {
+                        encode_key(&mut key_bytes, v);
+                        key_values.push(v.clone());
+                    } else {
+                        key_values.push(Value::Null);
+                        rolled_up |= 1 << (n - 1 - i);
+                    }
+                }
+                key_values.push(Value::Integer(rolled_up));
+                if !groups.contains_key(key_bytes.as_slice()) {
+                    groups.insert(key_bytes.clone(), (key_values.clone(), new_accumulators(g)));
+                }
+                let accumulators = &mut groups.get_mut(key_bytes.as_slice()).unwrap().1;
+                for (acc, aggregate) in accumulators.iter_mut().zip(&g.aggregates) {
+                    acc.add(aggregate, row, env)?;
+                }
+            }
+            return Ok(true);
+        }
         let accumulators = match &mut single {
             Some(accumulators) => accumulators,
             None => {
@@ -513,6 +572,21 @@ fn select_rows(txn: &Txn, plan: &Arc<SelectPlan>, env: &Env) -> Result<Rows> {
     if !batched {
         for_each_row(txn, plan, env, &mut visit)?;
     }
+    // A grouping set of no keys has its one group even without rows.
+    if let Some(g) = &plan.grouping
+        && let Some(sets) = &g.sets
+    {
+        let n = g.keys.len() - 1;
+        for (s, _) in sets.iter().enumerate().filter(|(_, set)| set.is_empty()) {
+            let mut key = Vec::new();
+            encode_key(&mut key, &Value::Integer(s as i64));
+            groups.entry(key).or_insert_with(|| {
+                let mut keys = vec![Value::Null; n];
+                keys.push(Value::Integer((1 << n) - 1));
+                (keys, new_accumulators(g))
+            });
+        }
+    }
 
     if plan.grouping.is_some() {
         let finished: Vec<(Vec<Value>, Vec<Accumulator>)> = if batched {
@@ -522,7 +596,9 @@ fn select_rows(txn: &Txn, plan: &Arc<SelectPlan>, env: &Env) -> Result<Rows> {
             single.map(|accumulators| (Vec::new(), accumulators)).into_iter().chain(groups.into_values()).collect()
         };
         for (mut row, accumulators) in finished {
-            row.extend(accumulators.into_iter().map(Accumulator::finish));
+            for accumulator in accumulators {
+                row.push(accumulator.finish()?);
+            }
             if let Some(having) = &plan.having
                 && !having.matches(&row, env)?
             {
@@ -568,6 +644,21 @@ fn finish(plan: &SelectPlan, mut out: Vec<(Vec<Value>, Vec<Value>)>, limit: Opti
                 }
             }
             std::cmp::Ordering::Equal
+        });
+    }
+    if !plan.distinct_on.is_empty() {
+        // The first row, in ORDER BY's order, of each set of values.
+        let mut seen = HashSet::new();
+        let at = plan.order_by.len();
+        out.retain(|(row, keys)| {
+            let mut key = Vec::new();
+            for (i, k) in plan.distinct_on.iter().enumerate() {
+                match k {
+                    SortKey::Output(c) => encode_key(&mut key, &row[*c]),
+                    SortKey::Expr(_) => encode_key(&mut key, &keys[at + i]),
+                }
+            }
+            seen.insert(key)
         });
     }
     let rows = out.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).map(|(row, _)| row).collect();
@@ -703,6 +794,7 @@ pub fn stream_plan(
     let streaming = plan.grouping.is_none()
         && plan.compound.is_none()
         && plan.windows.is_empty()
+        && plan.distinct_on.is_empty()
         && !plan.distinct
         && (plan.order_by.is_empty() || plan.presorted);
     if !streaming {
@@ -753,10 +845,13 @@ pub fn stream_plan(
 /// are taken out of `row` rather than copied.
 fn project(plan: &SelectPlan, row: &mut [Value], env: &Env) -> Result<(Vec<Value>, Vec<Value>)> {
     // Sort values first: they may read columns before any are moved out.
+    // DISTINCT ON's values follow ORDER BY's.
     let sort_values = plan
         .order_by
         .iter()
-        .map(|(key, _)| match key {
+        .map(|(key, _)| key)
+        .chain(&plan.distinct_on)
+        .map(|key| match key {
             SortKey::Expr(e) => e.eval(row, env),
             SortKey::Output(_) => Ok(Value::Null),
         })
@@ -1202,7 +1297,7 @@ fn create_table(txn: &mut Txn, create: &CreateTable, binder: &Binder) -> Result<
         if catalog::get_index(txn, &name)?.is_some() {
             return Err(sql_error(format!("index {name} already exists")));
         }
-        let index = IndexSchema { id: catalog::next_id(txn)?, name, table: table.name.clone(), columns, unique: true };
+        let index = IndexSchema::new(catalog::next_id(txn)?, name, table.name.clone(), columns, true);
         catalog::put_index(txn, &index);
     }
     Ok(QueryResult::Done("CREATE TABLE"))
@@ -1242,7 +1337,7 @@ fn alter_table(txn: &mut Txn, name: &str, action: &AlterAction, params: &[Value]
             table.checks.extend(def.checks.iter().cloned());
             if let Some(fk) = &def.references {
                 let mut uniques: Vec<Vec<usize>> =
-                    indexes.iter().filter(|i| i.unique).map(|i| i.columns.clone()).collect();
+                    indexes.iter().filter(|i| i.unique && i.is_plain()).map(|i| i.columns.clone()).collect();
                 uniques.extend(def.unique.then(|| vec![table.columns.len() - 1]));
                 let fk = foreign_key(txn, &table, &uniques, fk)?;
                 table.foreign_keys.push(fk);
@@ -1269,18 +1364,138 @@ fn alter_table(txn: &mut Txn, name: &str, action: &AlterAction, params: &[Value]
             if def.unique {
                 let column = table.columns.len() - 1;
                 let index_name = format!("{}_{}_key", table.name, def.name);
-                let index = IndexSchema {
-                    id: catalog::next_id(txn)?,
-                    name: index_name,
-                    table: table.name.clone(),
-                    columns: vec![column],
-                    unique: true,
-                };
+                let index =
+                    IndexSchema::new(catalog::next_id(txn)?, index_name, table.name.clone(), vec![column], true);
                 for (key, row) in &matching_rows(txn, &table, &Access::Scan, None, &Env::new(&[], Some(txn)))? {
                     add_index_entry(txn, &table, &index, row, &key[ROW_PREFIX_LEN..])?;
                 }
                 catalog::put_index(txn, &index);
             }
+        }
+        AlterAction::AddConstraint(constraint) => {
+            let rows = matching_rows(txn, &table, &Access::Scan, None, &Env::new(&[], Some(txn)))?;
+            match constraint {
+                TableConstraint::Check(check) => {
+                    validate_checks(&table, std::slice::from_ref(check))?;
+                    table.checks.push(check.clone());
+                }
+                TableConstraint::ForeignKey(fk) => {
+                    let uniques: Vec<Vec<usize>> =
+                        indexes.iter().filter(|i| i.unique && i.is_plain()).map(|i| i.columns.clone()).collect();
+                    let fk = foreign_key(txn, &table, &uniques, fk)?;
+                    table.foreign_keys.push(fk);
+                }
+                TableConstraint::Unique { name, columns } => {
+                    let positions = column_positions(&table, columns)?;
+                    let name = name.clone().unwrap_or_else(|| format!("{}_{}_key", table.name, columns.join("_")));
+                    if catalog::get_index(txn, &name)?.is_some() {
+                        return Err(sql_error(format!("index {name} already exists")));
+                    }
+                    let index = IndexSchema::new(catalog::next_id(txn)?, name, table.name.clone(), positions, true);
+                    for (key, row) in &rows {
+                        add_index_entry(txn, &table, &index, row, &key[ROW_PREFIX_LEN..])?;
+                    }
+                    catalog::put_index(txn, &index);
+                    return Ok(QueryResult::Done("ALTER TABLE"));
+                }
+            }
+            // Rows already there must satisfy it.
+            let rules = Rules::of(txn, &Arc::new(table.clone()))?;
+            for (_, row) in &rows {
+                rules.check(row)?;
+                rules.check_parents(txn, row)?;
+            }
+            catalog::put_table(txn, &table);
+        }
+        AlterAction::DropConstraint { name: constraint, if_exists } => {
+            if let Some(i) = (0..table.checks.len()).find(|&i| table.check_name(i) == *constraint) {
+                table.checks.remove(i);
+            } else if let Some(i) = (0..table.foreign_keys.len()).find(|&i| table.foreign_key_name(i) == *constraint) {
+                table.foreign_keys.remove(i);
+            } else if let Some(index) = indexes.iter().find(|i| i.unique && i.name == *constraint) {
+                delete_range(txn, catalog::index_range(index))?;
+                catalog::delete_index(txn, &index.name);
+                return Ok(QueryResult::Done("ALTER TABLE"));
+            } else if *constraint == format!("{}_pkey", table.name) {
+                return Err(sql_error("a table's primary key can't be dropped"));
+            } else if *if_exists {
+                return Ok(QueryResult::Done("ALTER TABLE"));
+            } else {
+                return Err(sql_error(format!("no such constraint on {}: {constraint}", table.name)));
+            }
+            catalog::put_table(txn, &table);
+        }
+        AlterAction::SetType { column, ty } => {
+            let c = position(&table, column)?;
+            if table.primary_key.contains(&c) {
+                return Err(sql_error(format!("column {column} is part of the primary key, so its type can't change")));
+            }
+            let referenced = catalog::children_of(txn, &table.name)?.iter().any(|child| {
+                child.foreign_keys.iter().any(|fk| fk.table == table.name && fk.references.contains(column))
+            });
+            if referenced || table.foreign_keys.iter().any(|fk| fk.columns.contains(column)) {
+                return Err(sql_error(format!("column {column} is part of a foreign key, so its type can't change")));
+            }
+            let rows = matching_rows(txn, &table, &Access::Scan, None, &Env::new(&[], Some(txn)))?;
+            table.columns[c].ty = *ty;
+            if let Some(default) = table.columns[c].default.take() {
+                table.columns[c].default = Some(default.cast(*ty)?);
+            }
+            // Every value converted, and indexes on the column rebuilt: their
+            // keys encode the old type.
+            let rebuilt: Vec<&Arc<IndexSchema>> = indexes.iter().filter(|i| i.columns.contains(&c)).collect();
+            for index in &rebuilt {
+                delete_range(txn, catalog::index_range(index))?;
+            }
+            let rules = Rules::of(txn, &Arc::new(table.clone()))?;
+            for (key, mut row) in rows {
+                row[c] = std::mem::replace(&mut row[c], Value::Null).cast(*ty)?;
+                rules.check(&row)?;
+                for index in &rebuilt {
+                    add_index_entry(txn, &table, index, &row, &key[ROW_PREFIX_LEN..])?;
+                }
+                txn.put(key, encode_row(&row));
+            }
+            catalog::put_table(txn, &table);
+        }
+        AlterAction::SetDefault { column, default } => {
+            let c = position(&table, column)?;
+            let (value, now) = match default {
+                None => (None, false),
+                Some(expr) => {
+                    let def = ColumnDef {
+                        name: column.clone(),
+                        ty: table.columns[c].ty,
+                        primary_key: false,
+                        not_null: false,
+                        unique: false,
+                        default: Some(expr.clone()),
+                        checks: Vec::new(),
+                        references: None,
+                    };
+                    column_default(&def, &Binder { params, txn: None, outer: None, ctes: None })?
+                }
+            };
+            table.columns[c].default = if now { None } else { value };
+            table.columns[c].default_now = now;
+            catalog::put_table(txn, &table);
+        }
+        AlterAction::SetNotNull { column, not_null } => {
+            let c = position(&table, column)?;
+            if !not_null && table.primary_key.contains(&c) {
+                return Err(sql_error(format!("column {column} is part of the primary key, so it must stay NOT NULL")));
+            }
+            if *not_null {
+                let rows = matching_rows(txn, &table, &Access::Scan, None, &Env::new(&[], Some(txn)))?;
+                if rows.iter().any(|(_, row)| row[c].is_null()) {
+                    return Err(Error::Constraint(format!(
+                        "column {}.{column} has NULLs, so it can't be NOT NULL",
+                        table.name
+                    )));
+                }
+            }
+            table.columns[c].not_null = *not_null;
+            catalog::put_table(txn, &table);
         }
         AlterAction::DropColumn(column) => {
             let c = position(&table, column)?;
@@ -1367,6 +1582,13 @@ fn alter_table(txn: &mut Txn, name: &str, action: &AlterAction, params: &[Value]
             for check in &mut table.checks {
                 rename_column_in(&mut check.expr, &table.name, from, to);
             }
+            for index in indexes.iter().filter(|i| !i.exprs.is_empty() || i.predicate.is_some()) {
+                let mut renamed = (**index).clone();
+                for e in renamed.exprs.iter_mut().chain(renamed.predicate.iter_mut()) {
+                    rename_column_in(e, &table.name, from, to);
+                }
+                catalog::put_index(txn, &renamed);
+            }
             let rename =
                 |names: &mut Vec<String>| names.iter_mut().filter(|n| *n == from).for_each(|n| *n = to.clone());
             for child in catalog::children_of(txn, &table.name)?.iter().filter(|c| c.name != table.name) {
@@ -1433,14 +1655,56 @@ fn create_index(txn: &mut Txn, create: &CreateIndex) -> Result<QueryResult> {
         return Err(sql_error(format!("index {} already exists", create.name)));
     }
     let table = catalog::require_table(txn, &create.table)?;
-    let columns = column_positions(&table, &create.columns)?;
-    let index = IndexSchema {
-        id: catalog::next_id(txn)?,
-        name: create.name.clone(),
-        table: table.name.clone(),
-        columns,
-        unique: create.unique,
+    // Plain columns make a column index; anything else an expression index.
+    let plain: Option<Vec<String>> = create
+        .parts
+        .iter()
+        .map(|p| match p {
+            Expr::Column { table: t, name } if t.as_deref().is_none_or(|t| t == table.name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut index = match plain {
+        Some(names) => {
+            let columns = column_positions(&table, &names)?;
+            IndexSchema::new(catalog::next_id(txn)?, create.name.clone(), table.name.clone(), columns, create.unique)
+        }
+        None => {
+            let mut columns = Vec::new();
+            for part in &create.parts {
+                part.walk(&mut |e| {
+                    if let Expr::Column { name, .. } = e
+                        && let Some(c) = table.column_index(name)
+                        && !columns.contains(&c)
+                    {
+                        columns.push(c);
+                    }
+                });
+            }
+            let mut index = IndexSchema::new(
+                catalog::next_id(txn)?,
+                create.name.clone(),
+                table.name.clone(),
+                columns,
+                create.unique,
+            );
+            index.exprs = create.parts.clone();
+            index
+        }
     };
+    index.predicate = create.predicate.clone();
+    for e in index.exprs.iter().chain(&index.predicate) {
+        let mut bad = None;
+        e.walk(&mut |e| {
+            if matches!(e, Expr::Param(_) | Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }) {
+                bad = Some(e.to_string());
+            }
+        });
+        if let Some(bad) = bad {
+            return Err(sql_error(format!("an index can't use {bad}")));
+        }
+    }
+    index.bind(&table)?;
     let rows = matching_rows(txn, &table, &Access::Scan, None, &Env::new(&[], Some(txn)))?;
     for (key, row) in &rows {
         add_index_entry(txn, &table, &index, row, &key[ROW_PREFIX_LEN..])?;
@@ -1470,6 +1734,10 @@ fn unique_violation(table: &TableSchema, columns: &[usize]) -> Error {
 }
 
 fn add_index_entry(txn: &mut Txn, table: &TableSchema, index: &IndexSchema, row: &[Value], pk: &[u8]) -> Result<()> {
+    // A partial index has entries only for the rows it covers.
+    if !index.holds(row) {
+        return Ok(());
+    }
     if index.unique {
         // As in standard SQL, NULLs never collide with each other.
         let values = index.values_of(row);
@@ -1792,6 +2060,9 @@ fn find_conflict(
         return Ok(Some((prepared.key.clone(), decode_row(&data, width)?)));
     }
     for index in checked {
+        if !index.holds(&prepared.row) {
+            continue;
+        }
         let values = index.values_of(&prepared.row);
         if values.iter().any(Value::is_null) {
             continue;
@@ -1805,7 +2076,7 @@ fn find_conflict(
         let Some(entry) = found else { continue };
         // The entry is the indexed values followed by the row's primary key.
         let mut rest = &entry[index.prefix().len()..];
-        for _ in &index.columns {
+        for _ in 0..index.width() {
             skip_key(&mut rest)?;
         }
         let mut key = table.row_prefix();
@@ -1924,7 +2195,7 @@ fn plan_upsert(
             columns.sort_unstable();
             columns == wanted
         };
-        let checked: Vec<_> = unique.filter(|i| same(&i.columns)).cloned().collect();
+        let checked: Vec<_> = unique.filter(|i| i.exprs.is_empty() && same(&i.columns)).cloned().collect();
         let check_key = !table.primary_key.is_empty() && same(&table.primary_key);
         if !check_key && checked.is_empty() {
             return Err(sql_error(format!(
@@ -1984,13 +2255,16 @@ fn insert_rows(txn: &mut Txn, insert: &Insert, params: &[Value], plans: &PlanCac
     let returning = !insert.returning.is_empty();
     let now = table.columns.iter().any(|c| c.default_now).then(Moment::now);
     let (mut count, mut returned, mut deferred) = (0, Vec::new(), Deferred::default());
-    let mut insert_one = |txn: &mut Txn, values: &mut dyn Iterator<Item = Result<Value>>, supplied: usize| {
+    // Each value, or `None` for DEFAULT.
+    let mut insert_one = |txn: &mut Txn, values: &mut dyn Iterator<Item = Result<Option<Value>>>, supplied: usize| {
         if supplied != columns.len() {
             return Err(sql_error(format!("{supplied} values supplied for {} columns", columns.len())));
         }
         let mut row: Vec<Value> = table.columns.iter().map(|c| c.default_value(now)).collect();
         for (&column, value) in columns.iter().zip(values) {
-            row[column] = value?;
+            if let Some(value) = value? {
+                row[column] = value;
+            }
         }
         let stored = match &upsert {
             None => write_row(txn, target, row, None, true, &mut deferred)?,
@@ -2026,10 +2300,13 @@ fn insert_rows(txn: &mut Txn, insert: &Insert, params: &[Value], plans: &PlanCac
     };
     match &insert.source {
         // Parameters and literals, by far the most common values, skip binding.
-        InsertSource::Values(rows) if rows.iter().flatten().all(|e| matches!(e, Expr::Param(_) | Expr::Literal(_))) => {
+        InsertSource::Values(rows)
+            if rows.iter().flatten().all(|e| matches!(e, Expr::Param(_) | Expr::Literal(_) | Expr::Default)) =>
+        {
             let value = |e: &Expr| match e {
-                Expr::Param(i) if *i < params.len() => Ok(params[*i].clone()),
-                Expr::Literal(v) => Ok(v.clone()),
+                Expr::Param(i) if *i < params.len() => Ok(Some(params[*i].clone())),
+                Expr::Literal(v) => Ok(Some(v.clone())),
+                Expr::Default => Ok(None),
                 e => Err(sql_error(format!("no value for {e}"))),
             };
             for exprs in rows {
@@ -2041,7 +2318,15 @@ fn insert_rows(txn: &mut Txn, insert: &Insert, params: &[Value], plans: &PlanCac
             let binder = Binder::new(params, txn);
             let values = rows
                 .iter()
-                .map(|exprs| exprs.iter().map(|e| binder.constant(e, "VALUES")).collect::<Result<Vec<_>>>())
+                .map(|exprs| {
+                    exprs
+                        .iter()
+                        .map(|e| match e {
+                            Expr::Default => Ok(None),
+                            e => binder.constant(e, "VALUES").map(Some),
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
                 .collect::<Result<Vec<_>>>()?;
             for row in values {
                 let supplied = row.len();
@@ -2052,7 +2337,7 @@ fn insert_rows(txn: &mut Txn, insert: &Insert, params: &[Value], plans: &PlanCac
             let plan = Arc::new(plan_select(txn, select, &Binder::new(params, txn))?);
             let rows = run_select(txn, &plan, params)?.rows;
             for row in &rows {
-                insert_one(txn, &mut row.iter().cloned().map(Ok), row.len())?;
+                insert_one(txn, &mut row.iter().cloned().map(|v| Ok(Some(v))), row.len())?;
             }
         }
     }

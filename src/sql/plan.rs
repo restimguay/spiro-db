@@ -51,7 +51,12 @@ pub enum Access {
 /// Whether `index` holds every column in `needed`: its own columns, plus the
 /// primary key that ends each entry. Such reads never touch the rows.
 pub fn index_covers(index: &IndexSchema, table: &TableSchema, needed: &[bool]) -> bool {
-    needed.iter().enumerate().all(|(c, &need)| !need || index.columns.contains(&c) || table.primary_key.contains(&c))
+    // An expression index's entries hold the expressions' values, not columns.
+    index.exprs.is_empty()
+        && needed
+            .iter()
+            .enumerate()
+            .all(|(c, &need)| !need || index.columns.contains(&c) || table.primary_key.contains(&c))
 }
 
 impl Access {
@@ -152,6 +157,30 @@ pub fn choose_access_enforcing(
     }
 
     let leading_equalities = |cols: &[usize]| cols.iter().take_while(|&&c| equal[c].is_some()).count();
+    // An index part's bound expression, moved to where the table's columns
+    // sit in the row.
+    let shifted = |e: &BExpr| {
+        let mut e = e.clone();
+        e.map_columns(&|c| c + offset);
+        e
+    };
+    // A partial index may be read only when WHERE asks for its rows.
+    let usable = |index: &IndexSchema| index.bound_predicate.as_ref().is_none_or(|p| conditions.contains(&shifted(p)));
+    // The value (and the condition supplying it) that pins part `k` of an index.
+    let part_equal = |index: &IndexSchema, k: usize| -> Option<(BExpr, usize)> {
+        let Some(part) = index.bound.get(k) else { return equal[index.columns[k]].clone() };
+        let part = shifted(part);
+        conditions.iter().enumerate().find_map(|(i, condition)| match condition {
+            BExpr::Binary(BinaryOp::Eq, left, right) if **left == part && known_early(right) => {
+                Some(((**right).clone(), i))
+            }
+            BExpr::Binary(BinaryOp::Eq, left, right) if **right == part && known_early(left) => {
+                Some(((**left).clone(), i))
+            }
+            _ => None,
+        })
+    };
+    let pinned_parts = |index: &IndexSchema| (0..index.width()).take_while(|&k| part_equal(index, k).is_some()).count();
     let values = |cols: &[usize]| cols.iter().map(|&c| equal[c].clone().unwrap().0).collect::<Vec<_>>();
     let sources = |cols: &[usize]| cols.iter().map(|&c| equal[c].as_ref().unwrap().1).collect::<Vec<_>>();
     // A condition is enforced only if every bound it supplied is used: a
@@ -173,17 +202,19 @@ pub fn choose_access_enforcing(
     // Prefer the index pinning the most columns; a fully pinned unique index wins ties.
     let best_index = indexes
         .iter()
+        .filter(|index| usable(index))
         .map(|index| {
-            let pinned = leading_equalities(&index.columns);
-            (2 * pinned + usize::from(index.unique && pinned == index.columns.len()), pinned, index)
+            let pinned = pinned_parts(index);
+            (2 * pinned + usize::from(index.unique && pinned == index.width()), pinned, index)
         })
         .filter(|&(_, pinned, _)| pinned > 0)
         .max_by_key(|&(score, ..)| score);
     if let Some((_, pinned, index)) = best_index
         && pinned >= pk_prefix
     {
-        let cols = &index.columns[..pinned];
-        return (Access::Index { index: index.clone(), values: values(cols) }, sources(cols));
+        let parts: Vec<(BExpr, usize)> = (0..pinned).map(|k| part_equal(index, k).expect("pinned")).collect();
+        let values = parts.iter().map(|(v, _)| v.clone()).collect();
+        return (Access::Index { index: index.clone(), values }, parts.into_iter().map(|(_, i)| i).collect());
     }
     if pk_prefix > 0 {
         return (Access::PrimaryKey(values(&pk[..pk_prefix])), sources(&pk[..pk_prefix]));
@@ -193,7 +224,7 @@ pub fn choose_access_enforcing(
     {
         return (Access::PrimaryKeyRange { lower: bound(&lower[c]), upper: bound(&upper[c]) }, range_sources(c));
     }
-    for index in indexes {
+    for index in indexes.iter().filter(|i| i.exprs.is_empty() && usable(i)) {
         let c = index.columns[0];
         if lower[c].is_some() || upper[c].is_some() {
             let access = Access::IndexRange { index: index.clone(), lower: bound(&lower[c]), upper: bound(&upper[c]) };
@@ -294,6 +325,10 @@ pub enum SortKey {
 pub struct GroupPlan {
     pub keys: Vec<BExpr>,
     pub aggregates: Vec<Aggregate>,
+    /// With ROLLUP, CUBE or GROUPING SETS: the keys (by position) of each
+    /// set. The last key is then a hidden column: a bit for each of the
+    /// others, set where the group rolled it up.
+    pub sets: Option<Vec<Vec<usize>>>,
 }
 
 pub struct SelectPlan {
@@ -312,6 +347,9 @@ pub struct SelectPlan {
     pub projection: Vec<BExpr>,
     pub columns: Vec<String>,
     pub distinct: bool,
+    /// DISTINCT ON's expressions: only the first row (in ORDER BY's order)
+    /// of each set of their values is kept.
+    pub distinct_on: Vec<SortKey>,
     pub order_by: Vec<(SortKey, Sort)>,
     /// Rows already arrive in ORDER BY order, so no sort is needed.
     pub presorted: bool,
@@ -451,7 +489,7 @@ fn bind_window(w: &Expr, bind: &mut dyn FnMut(&Expr) -> Result<BExpr>) -> Result
             WindowKind::NthValue
         }
         name if is_aggregate(name) => {
-            WindowKind::Aggregate(Aggregate::build(name, args, false, *star, filter.as_deref(), bind)?)
+            WindowKind::Aggregate(Aggregate::build(name, args, false, *star, filter.as_deref(), &[], bind)?)
         }
         _ => return Err(sql_error(format!("{name}() is not a window function"))),
     };
@@ -582,6 +620,7 @@ fn table_plan(
         }
         None => match binder.ctes.and_then(|ctes| ctes.find(&table.name)) {
             Some((columns, derived)) => Some((columns.to_vec(), derived.clone())),
+            None if let Some(found) = statement_cte(&table.name) => Some(found),
             None if catalog::get_table(txn, &table.name)?.is_none() => match catalog::get_view(txn, &table.name)? {
                 Some(view) => Some(plan_view(txn, &view, binder)?),
                 None => {
@@ -660,6 +699,7 @@ fn plan_compound(txn: &Txn, select: &Select, binder: &Binder) -> Result<SelectPl
         projection: Vec::new(),
         columns,
         distinct: false,
+        distinct_on: Vec::new(),
         order_by,
         presorted: false,
         limit: count(&select.limit, "LIMIT")?,
@@ -678,6 +718,8 @@ pub fn plan_from(txn: &Txn, from: &From, binder: &Binder) -> Result<(Arc<SelectP
     }
     let select = Select {
         distinct: false,
+        distinct_on: Vec::new(),
+        grouping_sets: None,
         items: vec![SelectItem::Wildcard],
         from: Some(from.clone()),
         filter: None,
@@ -697,6 +739,39 @@ pub fn plan_from(txn: &Txn, from: &From, binder: &Binder) -> Result<(Arc<SelectP
         scope.add_table(&plan.schema, &plan.binding);
     }
     Ok((Arc::new(plan), scope))
+}
+
+/// A WITH part's name, column names and rows.
+type NamedRows = (String, Vec<String>, Arc<Vec<Vec<Value>>>);
+
+thread_local! {
+    /// The rows of a writing WITH's parts, while its statement runs: each
+    /// part's name, column names and rows.
+    static STATEMENT_CTES: std::cell::RefCell<Vec<NamedRows>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Makes a WITH part's rows readable by name, until the guard is dropped.
+pub fn bind_statement_cte(name: &str, columns: Vec<String>, rows: Vec<Vec<Value>>) -> StatementCteGuard {
+    STATEMENT_CTES.with(|ctes| ctes.borrow_mut().push((name.to_string(), columns, Arc::new(rows))));
+    StatementCteGuard
+}
+
+/// Forgets the WITH part bound last when dropped.
+pub struct StatementCteGuard;
+
+impl Drop for StatementCteGuard {
+    fn drop(&mut self) {
+        STATEMENT_CTES.with(|ctes| ctes.borrow_mut().pop());
+    }
+}
+
+fn statement_cte(name: &str) -> Option<(Vec<String>, Derived)> {
+    STATEMENT_CTES.with(|ctes| {
+        let ctes = ctes.borrow();
+        let (_, columns, rows) = ctes.iter().rev().find(|(n, _, _)| n == name)?;
+        Some((columns.clone(), Derived::Rows(rows.clone())))
+    })
 }
 
 /// The most views a query may reach through other views.
@@ -950,7 +1025,7 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
         }
     };
 
-    let (grouping, having, mut projection, mut order_by, windows);
+    let (grouping, having, mut projection, mut order_by, windows, distinct_on);
     if aggregated {
         let mut g = Grouping::default();
         for key in &select.group_by {
@@ -963,6 +1038,22 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
             };
             g.keys.push(binder.bind(key, &scope, "GROUP BY")?);
         }
+        let sets = match &select.grouping_sets {
+            None => None,
+            Some(sets) => {
+                let n = g.keys.len();
+                let positions = sets
+                    .iter()
+                    .map(|set| {
+                        set.iter().map(|e| select.group_by.iter().position(|k| k == e).expect("in group_by")).collect()
+                    })
+                    .collect();
+                // The hidden column; a parameter number no query has, so no expression matches it.
+                g.keys.push(BExpr::Param(usize::MAX));
+                g.own_keys = Some(n);
+                Some(positions)
+            }
+        };
         projection = items.iter().map(|(e, _)| binder.bind_grouped(e, &scope, &mut g)).collect::<Result<Vec<_>>>()?;
         having = select.having.as_ref().map(|h| binder.bind_grouped(h, &scope, &mut g)).transpose()?;
         order_by = ordering
@@ -988,7 +1079,16 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
                 e.map_columns(&place);
             }
         }
-        grouping = Some(GroupPlan { keys: g.keys, aggregates: g.aggregates.into_iter().map(|(_, a)| a).collect() });
+        distinct_on = select
+            .distinct_on
+            .iter()
+            .map(|e| match output_reference(e)? {
+                Some(i) => Ok(SortKey::Output(i)),
+                None => Ok(SortKey::Expr(binder.bind_grouped(e, &scope, &mut g)?)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        grouping =
+            Some(GroupPlan { keys: g.keys, aggregates: g.aggregates.into_iter().map(|(_, a)| a).collect(), sets });
     } else {
         grouping = None;
         having = None;
@@ -1015,6 +1115,14 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
             .iter()
             .map(|w| bind_window(w, &mut |e| binder.bind(e, &scope, "OVER")))
             .collect::<Result<Vec<_>>>()?;
+        distinct_on = select
+            .distinct_on
+            .iter()
+            .map(|e| match output_reference(e)? {
+                Some(i) => Ok(SortKey::Output(i)),
+                None => Ok(SortKey::Expr(binder.bind(e, &output_scope, "DISTINCT ON")?)),
+            })
+            .collect::<Result<Vec<_>>>()?;
     }
 
     let count =
@@ -1025,7 +1133,12 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
     // A single-table scan in primary-key order already satisfies ORDER BY <pk>.
     let presorted = match (&base, &order_by[..]) {
         (Some(t), [(key, sort)])
-            if !sort.desc && joins.is_empty() && grouping.is_none() && !select.distinct && windows.is_empty() =>
+            if !sort.desc
+                && joins.is_empty()
+                && grouping.is_none()
+                && !select.distinct
+                && select.distinct_on.is_empty()
+                && windows.is_empty() =>
         {
             let sorted_column = match key {
                 SortKey::Output(i) => projection.get(*i),
@@ -1054,7 +1167,7 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
                     source_exprs.extend(aggregate.arg.iter().chain(&aggregate.filter));
                 }
             }
-            source_exprs.extend(order_by.iter().filter_map(|(k, _)| match k {
+            source_exprs.extend(order_by.iter().map(|(k, _)| k).chain(&distinct_on).filter_map(|k| match k {
                 SortKey::Expr(e) => Some(e),
                 SortKey::Output(_) => None,
             }));
@@ -1097,6 +1210,7 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
         projection,
         columns,
         distinct: select.distinct,
+        distinct_on,
         order_by,
         presorted,
         limit,

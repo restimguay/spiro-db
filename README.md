@@ -21,17 +21,17 @@ println!("{}", rows.to_json()); // [{"name":"Alan"}]
 **Statements**
 
 - `CREATE TABLE` (with `IF NOT EXISTS`), `CREATE TABLE name [(columns)] AS query`, `DROP TABLE` (with `IF EXISTS`) and `TRUNCATE [TABLE] name, ... [RESTART IDENTITY]`
-- `CREATE [UNIQUE] INDEX` and `DROP INDEX`, on one or more columns
+- `CREATE [UNIQUE] INDEX` and `DROP INDEX`, on columns or expressions (`ON users (lower(email))`), and partial (`... WHERE active`)
 - `CREATE [OR REPLACE] VIEW name [(columns)] AS query` and `DROP VIEW`
-- `ALTER TABLE ... ADD [COLUMN]`, `DROP [COLUMN]`, `RENAME [COLUMN] ... TO ...` and `RENAME TO`
-- `INSERT ... VALUES` (many rows at once) and `INSERT ... SELECT`
+- `ALTER TABLE ... ADD [COLUMN]`, `DROP [COLUMN]`, `RENAME [COLUMN] ... TO ...`, `RENAME TO`, `ADD [CONSTRAINT name] CHECK | FOREIGN KEY | UNIQUE`, `DROP CONSTRAINT [IF EXISTS] name`, and `ALTER [COLUMN] c TYPE t | SET DEFAULT e | DROP DEFAULT | SET NOT NULL | DROP NOT NULL`
+- `INSERT ... VALUES` (many rows at once, `DEFAULT` for a column's default), `INSERT ... SELECT` and `INSERT ... DEFAULT VALUES`
 - Upserts: `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`, plus SQLite's `INSERT OR IGNORE` and MySQL's `ON DUPLICATE KEY UPDATE`
 - `UPDATE` (with `FROM other tables`) and `DELETE` (with `USING other tables`), as in PostgreSQL
 - `RETURNING` on `INSERT`, `UPDATE` and `DELETE`
-- `SELECT` with `WHERE`, `[INNER | LEFT | RIGHT | FULL] [OUTER] JOIN ... ON | USING (columns)`, `NATURAL JOIN`, `CROSS JOIN`, `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY` and `LIMIT`/`OFFSET`
+- `SELECT` with `WHERE`, `[INNER | LEFT | RIGHT | FULL] [OUTER] JOIN ... ON | USING (columns)`, `NATURAL JOIN`, `CROSS JOIN`, `GROUP BY` (with `ROLLUP`, `CUBE`, `GROUPING SETS` and `grouping()`), `HAVING`, `DISTINCT`, `DISTINCT ON`, `ORDER BY` and `LIMIT`/`OFFSET`
 - `UNION [ALL]`, `INTERSECT [ALL]` and `EXCEPT [ALL]`, with `INTERSECT` binding first as in standard SQL; `ORDER BY` and `LIMIT` after them apply to the whole result
 - Subqueries: `(SELECT ...)` as a value, `[NOT] IN (SELECT ...)`, `[NOT] EXISTS (SELECT ...)`, and `FROM (SELECT ...) AS name [(columns)]`
-- `WITH name [(columns)] AS (query), ...` and `WITH RECURSIVE`
+- `WITH name [(columns)] AS (query), ...` and `WITH RECURSIVE`, and writes in `WITH` (`WITH gone AS (DELETE ... RETURNING *) INSERT INTO archive SELECT * FROM gone`)
 - `BEGIN`, `COMMIT`, `ROLLBACK`, and `SAVEPOINT`, `RELEASE [SAVEPOINT]`, `ROLLBACK TO [SAVEPOINT]`
 - `EXPLAIN`, which shows whether a query scans or uses a primary key or index
 
@@ -44,12 +44,14 @@ println!("{}", rows.to_json()); // [{"name":"Alan"}]
 **Expressions**
 
 - Arithmetic, comparisons and `||`, with SQL's three-valued `NULL` logic
-- `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN`, `[NOT] BETWEEN`, and `[NOT] LIKE`/`ILIKE`
+- `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN`, `[NOT] BETWEEN`, `[NOT] LIKE`/`ILIKE` (with `ESCAPE`), SQLite's `[NOT] GLOB`, and regular expressions: `~`, `~*`, `!~`, `!~*` and `[NOT] REGEXP`
 - Row values: `(a, b) = (1, 2)`, `(a, b) < (x, y)` in dictionary order, `(a, b) IN ((1, 2), ...)` and `(a, b) IN (SELECT x, y ...)`
 - `CASE`, `CAST`
-- Aggregates: `count(*)`, `count`, `sum`, `avg`, `min`, `max`, `total`, `group_concat`/`string_agg(x, sep)`, `bool_and`/`every`, `bool_or`, `variance`/`var_samp`, `var_pop`, `stddev`/`stddev_samp` and `stddev_pop`, each optionally with `DISTINCT` and `FILTER (WHERE ...)`
+- Aggregates: `count(*)`, `count`, `sum`, `avg`, `min`, `max`, `total`, `group_concat`/`string_agg(x, sep)`, `bool_and`/`every`, `bool_or`, `variance`/`var_samp`, `var_pop`, `stddev`/`stddev_samp` and `stddev_pop`, `median`, `percentile_cont`/`percentile_disc(f) WITHIN GROUP (ORDER BY x)`, and `array_agg` (as a JSON array, there being no array type), each optionally with `DISTINCT`, `FILTER (WHERE ...)` and an `ORDER BY` of its own (`string_agg(name, ', ' ORDER BY name)`)
 - Window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, and the aggregates, with `OVER (PARTITION BY ... ORDER BY ... [ROWS | RANGE frame])` and named windows (`WINDOW w AS (...)`)
 - Text functions: `lower`, `upper`, `length`, `octet_length`, `trim`/`ltrim`/`rtrim` (with optional characters, or `TRIM(LEADING 'x' FROM s)`), `substr` (or `SUBSTRING(s FROM a FOR n)`), `replace`, `strpos`/`instr` (or `POSITION(sub IN s)`), `concat`, `concat_ws`, `left`, `right`, `lpad`, `rpad`, `repeat`, `reverse`, `initcap`, `split_part`, `starts_with`, `ascii`, `chr`, `hex` and `to_hex`
+- Regular expressions: `regexp_like(s, pattern [, flags])`, `regexp_replace(s, pattern, replacement [, flags])` (`\1` for groups, flag `g` for every match), `regexp_substr` and `regexp_count`, with flag `i` for any case. The engine is written from scratch and runs in time linear in the text, whatever the pattern.
+- `printf`/`format`: C's conversions (`%d`, `%5.2f`, `%-10s`, `%x`, `%,d`, ...) and PostgreSQL's `%I`, `%L` and `%2$s`
 - Numeric functions: `abs`, `round`, `trunc`, `ceil`, `floor`, `sign`, `mod`, `sqrt`, `power`, `exp`, `ln`, `log`, `log10`, `log2`, `pi`, `random`, `degrees`, `radians` and the trigonometric functions
 - Other functions: `coalesce`/`ifnull`, `nullif`, `iif`, `greatest` and `least` (which pass over NULLs, as in PostgreSQL), and `typeof`
 - `ORDER BY ... [ASC | DESC] [NULLS FIRST | NULLS LAST]`, in queries and windows. By default NULLs sort below every value, as in SQLite.
@@ -66,6 +68,8 @@ WHERE EXISTS (SELECT 1 FROM orders WHERE user_id = u.id AND total > 100);
 A subquery that reads no outer column runs once per statement; a correlated one runs once per distinct set of outer values it reads. `IN (SELECT ...)` collects the subquery's values into a hash set, and follows SQL's rules for NULL: `x NOT IN (...)` is unknown when the subquery returns a NULL. A subquery used as a value must return one column and at most one row (no rows reads as NULL).
 
 **Common table expressions.** A `WITH` query can name those before it. `WITH RECURSIVE` runs `anchor UNION [ALL] recursive part`: the recursive part reads the rows the previous round added, until a round adds none. `UNION` drops rows already found, so walks over cyclic graphs end. Rows are produced as they are found, so a `LIMIT` stops even an endless query.
+
+A `WITH` part may also be an `INSERT`, `UPDATE` or `DELETE` with `RETURNING`, whose rows the later parts and the main statement read like a table. The parts run once each, in order, and each sees the changes of those before it. (PostgreSQL instead runs them all against one snapshot.) The whole statement is still atomic.
 
 ```sql
 WITH RECURSIVE chain AS (
@@ -96,7 +100,7 @@ SELECT name, depth FROM chain ORDER BY depth;
 
 A value made by a JSON function nests as JSON inside another (`json_object('tags', json_array(1, 2))`); other text becomes a JSON string.
 
-**Catalog tables** describe the database for tools and ORMs: `information_schema.tables`, `information_schema.columns` (with `data_type`, `is_nullable`, `column_default` and `is_primary_key`) and `information_schema.views`, and SQLite's `sqlite_master` (or `sqlite_schema`) with each table's, index's and view's `CREATE` statement. Tables can also be named as `main.name` or `public.name`.
+**Catalog tables** describe the database for tools and ORMs: `information_schema.tables`, `information_schema.columns` (with `data_type`, `is_nullable`, `column_default` and `is_primary_key`), `information_schema.views`, the keys in `information_schema.table_constraints`, `key_column_usage` (with MySQL's `referenced_table_name` and `referenced_column_name`), `referential_constraints` and `check_constraints`, and SQLite's `sqlite_master` (or `sqlite_schema`) with each table's, index's and view's `CREATE` statement. Tables can also be named as `main.name` or `public.name`.
 
 **Dates and times.** `DATE`, `TIME` and `TIMESTAMP` values are checked when stored and kept as ISO 8601 text in UTC: `2024-03-15`, `09:30:00`, `2024-03-15 09:30:00.25`. Input may use `T` instead of the space and end in `Z` or an offset such as `+02:00`, which is converted to UTC. These forms sort as text in time order, so comparisons, `ORDER BY`, `BETWEEN` and indexes need nothing special. Compare against literals in the same form (`at >= '2024-03-01'`).
 

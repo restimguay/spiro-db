@@ -51,6 +51,7 @@ const RESERVED: &[&str] = &[
     "OR",
     "ORDER",
     "OUTER",
+    "REGEXP",
     "RETURNING",
     "RIGHT",
     "SELECT",
@@ -95,6 +96,9 @@ fn compare_rows(op: BinaryOp, left: Vec<Expr>, right: Vec<Expr>) -> Option<Expr>
         _ => None,
     }
 }
+
+/// The sets of GROUP BY expressions that ROLLUP, CUBE and GROUPING SETS make.
+type GroupingSets = Vec<Vec<Expr>>;
 
 /// Whether `e` is an `INTERVAL '...'` literal.
 fn is_interval(e: &Expr) -> bool {
@@ -265,7 +269,8 @@ impl Parser<'_> {
         }
         let Token::Word(word) = self.peek() else { return Err(self.unexpected("a statement")) };
         match word.to_ascii_uppercase().as_str() {
-            "SELECT" | "WITH" => Ok(Statement::Select(Box::new(self.query()?))),
+            "SELECT" => Ok(Statement::Select(Box::new(self.query()?))),
+            "WITH" => self.with_statement(),
             "INSERT" => self.insert(),
             "UPDATE" => self.update(),
             "DELETE" => self.delete(),
@@ -361,6 +366,40 @@ impl Parser<'_> {
     /// A whole query: SELECTs combined with UNION, INTERSECT and EXCEPT,
     /// then ORDER BY, LIMIT and OFFSET for the result. INTERSECT binds more
     /// tightly than the other two, as in standard SQL.
+    /// A statement starting with WITH. Queries alone make a `Select`; an
+    /// INSERT, UPDATE or DELETE anywhere makes a `With`.
+    fn with_statement(&mut self) -> Result<Statement> {
+        let start = (self.pos, self.positional, self.params);
+        self.expect_kw("WITH")?;
+        let recursive = self.eat_kw("RECURSIVE");
+        let writes = |p: &Self| ["INSERT", "UPDATE", "DELETE"].iter().any(|kw| p.is_kw(kw));
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.ident()?;
+            let columns = if *self.peek() == Token::LParen { self.ident_list()? } else { Vec::new() };
+            self.expect_kw("AS")?;
+            self.expect(Token::LParen)?;
+            let statement = if writes(self) { self.statement()? } else { Statement::Select(Box::new(self.query()?)) };
+            self.expect(Token::RParen)?;
+            ctes.push(StatementCte { name, columns, statement });
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        let body = if writes(self) { self.statement()? } else { Statement::Select(Box::new(self.query()?)) };
+        let only_queries =
+            matches!(body, Statement::Select(_)) && ctes.iter().all(|c| matches!(c.statement, Statement::Select(_)));
+        if only_queries {
+            // As a query, which keeps WITH RECURSIVE and plans the parts together.
+            (self.pos, self.positional, self.params) = start;
+            return Ok(Statement::Select(Box::new(self.query()?)));
+        }
+        if recursive {
+            return Err(self.error("WITH RECURSIVE can't be used with INSERT, UPDATE or DELETE"));
+        }
+        Ok(Statement::With { ctes, body: Box::new(body) })
+    }
+
     fn query(&mut self) -> Result<Select> {
         if self.eat_kw("WITH") {
             let recursive = self.eat_kw("RECURSIVE");
@@ -449,8 +488,15 @@ impl Parser<'_> {
     /// A single SELECT, up to HAVING.
     fn select(&mut self) -> Result<Select> {
         self.expect_kw("SELECT")?;
-        let distinct = self.eat_kw("DISTINCT");
-        if !distinct {
+        let mut distinct = self.eat_kw("DISTINCT");
+        let mut distinct_on = Vec::new();
+        if distinct && self.eat_kw("ON") {
+            self.expect(Token::LParen)?;
+            distinct_on = self.expr_list()?;
+            self.expect(Token::RParen)?;
+            distinct = false;
+        }
+        if !distinct && distinct_on.is_empty() {
             self.eat_kw("ALL");
         }
         let mut items = vec![self.select_item()?];
@@ -460,9 +506,10 @@ impl Parser<'_> {
         let from = if self.eat_kw("FROM") { Some(self.from()?) } else { None };
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
         let mut group_by = Vec::new();
+        let mut grouping_sets = None;
         if self.eat_kw("GROUP") {
             self.expect_kw("BY")?;
-            group_by = self.expr_list()?;
+            (group_by, grouping_sets) = self.group_by()?;
         }
         let having = if self.eat_kw("HAVING") { Some(self.expr()?) } else { None };
         let mut windows = Vec::new();
@@ -478,6 +525,8 @@ impl Parser<'_> {
         }
         Ok(Select {
             distinct,
+            distinct_on,
+            grouping_sets,
             items,
             from,
             filter,
@@ -490,6 +539,85 @@ impl Parser<'_> {
             with: None,
             windows,
         })
+    }
+
+    /// GROUP BY's items: expressions, ROLLUP(...), CUBE(...) and GROUPING
+    /// SETS (...). Returns every expression once, and the sets to group by
+    /// if they aren't just all of them.
+    fn group_by(&mut self) -> Result<(Vec<Expr>, Option<GroupingSets>)> {
+        // A parenthesised list of expressions, possibly empty: (a, b) or ().
+        let set = |p: &mut Self| -> Result<Vec<Expr>> {
+            if !p.eat(&Token::LParen) {
+                return Ok(vec![p.expr()?]);
+            }
+            let items = if *p.peek() == Token::RParen { Vec::new() } else { p.expr_list()? };
+            p.expect(Token::RParen)?;
+            Ok(items)
+        };
+        let mut sets: Vec<Vec<Expr>> = vec![Vec::new()];
+        let mut special = false;
+        loop {
+            let choices: Vec<Vec<Expr>> =
+                if (self.is_kw("ROLLUP") || self.is_kw("CUBE")) && *self.peek_nth(1) == Token::LParen {
+                    special = true;
+                    let cube = self.eat_kw("CUBE");
+                    if !cube {
+                        self.advance();
+                    }
+                    self.expect(Token::LParen)?;
+                    let mut items = Vec::new();
+                    loop {
+                        items.push(set(self)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                    if cube {
+                        if items.len() > 12 {
+                            return Err(self.error("CUBE takes at most 12 items"));
+                        }
+                        // Every subset, the fullest first.
+                        let n = items.len();
+                        (0..1u32 << n)
+                            .rev()
+                            .map(|mask| {
+                                (0..n).filter(|i| mask >> (n - 1 - i) & 1 == 1).flat_map(|i| items[i].clone()).collect()
+                            })
+                            .collect()
+                    } else {
+                        (0..=items.len()).rev().map(|k| items[..k].concat()).collect()
+                    }
+                } else if self.is_kw("GROUPING") && self.is_kw_at(1, "SETS") {
+                    special = true;
+                    self.advance();
+                    self.advance();
+                    self.expect(Token::LParen)?;
+                    let mut choices = Vec::new();
+                    loop {
+                        choices.push(set(self)?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                    choices
+                } else {
+                    vec![vec![self.expr()?]]
+                };
+            // Each item multiplies the sets so far by its choices.
+            sets = sets.iter().flat_map(|s| choices.iter().map(move |c| [s.clone(), c.clone()].concat())).collect();
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        let mut all: Vec<Expr> = Vec::new();
+        for e in sets.iter().flatten() {
+            if !all.contains(e) {
+                all.push(e.clone());
+            }
+        }
+        Ok((all, special.then_some(sets)))
     }
 
     fn select_item(&mut self) -> Result<SelectItem> {
@@ -614,12 +742,29 @@ impl Parser<'_> {
         }
         self.expect_kw("INTO")?;
         let table = self.table_name()?;
-        let columns = if *self.peek() == Token::LParen { Some(self.ident_list()?) } else { None };
-        let source = if self.eat_kw("VALUES") {
+        let mut columns = if *self.peek() == Token::LParen { Some(self.ident_list()?) } else { None };
+        let source = if self.is_kw("DEFAULT") && self.is_kw_at(1, "VALUES") {
+            // DEFAULT VALUES: one row of defaults.
+            self.advance();
+            self.advance();
+            if columns.is_some() {
+                return Err(self.error("DEFAULT VALUES takes no column list"));
+            }
+            columns = Some(Vec::new());
+            InsertSource::Values(vec![Vec::new()])
+        } else if self.eat_kw("VALUES") {
             let mut rows = Vec::new();
             loop {
                 self.expect(Token::LParen)?;
-                rows.push(self.expr_list()?);
+                let mut row = Vec::new();
+                loop {
+                    // DEFAULT stands for the column's default.
+                    row.push(if self.eat_kw("DEFAULT") { Expr::Default } else { self.expr()? });
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                rows.push(row);
                 self.expect(Token::RParen)?;
                 if !self.eat(&Token::Comma) {
                     break;
@@ -766,8 +911,21 @@ impl Parser<'_> {
         let name = self.ident()?;
         self.expect_kw("ON")?;
         let table = self.table_name()?;
-        let columns = self.ident_list()?;
-        Ok(Statement::CreateIndex(CreateIndex { name, table, columns, unique, if_not_exists }))
+        self.expect(Token::LParen)?;
+        let mut parts = Vec::new();
+        loop {
+            parts.push(self.expr()?);
+            // Sort directions are accepted; entries are kept in ascending order.
+            if !self.eat_kw("ASC") {
+                self.eat_kw("DESC");
+            }
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(Token::RParen)?;
+        let predicate = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+        Ok(Statement::CreateIndex(CreateIndex { name, table, parts, predicate, unique, if_not_exists }))
     }
 
     fn create_table(&mut self) -> Result<Statement> {
@@ -855,12 +1013,63 @@ impl Parser<'_> {
         self.expect_kw("ALTER")?;
         self.expect_kw("TABLE")?;
         let table = self.table_name()?;
+        let constraint_ahead =
+            |p: &Self| ["CONSTRAINT", "CHECK", "FOREIGN", "UNIQUE", "PRIMARY"].iter().any(|kw| p.is_kw(kw));
         let action = if self.eat_kw("ADD") {
-            self.eat_kw("COLUMN");
-            AlterAction::AddColumn(self.column_def()?)
+            if constraint_ahead(self) {
+                let name = if self.eat_kw("CONSTRAINT") { Some(self.ident()?) } else { None };
+                if self.is_kw("CHECK") {
+                    AlterAction::AddConstraint(TableConstraint::Check(self.check(name)?))
+                } else if self.eat_kw("FOREIGN") {
+                    self.expect_kw("KEY")?;
+                    let columns = self.ident_list()?;
+                    AlterAction::AddConstraint(TableConstraint::ForeignKey(self.references(name, columns)?))
+                } else if self.eat_kw("UNIQUE") {
+                    AlterAction::AddConstraint(TableConstraint::Unique { name, columns: self.ident_list()? })
+                } else if self.is_kw("PRIMARY") {
+                    return Err(self.error("a table's primary key can't be changed"));
+                } else {
+                    return Err(self.unexpected("CHECK, FOREIGN KEY or UNIQUE"));
+                }
+            } else {
+                self.eat_kw("COLUMN");
+                AlterAction::AddColumn(Box::new(self.column_def()?))
+            }
         } else if self.eat_kw("DROP") {
+            if self.eat_kw("CONSTRAINT") {
+                let if_exists = self.if_exists()?;
+                AlterAction::DropConstraint { name: self.ident()?, if_exists }
+            } else {
+                self.eat_kw("COLUMN");
+                AlterAction::DropColumn(self.ident()?)
+            }
+        } else if self.eat_kw("ALTER") {
             self.eat_kw("COLUMN");
-            AlterAction::DropColumn(self.ident()?)
+            let column = self.ident()?;
+            if self.eat_kw("TYPE") {
+                AlterAction::SetType { column, ty: self.data_type()? }
+            } else if self.eat_kw("SET") {
+                if self.eat_kw("DATA") {
+                    self.expect_kw("TYPE")?;
+                    AlterAction::SetType { column, ty: self.data_type()? }
+                } else if self.eat_kw("DEFAULT") {
+                    AlterAction::SetDefault { column, default: Some(self.expr()?) }
+                } else {
+                    self.expect_kw("NOT")?;
+                    self.expect_kw("NULL")?;
+                    AlterAction::SetNotNull { column, not_null: true }
+                }
+            } else if self.eat_kw("DROP") {
+                if self.eat_kw("DEFAULT") {
+                    AlterAction::SetDefault { column, default: None }
+                } else {
+                    self.expect_kw("NOT")?;
+                    self.expect_kw("NULL")?;
+                    AlterAction::SetNotNull { column, not_null: false }
+                }
+            } else {
+                return Err(self.unexpected("TYPE, SET or DROP"));
+            }
         } else if self.eat_kw("RENAME") {
             if self.eat_kw("TO") {
                 AlterAction::RenameTable(self.ident()?)
@@ -871,7 +1080,7 @@ impl Parser<'_> {
                 AlterAction::RenameColumn { from, to: self.ident()? }
             }
         } else {
-            return Err(self.unexpected("ADD, DROP or RENAME"));
+            return Err(self.unexpected("ADD, DROP, ALTER or RENAME"));
         };
         Ok(Statement::AlterTable { table, action })
     }
@@ -1068,8 +1277,9 @@ impl Parser<'_> {
                 lhs = Expr::IsNull { expr: Box::new(lhs), negated };
                 continue;
             }
-            let negated = self.is_kw("NOT") && ["IN", "LIKE", "ILIKE", "BETWEEN"].iter().any(|kw| self.is_kw_at(1, kw));
-            if negated || ["IN", "LIKE", "ILIKE", "BETWEEN"].iter().any(|kw| self.is_kw(kw)) {
+            const INFIX: [&str; 7] = ["IN", "LIKE", "ILIKE", "BETWEEN", "GLOB", "REGEXP", "RLIKE"];
+            let negated = self.is_kw("NOT") && INFIX.iter().any(|kw| self.is_kw_at(1, kw));
+            if negated || INFIX.iter().any(|kw| self.is_kw(kw)) {
                 if P_CMP < min {
                     break;
                 }
@@ -1112,14 +1322,69 @@ impl Parser<'_> {
                     self.expect_kw("AND")?;
                     let high = Box::new(self.expr_bp(P_CMP + 1)?);
                     Expr::Between { expr, low, high, negated }
+                } else if self.is_kw("GLOB") || self.is_kw("REGEXP") || self.is_kw("RLIKE") {
+                    // x GLOB p is glob(p, x); x REGEXP p is regexp_like(x, p).
+                    let glob = self.eat_kw("GLOB");
+                    if !glob {
+                        self.advance();
+                    }
+                    let pattern = self.expr_bp(P_CMP + 1)?;
+                    let (name, args) =
+                        if glob { ("glob", vec![pattern, *expr]) } else { ("regexp_like", vec![*expr, pattern]) };
+                    let call = Expr::Function {
+                        name: name.into(),
+                        args,
+                        distinct: false,
+                        star: false,
+                        filter: None,
+                        order_by: Vec::new(),
+                    };
+                    if negated { Expr::Unary { op: UnaryOp::Not, expr: Box::new(call) } } else { call }
                 } else {
                     let case_insensitive = self.eat_kw("ILIKE");
                     if !case_insensitive {
                         self.expect_kw("LIKE")?;
                     }
                     let pattern = Box::new(self.expr_bp(P_CMP + 1)?);
-                    Expr::Like { expr, pattern, negated, case_insensitive }
+                    if self.eat_kw("ESCAPE") {
+                        let escape = self.expr_bp(P_CMP + 1)?;
+                        let fold = Expr::Literal(Value::Boolean(case_insensitive));
+                        let args = vec![*expr, *pattern, escape, fold];
+                        let call = Expr::Function {
+                            name: "like_escape".into(),
+                            args,
+                            distinct: false,
+                            star: false,
+                            filter: None,
+                            order_by: Vec::new(),
+                        };
+                        if negated { Expr::Unary { op: UnaryOp::Not, expr: Box::new(call) } } else { call }
+                    } else {
+                        Expr::Like { expr, pattern, negated, case_insensitive }
+                    }
                 };
+                continue;
+            }
+            // s ~ pattern, s ~* pattern, s !~ pattern, s !~* pattern
+            if let Token::Match { negated, case_insensitive } = *self.peek() {
+                if P_CMP < min {
+                    break;
+                }
+                self.advance();
+                let pattern = self.expr_bp(P_CMP + 1)?;
+                let mut args = vec![lhs, pattern];
+                if case_insensitive {
+                    args.push(Expr::Literal(Value::Text("i".into())));
+                }
+                let call = Expr::Function {
+                    name: "regexp_like".into(),
+                    args,
+                    distinct: false,
+                    star: false,
+                    filter: None,
+                    order_by: Vec::new(),
+                };
+                lhs = if negated { Expr::Unary { op: UnaryOp::Not, expr: Box::new(call) } } else { call };
                 continue;
             }
             // json -> key and json ->> key, binding as tightly as * and /.
@@ -1132,6 +1397,7 @@ impl Parser<'_> {
                     distinct: false,
                     star: false,
                     filter: None,
+                    order_by: Vec::new(),
                 };
                 continue;
             }
@@ -1169,6 +1435,7 @@ impl Parser<'_> {
                         distinct: false,
                         star: false,
                         filter: None,
+                        order_by: Vec::new(),
                     }
                 }
                 (op, Expr::Row(left), Expr::Row(right)) => compare_rows(op, left, right).ok_or_else(|| {
@@ -1295,6 +1562,7 @@ impl Parser<'_> {
                         distinct: false,
                         star: false,
                         filter: None,
+                        order_by: Vec::new(),
                     })
                 }
                 "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME"
@@ -1307,6 +1575,7 @@ impl Parser<'_> {
                         distinct: false,
                         star: false,
                         filter: None,
+                        order_by: Vec::new(),
                     })
                 }
                 // EXTRACT(field FROM time) is date_part('field', time).
@@ -1321,7 +1590,14 @@ impl Parser<'_> {
                     let time = self.expr()?;
                     self.expect(Token::RParen)?;
                     let args = vec![Expr::Literal(Value::Text(field)), time];
-                    Ok(Expr::Function { name: "date_part".into(), args, distinct: false, star: false, filter: None })
+                    Ok(Expr::Function {
+                        name: "date_part".into(),
+                        args,
+                        distinct: false,
+                        star: false,
+                        filter: None,
+                        order_by: Vec::new(),
+                    })
                 }
                 // MySQL's VALUES(column) in ON DUPLICATE KEY UPDATE.
                 "VALUES" if *self.peek_nth(1) == Token::LParen => {
@@ -1335,6 +1611,7 @@ impl Parser<'_> {
                         distinct: false,
                         star: false,
                         filter: None,
+                        order_by: Vec::new(),
                     })
                 }
                 _ if *self.peek_nth(1) == Token::LParen && !is_reserved(&word) => self.function(),
@@ -1371,6 +1648,7 @@ impl Parser<'_> {
             distinct: false,
             star: false,
             filter: None,
+            order_by: Vec::new(),
         };
         // Standard SQL's keyword forms: POSITION(sub IN s),
         // SUBSTRING(s FROM start FOR length), TRIM([LEADING | TRAILING | BOTH] [chars] FROM s).
@@ -1439,7 +1717,26 @@ impl Parser<'_> {
             }
             (args, distinct, false)
         };
+        // An aggregate's own ordering: string_agg(x, ',' ORDER BY y).
+        let mut order_by = Vec::new();
+        if self.eat_kw("ORDER") {
+            self.expect_kw("BY")?;
+            order_by = self.order_items()?;
+        }
         self.expect(Token::RParen)?;
+        // percentile_cont(0.5) WITHIN GROUP (ORDER BY x)
+        if self.is_kw("WITHIN") && self.is_kw_at(1, "GROUP") {
+            self.advance();
+            self.advance();
+            self.expect(Token::LParen)?;
+            self.expect_kw("ORDER")?;
+            self.expect_kw("BY")?;
+            if !order_by.is_empty() {
+                return Err(self.error("an aggregate can't have both ORDER BY and WITHIN GROUP"));
+            }
+            order_by = self.order_items()?;
+            self.expect(Token::RParen)?;
+        }
         let filter = if self.is_kw("FILTER") && *self.peek_nth(1) == Token::LParen {
             self.advance();
             self.advance();
@@ -1459,9 +1756,12 @@ impl Parser<'_> {
             } else {
                 WindowSpec { base: Some(self.ident()?), ..WindowSpec::default() }
             };
+            if !order_by.is_empty() {
+                return Err(self.error("ORDER BY inside a window function's arguments is not supported"));
+            }
             return Ok(Expr::Window { name, args, star, filter, over: Box::new(over) });
         }
-        Ok(Expr::Function { name, args, distinct, star, filter })
+        Ok(Expr::Function { name, args, distinct, star, filter, order_by })
     }
 
     /// `expr [ASC | DESC], ...` after ORDER BY.

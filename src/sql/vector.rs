@@ -70,8 +70,9 @@ pub fn applies(plan: &SelectPlan) -> bool {
     plan.base.is_some()
         && plan.joins.is_empty()
         && plan.grouping.as_ref().is_some_and(|g| {
+            g.sets.is_none() &&
             // json_group_array keeps the NULLs batches pass over.
-            g.aggregates.iter().all(|a| a.filter.is_none() && a.func != AggFunc::JsonArray)
+            g.aggregates.iter().all(|a| a.filter.is_none() && a.order.is_empty() && a.func != AggFunc::JsonArray)
         })
         && plan.is_simple()
 }

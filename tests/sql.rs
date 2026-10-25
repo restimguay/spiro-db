@@ -1441,7 +1441,7 @@ fn check_constraints() {
     run(&db, "INSERT INTO items (price, name) VALUES (NULL, NULL)");
     assert!(
         error(&db, "INSERT INTO items (price, name) VALUES (0, 'cup')")
-            .contains("CHECK constraint failed: items: price > 0")
+            .contains("CHECK constraint failed: items_price_check (price > 0)")
     );
     assert!(
         error(&db, "INSERT INTO items (price, qty, name) VALUES (1, -1, 'cup')")
@@ -2127,4 +2127,321 @@ fn scans_never_see_part_of_a_commit() {
     let transfers = writer.join().unwrap();
     assert!(scans > 10 && transfers > 10, "{scans} scans, {transfers} transfers");
     assert_eq!(query(&db, "SELECT sum(balance) FROM accounts"), rows![[200_000]]);
+}
+
+#[test]
+fn patterns_and_formatting() {
+    let (_dir, db) = open("patterns");
+    run(
+        &db,
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, email TEXT, phone TEXT);
+         INSERT INTO people (name, email, phone) VALUES
+             ('Ada Lovelace', 'ada@example.com', '555-1234'),
+             ('alan turing', 'alan@EXAMPLE.org', 'n/a'),
+             ('Grace_Hopper', 'grace@navy.mil', '(555) 987-6543')",
+    );
+    assert_eq!(query(&db, "SELECT id FROM people WHERE email ~ '@example\\.com$'"), rows![[1]]);
+    assert_eq!(query(&db, "SELECT id FROM people WHERE email ~* 'EXAMPLE' ORDER BY id"), rows![[1], [2]]);
+    assert_eq!(query(&db, "SELECT id FROM people WHERE email !~ 'example' ORDER BY id"), rows![[2], [3]]);
+    assert_eq!(
+        query(&db, "SELECT id FROM people WHERE regexp_like(phone, '\\d{3}-\\d{4}') ORDER BY id"),
+        rows![[1], [3]]
+    );
+    assert_eq!(query(&db, "SELECT id FROM people WHERE name REGEXP '^[A-Z]' ORDER BY id"), rows![[1], [3]]);
+    assert_eq!(query(&db, "SELECT id FROM people WHERE name NOT REGEXP '^[A-Z]'"), rows![[2]]);
+    assert_eq!(
+        query(
+            &db,
+            "SELECT regexp_replace(name, '(\\w+) (\\w+)', '\\2, \\1'), regexp_replace(phone, '\\d', '#', 'g'), regexp_substr(email, '[^@]+$'), regexp_count(phone, '\\d') FROM people WHERE id = 1"
+        ),
+        rows![["Lovelace, Ada", "###-####", "example.com", 7]]
+    );
+    assert_eq!(query(&db, "SELECT regexp_replace('aaa', 'a', 'b')"), rows![["baa"]]);
+    // GLOB is case-sensitive; LIKE ... ESCAPE matches the wildcard literally.
+    assert_eq!(query(&db, "SELECT id FROM people WHERE name GLOB '[A-Z]*' ORDER BY id"), rows![[1], [3]]);
+    assert_eq!(query(&db, "SELECT id FROM people WHERE name NOT GLOB '*ace*' ORDER BY id"), rows![[2]]);
+    assert_eq!(query(&db, "SELECT glob('*.txt', 'notes.txt'), glob('*.txt', 'notes.md')"), rows![[true, false]]);
+    assert_eq!(query(&db, "SELECT id FROM people WHERE name LIKE '%!_%' ESCAPE '!'"), rows![[3]]);
+    assert_eq!(query(&db, "SELECT count(*) FROM people WHERE name LIKE '%_%'"), rows![[3]]);
+    assert_eq!(
+        query(
+            &db,
+            "SELECT '10%' LIKE '10\\%' ESCAPE '\\', 'A_b' ILIKE 'a#_B' ESCAPE '#', '1x' NOT LIKE '1#%' ESCAPE '#'"
+        ),
+        rows![[true, true, true]]
+    );
+    // printf and format.
+    assert_eq!(
+        query(&db, "SELECT printf('%5.2f|%-4d|%04d|%s|%x|%%|%,d', 3.14159, 7, 42, 'hi', 255, 1234567)"),
+        rows![[" 3.14|7   |0042|hi|ff|%|1,234,567"]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT format('Hello %s, you are %s', 'Ada', 36), format('%I.%I = %L', 'Users', 'id', 'O''Brien'), format('%2$s %1$s', 'a', 'b'), format('%L', NULL)"
+        ),
+        rows![["Hello Ada, you are 36", "\"Users\".id = 'O''Brien'", "b a", "NULL"]]
+    );
+    assert!(error(&db, "SELECT 'a' ~ '('").contains("invalid regular expression"));
+    assert!(error(&db, "SELECT regexp_like('a', 'a', 'z')").contains("unknown flag"));
+}
+
+#[test]
+fn defaults_and_ordered_aggregates() {
+    let (_dir, db) = open("ordered-aggs");
+    run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT DEFAULT 'none', score INTEGER DEFAULT 0, name TEXT)");
+    run(&db, "INSERT INTO t DEFAULT VALUES; INSERT INTO t VALUES (DEFAULT, 'a', DEFAULT, 'x')");
+    assert_eq!(
+        query(&db, "SELECT id, grp, score, name FROM t ORDER BY id"),
+        rows![[1, "none", 0, NULL], [2, "a", 0, "x"]]
+    );
+    assert!(error(&db, "INSERT INTO t (id) DEFAULT VALUES").contains("no column list"));
+    assert!(error(&db, "SELECT DEFAULT").to_lowercase().contains("default"));
+    run(&db, "DELETE FROM t");
+    run(
+        &db,
+        "INSERT INTO t (grp, score, name) VALUES ('a', 30, 'cat'), ('a', 10, 'ann'), ('a', 20, 'bob'), ('b', 5, 'eve'), ('b', 15, 'dan')",
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT grp, string_agg(name, ',' ORDER BY score DESC), group_concat(name ORDER BY name), array_agg(score ORDER BY score)
+             FROM t GROUP BY grp ORDER BY grp"
+        ),
+        rows![["a", "cat,bob,ann", "ann,bob,cat", "[10,20,30]"], ["b", "dan,eve", "dan,eve", "[5,15]"]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT median(score), percentile_cont(0.25) WITHIN GROUP (ORDER BY score), percentile_disc(0.5) WITHIN GROUP (ORDER BY score),
+                    percentile_disc(0.5) WITHIN GROUP (ORDER BY score DESC) FROM t"
+        ),
+        rows![[15.0, 10.0, 15, 15]]
+    );
+    assert_eq!(
+        query(&db, "SELECT grp, median(score) FROM t GROUP BY grp ORDER BY grp"),
+        rows![["a", 20.0], ["b", 10.0]]
+    );
+    assert!(error(&db, "SELECT percentile_cont(2) WITHIN GROUP (ORDER BY score) FROM t").contains("fraction"));
+    assert!(error(&db, "SELECT upper(name ORDER BY id) FROM t").contains("only for aggregates"));
+}
+
+#[test]
+fn distinct_on_and_grouping_sets() {
+    let (_dir, db) = open("grouping-sets");
+    run(
+        &db,
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, product TEXT, amount INTEGER);
+         INSERT INTO sales (region, product, amount) VALUES
+             ('east', 'pen', 10), ('east', 'pen', 5), ('east', 'ink', 20), ('west', 'pen', 7), ('west', 'ink', 3)",
+    );
+    // DISTINCT ON keeps each region's first row in ORDER BY's order.
+    assert_eq!(
+        query(&db, "SELECT DISTINCT ON (region) region, product, amount FROM sales ORDER BY region, amount DESC"),
+        rows![["east", "ink", 20], ["west", "pen", 7]]
+    );
+    assert_eq!(
+        query(&db, "SELECT DISTINCT ON (1) region, count(*) FROM sales GROUP BY region, product ORDER BY 1, 2 DESC"),
+        rows![["east", 2], ["west", 1]]
+    );
+    // ROLLUP: per region and product, per region, and the grand total.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT region, product, sum(amount), grouping(region, product) FROM sales
+             GROUP BY ROLLUP (region, product) ORDER BY region NULLS LAST, product NULLS LAST"
+        ),
+        rows![
+            ["east", "ink", 20, 0],
+            ["east", "pen", 15, 0],
+            ["east", NULL, 35, 1],
+            ["west", "ink", 3, 0],
+            ["west", "pen", 7, 0],
+            ["west", NULL, 10, 1],
+            [NULL, NULL, 45, 3],
+        ]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT region, product, sum(amount) FROM sales GROUP BY CUBE (region, product) HAVING grouping(region) = 1 ORDER BY product NULLS FIRST"
+        ),
+        rows![[NULL, NULL, 45], [NULL, "ink", 23], [NULL, "pen", 22]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT region, product, count(*) FROM sales GROUP BY GROUPING SETS ((region), (product), ()) ORDER BY region, product"
+        ),
+        rows![[NULL, NULL, 5], [NULL, "ink", 2], [NULL, "pen", 3], ["east", NULL, 3], ["west", NULL, 2]]
+    );
+    // The empty set still has its row with no input.
+    assert_eq!(
+        query(&db, "SELECT region, count(*) FROM sales WHERE amount > 100 GROUP BY ROLLUP (region)"),
+        rows![[NULL, 0]]
+    );
+    assert!(error(&db, "SELECT grouping(amount) FROM sales GROUP BY ROLLUP (region)").contains("GROUP BY expressions"));
+}
+
+#[test]
+fn writes_in_with() {
+    let (_dir, db) = open("with-writes");
+    run(
+        &db,
+        "CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, done BOOLEAN);
+         CREATE TABLE archive (id INTEGER PRIMARY KEY, title TEXT);
+         INSERT INTO tasks VALUES (1, 'a', true), (2, 'b', false), (3, 'c', true)",
+    );
+    // Move finished tasks to the archive in one statement.
+    let moved = query(
+        &db,
+        "WITH gone AS (DELETE FROM tasks WHERE done RETURNING id, title) INSERT INTO archive SELECT * FROM gone RETURNING id",
+    );
+    assert_eq!(moved, rows![[1], [3]]);
+    assert_eq!(query(&db, "SELECT id FROM tasks"), rows![[2]]);
+    assert_eq!(query(&db, "SELECT id, title FROM archive ORDER BY id"), rows![[1, "a"], [3, "c"]]);
+    // A query part read by a write, and parts read by later parts.
+    run(
+        &db,
+        "WITH todo AS (SELECT id FROM tasks WHERE NOT done) UPDATE tasks SET title = upper(title) WHERE id IN (SELECT id FROM todo)",
+    );
+    assert_eq!(query(&db, "SELECT title FROM tasks"), rows![["B"]]);
+    assert_eq!(
+        query(
+            &db,
+            "WITH added AS (INSERT INTO tasks (id, title, done) VALUES (4, 'd', false), (5, 'e', false) RETURNING id),
+                  marked (n) AS (UPDATE tasks SET done = true WHERE id IN (SELECT id FROM added) RETURNING id)
+             SELECT count(*), sum(n) FROM marked"
+        ),
+        rows![[2, 9]]
+    );
+    assert_eq!(query(&db, "SELECT count(*) FROM tasks WHERE done"), rows![[2]]);
+    run(&db, "WITH src AS (SELECT 10 AS id, 'z' AS title) INSERT INTO archive SELECT * FROM src");
+    assert_eq!(query(&db, "SELECT title FROM archive WHERE id = 10"), rows![["z"]]);
+    assert!(error(&db, "WITH x AS (DELETE FROM tasks) SELECT 1").contains("RETURNING"));
+    // A failed statement undoes its earlier parts too.
+    assert!(error(&db, "WITH x AS (DELETE FROM tasks RETURNING id) INSERT INTO archive SELECT id, 'dup' FROM x UNION ALL SELECT 1, 'a'").contains("UNIQUE"));
+    assert_eq!(query(&db, "SELECT count(*) FROM tasks"), rows![[3]]);
+}
+
+#[test]
+fn more_alter_table() {
+    let (dir, db) = open("alter-more");
+    run(
+        &db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total TEXT, note TEXT);
+         INSERT INTO users VALUES (1, 'a@x'), (2, 'b@x');
+         INSERT INTO orders VALUES (1, 1, '10', NULL), (2, 2, '20.5', 'gift')",
+    );
+    // ADD / DROP CONSTRAINT, checking the rows already there.
+    run(&db, "ALTER TABLE orders ADD CONSTRAINT orders_user FOREIGN KEY (user_id) REFERENCES users");
+    assert!(error(&db, "INSERT INTO orders VALUES (3, 9, '1', NULL)").contains("orders_user"));
+    run(&db, "ALTER TABLE users ADD UNIQUE (email)");
+    assert!(error(&db, "INSERT INTO users VALUES (3, 'a@x')").contains("UNIQUE"));
+    assert!(error(&db, "ALTER TABLE orders ADD CHECK (note IS NOT NULL)").contains("CHECK"));
+    run(&db, "ALTER TABLE orders ADD CHECK (user_id > 0)");
+    assert!(error(&db, "INSERT INTO orders VALUES (3, 0, '1', NULL)").contains("orders_user_id_check"));
+    run(&db, "ALTER TABLE orders DROP CONSTRAINT orders_user_id_check; ALTER TABLE orders DROP CONSTRAINT orders_user");
+    run(&db, "ALTER TABLE users DROP CONSTRAINT users_email_key; ALTER TABLE users DROP CONSTRAINT IF EXISTS nope");
+    run(&db, "INSERT INTO orders VALUES (3, 9, '1', NULL); INSERT INTO users VALUES (3, 'a@x')");
+    assert!(error(&db, "ALTER TABLE users DROP CONSTRAINT nope").contains("no such constraint"));
+    // ALTER COLUMN: type, default and NOT NULL.
+    run(&db, "CREATE INDEX orders_total ON orders (total); ALTER TABLE orders ALTER COLUMN total TYPE REAL");
+    assert_eq!(query(&db, "SELECT id FROM orders WHERE total > 15"), rows![[2]]);
+    assert_eq!(query(&db, "SELECT id FROM orders WHERE total = 20.5"), rows![[2]]);
+    assert!(error(&db, "ALTER TABLE orders ALTER note TYPE INTEGER").contains("cannot cast"));
+    run(
+        &db,
+        "ALTER TABLE orders ALTER COLUMN note SET DEFAULT 'none'; INSERT INTO orders (id, user_id, total) VALUES (4, 1, 1)",
+    );
+    assert_eq!(query(&db, "SELECT note FROM orders WHERE id = 4"), rows![["none"]]);
+    run(&db, "ALTER TABLE orders ALTER note DROP DEFAULT; INSERT INTO orders (id, user_id, total) VALUES (5, 1, 1)");
+    assert_eq!(query(&db, "SELECT note FROM orders WHERE id = 5"), rows![[NULL]]);
+    assert!(error(&db, "ALTER TABLE orders ALTER note SET NOT NULL").contains("has NULLs"));
+    run(&db, "UPDATE orders SET note = '' WHERE note IS NULL; ALTER TABLE orders ALTER note SET NOT NULL");
+    assert!(error(&db, "INSERT INTO orders (id, user_id, total) VALUES (6, 1, 1)").contains("NOT NULL"));
+    run(&db, "ALTER TABLE orders ALTER note DROP NOT NULL");
+    assert!(error(&db, "ALTER TABLE orders ALTER id DROP NOT NULL").contains("primary key"));
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    let schema = db.schema("orders").unwrap().unwrap();
+    assert!(schema.contains("total REAL"), "{schema}");
+}
+
+#[test]
+fn expression_and_partial_indexes() {
+    let (dir, db) = open("expr-indexes");
+    run(
+        &db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, active BOOLEAN);
+         CREATE UNIQUE INDEX users_email_lower ON users (lower(email));
+         CREATE INDEX users_active_email ON users (email) WHERE active;
+         INSERT INTO users VALUES (1, 'Ada@X.org', true), (2, 'alan@x.org', false), (3, 'grace@x.org', true)",
+    );
+    // Uniqueness of the expression, and lookups through it.
+    assert!(error(&db, "INSERT INTO users VALUES (4, 'ADA@x.ORG', true)").contains("UNIQUE"));
+    assert_eq!(query(&db, "SELECT id FROM users WHERE lower(email) = 'ada@x.org'"), rows![[1]]);
+    let explain = format!("{:?}", query(&db, "EXPLAIN SELECT id FROM users WHERE lower(email) = 'ada@x.org'"));
+    assert!(explain.contains("users_email_lower"), "{explain}");
+    // A partial index serves queries that ask for its rows, and only those.
+    assert_eq!(query(&db, "SELECT id FROM users WHERE active AND email = 'grace@x.org'"), rows![[3]]);
+    let explain = format!("{:?}", query(&db, "EXPLAIN SELECT id FROM users WHERE active AND email = 'grace@x.org'"));
+    assert!(explain.contains("users_active_email"), "{explain}");
+    assert_eq!(query(&db, "SELECT id FROM users WHERE email = 'alan@x.org'"), rows![[2]]);
+    let explain = format!("{:?}", query(&db, "EXPLAIN SELECT id FROM users WHERE email = 'alan@x.org'"));
+    assert!(!explain.contains("users_active_email"), "{explain}");
+    // Entries follow updates in and out of the partial index.
+    run(&db, "UPDATE users SET active = true WHERE id = 2; UPDATE users SET active = false WHERE id = 3");
+    assert_eq!(query(&db, "SELECT id FROM users WHERE active AND email = 'alan@x.org'"), rows![[2]]);
+    assert_eq!(query(&db, "SELECT count(*) FROM users WHERE active AND email = 'grace@x.org'"), rows![[0]]);
+    // Survive a rename and a reopen.
+    run(&db, "ALTER TABLE users RENAME COLUMN email TO mail");
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    assert!(
+        db.schema("users").unwrap().unwrap().contains("CREATE UNIQUE INDEX users_email_lower ON users (lower(mail))")
+    );
+    assert!(error(&db, "INSERT INTO users VALUES (5, 'GRACE@x.org', false)").contains("UNIQUE"));
+    assert_eq!(query(&db, "SELECT id FROM users WHERE lower(mail) = 'alan@x.org'"), rows![[2]]);
+    assert!(error(&db, "CREATE INDEX bad ON users (id) WHERE id > (SELECT 1)").contains("can't use"));
+}
+
+#[test]
+fn key_catalog_tables() {
+    let (_dir, db) = open("key-catalog");
+    run(
+        &db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users ON DELETE CASCADE,
+             total REAL CHECK (total >= 0))",
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT table_name, constraint_name, constraint_type FROM information_schema.table_constraints ORDER BY table_name, constraint_name"
+        ),
+        rows![
+            ["orders", "orders_pkey", "PRIMARY KEY"],
+            ["orders", "orders_total_check", "CHECK"],
+            ["orders", "orders_user_id_fkey", "FOREIGN KEY"],
+            ["users", "users_email_key", "UNIQUE"],
+            ["users", "users_pkey", "PRIMARY KEY"],
+        ]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT constraint_name, column_name, referenced_table_name, referenced_column_name FROM information_schema.key_column_usage WHERE table_name = 'orders' ORDER BY 1"
+        ),
+        rows![["orders_pkey", "id", NULL, NULL], ["orders_user_id_fkey", "user_id", "users", "id"]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT constraint_name, unique_constraint_name, update_rule, delete_rule FROM information_schema.referential_constraints"
+        ),
+        rows![["orders_user_id_fkey", "users_pkey", "NO ACTION", "CASCADE"]]
+    );
+    assert_eq!(query(&db, "SELECT check_clause FROM information_schema.check_constraints"), rows![["total >= 0"]]);
 }

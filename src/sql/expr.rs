@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use super::ast::{BinaryOp, Expr, Select, UnaryOp, is_aggregate};
+use super::ast::{BinaryOp, Expr, OrderBy, Select, Sort, UnaryOp, is_aggregate};
 use super::catalog::TableSchema;
 use super::datetime::{self, Kind, Moment};
 use super::decimal::Decimal;
@@ -823,6 +823,12 @@ pub enum AggFunc {
     JsonArray,
     /// `json_group_object` and `json_object_agg`.
     JsonObject,
+    /// `percentile_cont(f) WITHIN GROUP (ORDER BY x)`, and `median(x)`:
+    /// interpolated between the values either side.
+    PercentileCont,
+    /// `percentile_disc(f) WITHIN GROUP (ORDER BY x)`: the first value at
+    /// or past the fraction.
+    PercentileDisc,
 }
 
 impl AggFunc {
@@ -841,7 +847,9 @@ impl AggFunc {
             "var_pop" => AggFunc::VarPop,
             "stddev" | "stddev_samp" => AggFunc::StddevSamp,
             "stddev_pop" => AggFunc::StddevPop,
-            "json_group_array" | "json_agg" => AggFunc::JsonArray,
+            "json_group_array" | "json_agg" | "array_agg" => AggFunc::JsonArray,
+            "percentile_cont" | "median" => AggFunc::PercentileCont,
+            "percentile_disc" => AggFunc::PercentileDisc,
             "json_group_object" | "json_object_agg" => AggFunc::JsonObject,
             _ => return None,
         })
@@ -858,6 +866,11 @@ pub struct Aggregate {
     pub filter: Option<BExpr>,
     /// What `group_concat` puts between values.
     pub separator: String,
+    /// `ORDER BY` inside the call: the order values are aggregated in.
+    pub order: Vec<(BExpr, Sort)>,
+    /// For a percentile: the fraction, and whether the values sort descending.
+    pub fraction: f64,
+    pub descending: bool,
 }
 
 impl Aggregate {
@@ -869,11 +882,48 @@ impl Aggregate {
         distinct: bool,
         star: bool,
         filter: Option<&Expr>,
+        order_by: &[OrderBy],
         bind: &mut dyn FnMut(&Expr) -> Result<BExpr>,
     ) -> Result<Aggregate> {
         let func = AggFunc::of(name).ok_or_else(|| sql_error(format!("{name}() is not an aggregate")))?;
         let filter = filter.map(&mut *bind).transpose()?;
-        let mut aggregate = Aggregate { func, arg: None, distinct, filter, separator: ",".into() };
+        let mut aggregate = Aggregate {
+            func,
+            arg: None,
+            distinct,
+            filter,
+            separator: ",".into(),
+            order: Vec::new(),
+            fraction: 0.5,
+            descending: false,
+        };
+        if matches!(func, AggFunc::PercentileCont | AggFunc::PercentileDisc) {
+            // percentile_cont(f) WITHIN GROUP (ORDER BY x), or median(x).
+            let (arg, desc) = match (name, args, order_by) {
+                ("median", [x], []) => (x, false),
+                (_, [fraction], [order]) if name != "median" => {
+                    let f = match fraction {
+                        Expr::Literal(v) => v.as_f64(),
+                        _ => None,
+                    };
+                    aggregate.fraction = f.filter(|f| (0.0..=1.0).contains(f)).ok_or_else(|| {
+                        sql_error(format!("{name}() needs a fraction from 0 to 1, written as a number"))
+                    })?;
+                    (&order.expr, order.desc)
+                }
+                _ => {
+                    return Err(sql_error(format!(
+                        "{name}() is written {name}(fraction) WITHIN GROUP (ORDER BY value)"
+                    )));
+                }
+            };
+            aggregate.arg = Some(bind(arg)?);
+            aggregate.descending = desc;
+            return Ok(aggregate);
+        }
+        for o in order_by {
+            aggregate.order.push((bind(&o.expr)?, o.sort()));
+        }
         if star {
             return match func {
                 AggFunc::Count if !distinct => Ok(aggregate),
@@ -916,6 +966,9 @@ impl Aggregate {
 #[derive(Default)]
 pub struct Grouping {
     pub keys: Vec<BExpr>,
+    /// With grouping sets: how many of `keys` are the query's own, the
+    /// rest being the hidden column of which keys each group rolled up.
+    pub own_keys: Option<usize>,
     /// Each aggregate with the expression it came from, so repeats are shared.
     pub aggregates: Vec<(Expr, Aggregate)>,
 }
@@ -1026,19 +1079,48 @@ impl<'a> Binder<'a> {
                 return Ok(Some(BExpr::Column(i)));
             }
             match e {
-                Expr::Function { name, args, distinct, star, filter } if is_aggregate(name) => {
+                Expr::Function { name, args, distinct, star, filter, order_by } if is_aggregate(name) => {
                     let position = match grouping.aggregates.iter().position(|(seen, _)| seen == e) {
                         Some(j) => j,
                         None => {
-                            let aggregate =
-                                Aggregate::build(name, args, *distinct, *star, filter.as_deref(), &mut |e| {
-                                    self.bind(e, scope, "an aggregate's argument")
-                                })?;
+                            let aggregate = Aggregate::build(
+                                name,
+                                args,
+                                *distinct,
+                                *star,
+                                filter.as_deref(),
+                                order_by,
+                                &mut |e| self.bind(e, scope, "an aggregate's argument"),
+                            )?;
                             grouping.aggregates.push((e.clone(), aggregate));
                             grouping.aggregates.len() - 1
                         }
                     };
                     Ok(Some(BExpr::Column(group_keys + position)))
+                }
+                // GROUPING(a, b): a bit for each key, set when the group rolled it up.
+                Expr::Function { name, args, .. } if name == "grouping" => {
+                    let Some(n) = grouping.own_keys else { return Ok(Some(BExpr::Literal(Value::Integer(0)))) };
+                    let mask = || Box::new(BExpr::Column(n));
+                    let int = |i: i64| Box::new(BExpr::Literal(Value::Integer(i)));
+                    let mut total: Option<BExpr> = None;
+                    for (j, arg) in args.iter().enumerate() {
+                        let bound = self.bind(arg, scope, "GROUPING")?;
+                        let k = grouping.keys[..n].iter().position(|key| *key == bound).ok_or_else(|| {
+                            sql_error(format!("GROUPING() arguments must be GROUP BY expressions, not {arg}"))
+                        })?;
+                        let bit = BExpr::Binary(
+                            BinaryOp::Rem,
+                            Box::new(BExpr::Binary(BinaryOp::Div, mask(), int(1 << (n - 1 - k)))),
+                            int(2),
+                        );
+                        let weighted = BExpr::Binary(BinaryOp::Mul, Box::new(bit), int(1 << (args.len() - 1 - j)));
+                        total = Some(match total {
+                            None => weighted,
+                            Some(t) => BExpr::Binary(BinaryOp::Add, Box::new(t), Box::new(weighted)),
+                        });
+                    }
+                    Ok(Some(total.ok_or_else(|| sql_error("GROUPING() needs at least one argument"))?))
                 }
                 // A window function's value, placed after the group's row later.
                 Expr::Column { table: Some(table), name } if table == WINDOW_TABLE => {
@@ -1098,9 +1180,10 @@ impl<'a> Binder<'a> {
             Expr::Like { expr, pattern, negated, case_insensitive } => {
                 BExpr::Like(sub(expr)?, sub(pattern)?, *negated, *case_insensitive)
             }
-            Expr::Function { name, args, distinct, star, filter } => {
-                if filter.is_some() {
-                    return Err(sql_error(format!("FILTER is only for aggregates, not {name}()")));
+            Expr::Function { name, args, distinct, star, filter, order_by } => {
+                if filter.is_some() || !order_by.is_empty() {
+                    let what = if filter.is_some() { "FILTER" } else { "ORDER BY in the arguments" };
+                    return Err(sql_error(format!("{what} is only for aggregates, not {name}()")));
                 }
                 if *star || *distinct {
                     return Err(sql_error(format!(
@@ -1131,6 +1214,7 @@ impl<'a> Binder<'a> {
             }
             Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => unreachable!("bound above"),
             Expr::Row(_) => return Err(sql_error("a row value can only be compared, or tested with IN")),
+            Expr::Default => return Err(sql_error("DEFAULT can only be a value in INSERT ... VALUES")),
             Expr::Window { name, .. } => {
                 return Err(sql_error(format!(
                     "window function {name}() is allowed only in the select list and ORDER BY, and not inside another"
@@ -1139,6 +1223,9 @@ impl<'a> Binder<'a> {
         })
     }
 }
+
+/// A value with the sort keys it is ordered by.
+type Keyed = (Vec<Value>, Value);
 
 /// A value given to `bool_and` or `bool_or`.
 fn boolean(value: &Value, name: &str) -> Result<bool> {
@@ -1154,6 +1241,9 @@ pub struct Accumulator {
     state: State,
     /// Values already counted, for DISTINCT aggregates.
     seen: Option<HashSet<Vec<u8>>>,
+    /// For an aggregate with its own ORDER BY: the rows, each value with its
+    /// sort keys, aggregated in order when the group is done.
+    ordered: Option<(Vec<Sort>, Vec<Keyed>)>,
 }
 
 #[derive(Clone)]
@@ -1180,6 +1270,13 @@ enum State {
     },
     JsonArray(Vec<crate::json::Json>),
     JsonObject(Vec<(String, crate::json::Json)>),
+    /// The values for a percentile, sorted when it is worked out.
+    Percentile {
+        cont: bool,
+        fraction: f64,
+        descending: bool,
+        values: Vec<Value>,
+    },
 }
 
 impl Accumulator {
@@ -1196,15 +1293,28 @@ impl Accumulator {
             AggFunc::BoolOr => State::BoolOr(None),
             AggFunc::JsonArray => State::JsonArray(Vec::new()),
             AggFunc::JsonObject => State::JsonObject(Vec::new()),
+            AggFunc::PercentileCont | AggFunc::PercentileDisc => State::Percentile {
+                cont: aggregate.func == AggFunc::PercentileCont,
+                fraction: aggregate.fraction,
+                descending: aggregate.descending,
+                values: Vec::new(),
+            },
             func => State::Variance { func, n: 0, mean: 0.0, m2: 0.0 },
         };
-        Accumulator { state, seen: aggregate.distinct.then(HashSet::new) }
+        let ordered = (!aggregate.order.is_empty() && aggregate.arg.is_some())
+            .then(|| (aggregate.order.iter().map(|(_, sort)| *sort).collect(), Vec::new()));
+        Accumulator { state, seen: aggregate.distinct.then(HashSet::new), ordered }
     }
 
     pub fn add(&mut self, aggregate: &Aggregate, row: &[Value], env: &Env) -> Result<()> {
         if let Some(filter) = &aggregate.filter
             && !filter.matches(row, env)?
         {
+            return Ok(());
+        }
+        if let (Some((_, rows)), Some(arg)) = (&mut self.ordered, &aggregate.arg) {
+            let keys = aggregate.order.iter().map(|(e, _)| e.eval(row, env)).collect::<Result<Vec<_>>>()?;
+            rows.push((keys, arg.eval(row, env)?));
             return Ok(());
         }
         match &aggregate.arg {
@@ -1478,6 +1588,10 @@ impl Accumulator {
                 *any = Some(any.unwrap_or(false) || b);
             }
             State::JsonArray(_) => unreachable!("handled above"),
+            State::Percentile { values, .. } => {
+                numeric(&value, "percentile")?;
+                values.push(value.into_owned());
+            }
             State::JsonObject(fields) => {
                 let pair = crate::json::Json::parse(&value.to_string()).ok();
                 match pair.as_ref().and_then(|p| p.as_array()) {
@@ -1533,6 +1647,7 @@ impl Accumulator {
             }
             (State::Total(a), State::Total(b)) => *a += b,
             (State::JsonArray(a), State::JsonArray(b)) => a.extend(b),
+            (State::Percentile { values: a, .. }, State::Percentile { values: b, .. }) => a.extend(b),
             (State::JsonObject(a), State::JsonObject(b)) => a.extend(b),
             (State::Concat(separator, a), State::Concat(_, Some(b))) => match a {
                 Some(a) => {
@@ -1556,8 +1671,17 @@ impl Accumulator {
         Ok(())
     }
 
-    pub fn finish(self) -> Value {
-        match self.state {
+    pub fn finish(mut self) -> Result<Value> {
+        if let Some((sorts, mut rows)) = self.ordered.take() {
+            rows.sort_by(|(a, _), (b, _)| {
+                let keys = a.iter().zip(b).zip(&sorts);
+                keys.map(|((x, y), sort)| sort.compare(x, y)).find(|o| o.is_ne()).unwrap_or(Ordering::Equal)
+            });
+            for (_, value) in rows {
+                self.add_value(Cow::Owned(value))?;
+            }
+        }
+        Ok(match self.state {
             State::Count(n) => Value::Integer(n),
             State::Avg(_, 0) => Value::Null,
             State::Avg(sum, n) => Value::Real(sum / n as f64),
@@ -1572,7 +1696,7 @@ impl Accumulator {
                 let sample = matches!(func, AggFunc::VarSamp | AggFunc::StddevSamp);
                 let divisor = if sample { n - 1 } else { n };
                 if divisor <= 0 {
-                    return Value::Null;
+                    return Ok(Value::Null);
                 }
                 let variance = m2 / divisor as f64;
                 match func {
@@ -1580,7 +1704,24 @@ impl Accumulator {
                     _ => Value::Real(variance),
                 }
             }
-        }
+            State::Percentile { cont, fraction, descending, mut values } => {
+                if values.is_empty() {
+                    return Ok(Value::Null);
+                }
+                values.sort_by(|a, b| if descending { b.total_cmp(a) } else { a.total_cmp(b) });
+                if cont {
+                    // Between the values either side of fraction * (n - 1), as PostgreSQL does.
+                    let at = fraction * (values.len() - 1) as f64;
+                    let (low, high) = (at.floor() as usize, at.ceil() as usize);
+                    let (a, b) = (values[low].as_f64().unwrap_or(0.0), values[high].as_f64().unwrap_or(0.0));
+                    Value::Real(a + (b - a) * (at - low as f64))
+                } else {
+                    // The first value whose position reaches the fraction.
+                    let at = ((fraction * values.len() as f64).ceil() as usize).clamp(1, values.len()) - 1;
+                    values.swap_remove(at)
+                }
+            }
+        })
     }
 }
 

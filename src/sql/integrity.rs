@@ -58,7 +58,8 @@ impl ParentKey {
         if let Some(order) = order(&parent.primary_key) {
             return Some((ParentKey::Primary, order));
         }
-        indexes.iter().filter(|i| i.unique).find_map(|i| order(&i.columns).map(|o| (ParentKey::Unique(i.clone()), o)))
+        let unique = indexes.iter().filter(|i| i.unique && i.is_plain());
+        unique.clone().find_map(|i| order(&i.columns).map(|o| (ParentKey::Unique(i.clone()), o)))
     }
 
     fn columns<'a>(&'a self, table: &'a TableSchema) -> &'a [usize] {
@@ -99,10 +100,11 @@ impl Rules {
         }
         let binder = Binder { params: &[], txn: None, outer: None, ctes: None };
         let scope = Scope::of_table(table, &table.name);
-        for check in &table.checks {
+        for (i, check) in table.checks.iter().enumerate() {
+            // Unnamed checks go by the name ALTER TABLE ... DROP CONSTRAINT takes.
             let label = match &check.name {
                 Some(name) => name.clone(),
-                None => format!("{}: {}", table.name, check.expr),
+                None => format!("{} ({})", table.check_name(i), check.expr),
             };
             rules.checks.push((label, binder.bind(&check.expr, &scope, "CHECK")?));
         }
@@ -235,13 +237,15 @@ impl Child {
                 rows.push((key.to_vec(), decode_row(data, width)?));
                 Ok(true)
             })?;
-        } else if let Some((index, values)) = self.indexes.iter().find_map(|i| leading(&i.columns).map(|v| (i, v))) {
+        } else if let Some((index, values)) =
+            self.indexes.iter().filter(|i| i.is_plain()).find_map(|i| leading(&i.columns).map(|v| (i, v)))
+        {
             let (lower, upper) = catalog::values_range(index, &values);
             let mut keys = Vec::new();
             txn.scan(lower, upper, &mut |entry, _| {
                 // The entry is the indexed values followed by the row's primary key.
                 let mut rest = &entry[index.prefix().len()..];
-                for _ in &index.columns {
+                for _ in 0..index.width() {
                     skip_key(&mut rest)?;
                 }
                 let mut key = table.row_prefix();

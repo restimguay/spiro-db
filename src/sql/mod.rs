@@ -38,6 +38,7 @@ mod lexer;
 mod notify;
 mod parser;
 mod plan;
+mod regex;
 pub(crate) mod repl;
 mod system;
 mod txn;

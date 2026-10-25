@@ -21,9 +21,10 @@ use std::sync::{Arc, RwLock};
 use crate::coding::{Reader, put_bytes, put_varint};
 use crate::error::{Result, corruption};
 
-use super::ast::{CheckDef, FkAction, ForeignKeyDef, Select};
+use super::ast::{CheckDef, Expr, FkAction, ForeignKeyDef, Select};
 use super::datetime::{Kind, Moment};
 use super::encoding::{decode_value, encode_key, encode_keys, encode_value, prefix_end};
+use super::expr::{BExpr, Binder, Env, Scope};
 use super::parser::{parse_expression, parse_query};
 use super::txn::Txn;
 use super::value::{DataType, Value, sql_error};
@@ -84,6 +85,34 @@ pub struct TableSchema {
 impl TableSchema {
     pub fn new(id: u32, name: String, columns: Vec<Column>) -> TableSchema {
         TableSchema { id, name, columns, primary_key: Vec::new(), checks: Vec::new(), foreign_keys: Vec::new() }
+    }
+
+    /// Check `i`'s name: its own, or one made as PostgreSQL makes them,
+    /// `table_column_check` (or `table_check` for several columns).
+    pub fn check_name(&self, i: usize) -> String {
+        let check = &self.checks[i];
+        if let Some(name) = &check.name {
+            return name.clone();
+        }
+        let mut columns: Vec<String> = Vec::new();
+        check.expr.walk(&mut |e| {
+            if let super::ast::Expr::Column { name, .. } = e
+                && self.column_index(name).is_some()
+                && !columns.contains(name)
+            {
+                columns.push(name.clone());
+            }
+        });
+        match columns.as_slice() {
+            [column] => format!("{}_{column}_check", self.name),
+            _ => format!("{}_check", self.name),
+        }
+    }
+
+    /// Foreign key `i`'s name: its own, or `table_columns_fkey`.
+    pub fn foreign_key_name(&self, i: usize) -> String {
+        let fk = &self.foreign_keys[i];
+        fk.name.clone().unwrap_or_else(|| format!("{}_{}_fkey", self.name, fk.columns.join("_")))
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
@@ -308,11 +337,59 @@ pub struct IndexSchema {
     pub id: u32,
     pub name: String,
     pub table: String,
+    /// The indexed columns; for an expression index, the columns its
+    /// expressions read.
     pub columns: Vec<usize>,
     pub unique: bool,
+    /// For an expression index: what its entries hold, instead of columns.
+    pub exprs: Vec<Expr>,
+    /// For a partial index: the rows it holds entries for.
+    pub predicate: Option<Expr>,
+    /// `exprs` and `predicate` bound to the table's columns, once loaded.
+    pub bound: Vec<BExpr>,
+    pub bound_predicate: Option<BExpr>,
 }
 
 impl IndexSchema {
+    pub fn new(id: u32, name: String, table: String, columns: Vec<usize>, unique: bool) -> IndexSchema {
+        IndexSchema {
+            id,
+            name,
+            table,
+            columns,
+            unique,
+            exprs: Vec::new(),
+            predicate: None,
+            bound: Vec::new(),
+            bound_predicate: None,
+        }
+    }
+
+    /// How many values each entry holds before the row's key.
+    pub fn width(&self) -> usize {
+        if self.exprs.is_empty() { self.columns.len() } else { self.exprs.len() }
+    }
+
+    /// Whether it indexes plain columns, every row of them: the only kind
+    /// a foreign key or a covering read can rely on.
+    pub fn is_plain(&self) -> bool {
+        self.exprs.is_empty() && self.predicate.is_none()
+    }
+
+    /// Binds the expressions to `table`'s columns, so entries can be made.
+    pub fn bind(&mut self, table: &TableSchema) -> Result<()> {
+        let binder = Binder { params: &[], txn: None, outer: None, ctes: None };
+        let scope = Scope::of_table(table, &table.name);
+        self.bound = self.exprs.iter().map(|e| binder.bind(e, &scope, "an index")).collect::<Result<_>>()?;
+        self.bound_predicate =
+            self.predicate.as_ref().map(|p| binder.bind(p, &scope, "an index's WHERE")).transpose()?;
+        Ok(())
+    }
+
+    /// Whether `row` belongs in a partial index (every row does in a full one).
+    pub fn holds(&self, row: &[Value]) -> bool {
+        self.bound_predicate.as_ref().is_none_or(|p| p.matches(row, &Env::new(&[], None)).unwrap_or(false))
+    }
     pub fn prefix(&self) -> Vec<u8> {
         key(b'X', &self.id.to_be_bytes())
     }
@@ -324,24 +401,38 @@ impl IndexSchema {
         k
     }
 
+    /// The values a row's entry holds. An expression that fails gives NULL.
     pub fn values_of(&self, row: &[Value]) -> Vec<Value> {
-        self.columns.iter().map(|&c| row[c].clone()).collect()
+        if self.bound.is_empty() {
+            return self.columns.iter().map(|&c| row[c].clone()).collect();
+        }
+        let env = Env::new(&[], None);
+        self.bound.iter().map(|e| e.eval(row, &env).unwrap_or(Value::Null)).collect()
     }
 
     /// The entry for a row: its indexed values, then its encoded primary key.
     pub fn entry_key(&self, row: &[Value], encoded_pk: &[u8]) -> Vec<u8> {
-        let mut k = Vec::with_capacity(ROW_PREFIX_LEN + 16 * self.columns.len() + encoded_pk.len());
+        let mut k = Vec::with_capacity(ROW_PREFIX_LEN + 16 * self.width() + encoded_pk.len());
         k.extend_from_slice(&[0, b'X']);
         k.extend_from_slice(&self.id.to_be_bytes());
-        self.columns.iter().for_each(|&c| encode_key(&mut k, &row[c]));
+        if self.bound.is_empty() {
+            self.columns.iter().for_each(|&c| encode_key(&mut k, &row[c]));
+        } else {
+            self.values_of(row).iter().for_each(|v| encode_key(&mut k, v));
+        }
         k.extend_from_slice(encoded_pk);
         k
     }
 
     pub fn to_sql(&self, table: &TableSchema) -> String {
-        let cols: Vec<&str> = self.columns.iter().map(|&c| table.columns[c].name.as_str()).collect();
+        let parts: Vec<String> = if self.exprs.is_empty() {
+            self.columns.iter().map(|&c| table.columns[c].name.clone()).collect()
+        } else {
+            self.exprs.iter().map(ToString::to_string).collect()
+        };
         let unique = if self.unique { "UNIQUE " } else { "" };
-        format!("CREATE {unique}INDEX {} ON {} ({})", self.name, self.table, cols.join(", "))
+        let filter = self.predicate.as_ref().map(|p| format!(" WHERE {p}")).unwrap_or_default();
+        format!("CREATE {unique}INDEX {} ON {} ({}){filter}", self.name, self.table, parts.join(", "))
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -352,6 +443,10 @@ impl IndexSchema {
         put_varint(&mut b, self.columns.len() as u64);
         self.columns.iter().for_each(|&c| put_varint(&mut b, c as u64));
         b.push(u8::from(self.unique));
+        // Expressions and a predicate follow; definitions from before them end here.
+        put_varint(&mut b, self.exprs.len() as u64);
+        self.exprs.iter().for_each(|e| put_bytes(&mut b, e.to_string().as_bytes()));
+        put_bytes(&mut b, self.predicate.as_ref().map(ToString::to_string).unwrap_or_default().as_bytes());
         b
     }
 
@@ -367,7 +462,20 @@ impl IndexSchema {
         for _ in 0..r.varint()? {
             columns.push(r.varint()? as usize);
         }
-        Ok(IndexSchema { id, name, table, columns, unique: r.u8()? != 0 })
+        let mut index = IndexSchema::new(id, name, table, columns, r.u8()? != 0);
+        if !r.is_empty() {
+            let parse = |text: String| {
+                parse_expression(&text).map_err(|e| corruption(format!("stored index expression {text}: {e}")))
+            };
+            for _ in 0..r.varint()? {
+                index.exprs.push(parse(string(&mut r)?)?);
+            }
+            let predicate = string(&mut r)?;
+            if !predicate.is_empty() {
+                index.predicate = Some(parse(predicate)?);
+            }
+        }
+        Ok(index)
     }
 }
 
@@ -587,11 +695,19 @@ fn load_indexes(txn: &Txn, table: &str) -> Result<Arc<[Arc<IndexSchema>]>> {
     txn.scan(lower, upper, &mut |_, data| {
         let index = IndexSchema::decode(data)?;
         if index.table == table {
-            indexes.push(Arc::new(index));
+            indexes.push(index);
         }
         Ok(true)
     })?;
-    Ok(indexes.into())
+    // Expressions are bound to the table's columns, for making entries.
+    if indexes.iter().any(|i| !i.exprs.is_empty() || i.predicate.is_some())
+        && let Some(schema) = load_table(txn, table)?
+    {
+        for index in &mut indexes {
+            index.bind(&schema)?;
+        }
+    }
+    Ok(indexes.into_iter().map(Arc::new).collect())
 }
 
 /// Allocates an id for a new table or index.

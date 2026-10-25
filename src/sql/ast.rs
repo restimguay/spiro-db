@@ -51,6 +51,12 @@ pub enum Statement {
     /// `ROLLBACK TO [SAVEPOINT] name`
     RollbackTo(String),
     Explain(Box<Statement>),
+    /// `WITH name AS (statement), ... statement`, where some statement is an
+    /// INSERT, UPDATE or DELETE (a WITH of queries alone is a `Select`).
+    With {
+        ctes: Vec<StatementCte>,
+        body: Box<Statement>,
+    },
     /// `TRUNCATE [TABLE] name, ... [RESTART IDENTITY]`
     Truncate {
         tables: Vec<String>,
@@ -152,17 +158,51 @@ pub struct ColumnDef {
 /// What `ALTER TABLE` changes.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterAction {
-    AddColumn(ColumnDef),
+    AddColumn(Box<ColumnDef>),
     DropColumn(String),
     RenameTable(String),
-    RenameColumn { from: String, to: String },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    AddConstraint(TableConstraint),
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+    },
+    /// `ALTER [COLUMN] c TYPE ty` (or `SET DATA TYPE ty`).
+    SetType {
+        column: String,
+        ty: DataType,
+    },
+    /// `ALTER [COLUMN] c SET DEFAULT expr`, or `DROP DEFAULT` (`None`).
+    SetDefault {
+        column: String,
+        default: Option<Expr>,
+    },
+    /// `ALTER [COLUMN] c SET NOT NULL` (true) or `DROP NOT NULL`.
+    SetNotNull {
+        column: String,
+        not_null: bool,
+    },
+}
+
+/// A constraint added with `ALTER TABLE ... ADD`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableConstraint {
+    Check(CheckDef),
+    ForeignKey(ForeignKeyDef),
+    Unique { name: Option<String>, columns: Vec<String> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateIndex {
     pub name: String,
     pub table: String,
-    pub columns: Vec<String>,
+    /// What it indexes: columns, or expressions such as `lower(email)`.
+    pub parts: Vec<Expr>,
+    /// `WHERE ...`: a partial index, of only the rows this accepts.
+    pub predicate: Option<Expr>,
     pub unique: bool,
     pub if_not_exists: bool,
 }
@@ -223,10 +263,15 @@ pub struct Delete {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Select {
     pub distinct: bool,
+    /// `DISTINCT ON (exprs)`: the first row of each set of these values.
+    pub distinct_on: Vec<Expr>,
     pub items: Vec<SelectItem>,
     pub from: Option<From>,
     pub filter: Option<Expr>,
     pub group_by: Vec<Expr>,
+    /// With ROLLUP, CUBE or GROUPING SETS: each set of `group_by`'s
+    /// expressions to group by in turn.
+    pub grouping_sets: Option<Vec<Vec<Expr>>>,
     pub having: Option<Expr>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<Expr>,
@@ -296,6 +341,15 @@ impl fmt::Display for WindowSpec {
     }
 }
 
+/// A common table expression that may write: `name [(columns)] AS (INSERT
+/// ... RETURNING ...)`, or a query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatementCte {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub statement: Statement,
+}
+
 /// The common table expressions of a `WITH` clause.
 #[derive(Clone, Debug, PartialEq)]
 pub struct With {
@@ -350,6 +404,8 @@ impl Select {
     pub fn wrapping(query: Select) -> Select {
         Select {
             distinct: false,
+            distinct_on: Vec::new(),
+            grouping_sets: None,
             items: vec![SelectItem::Wildcard],
             from: Some(From {
                 base: TableRef {
@@ -539,6 +595,9 @@ pub enum Expr {
         star: bool,
         /// An aggregate's `FILTER (WHERE ...)`.
         filter: Option<Box<Expr>>,
+        /// An aggregate's `ORDER BY` (`string_agg(x, ',' ORDER BY y)`), or the
+        /// ordering of `WITHIN GROUP (ORDER BY ...)`.
+        order_by: Vec<OrderBy>,
     },
     /// `name(args) OVER (...)`: a window function.
     Window {
@@ -561,6 +620,8 @@ pub enum Expr {
     Subquery(Box<Select>),
     /// `(a, b, ...)`: a row value, which may be compared or tested with IN.
     Row(Vec<Expr>),
+    /// `DEFAULT` in INSERT's VALUES: the column's default.
+    Default,
     /// `[NOT] EXISTS (SELECT ...)`
     Exists {
         select: Box<Select>,
@@ -580,7 +641,12 @@ impl Expr {
         f(self);
         match self {
             // A subquery's own expressions belong to it, not to this query.
-            Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) | Expr::Subquery(_) | Expr::Exists { .. } => {}
+            Expr::Literal(_)
+            | Expr::Column { .. }
+            | Expr::Param(_)
+            | Expr::Subquery(_)
+            | Expr::Exists { .. }
+            | Expr::Default => {}
             Expr::Unary { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Cast { expr, .. }
@@ -603,9 +669,10 @@ impl Expr {
                 pattern.walk(f);
             }
             Expr::Row(items) => items.iter().for_each(|e| e.walk(f)),
-            Expr::Function { args, filter, .. } => {
+            Expr::Function { args, filter, order_by, .. } => {
                 args.iter().for_each(|e| e.walk(f));
                 filter.iter().for_each(|e| e.walk(f));
+                order_by.iter().for_each(|o| o.expr.walk(f));
             }
             Expr::Window { args, filter, over, .. } => {
                 args.iter().for_each(|e| e.walk(f));
@@ -633,7 +700,12 @@ impl Expr {
     /// Calls `f` with each direct child expression (not those inside subqueries).
     pub fn for_each_child(&mut self, f: &mut dyn FnMut(&mut Expr)) {
         match self {
-            Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) | Expr::Subquery(_) | Expr::Exists { .. } => {}
+            Expr::Literal(_)
+            | Expr::Column { .. }
+            | Expr::Param(_)
+            | Expr::Subquery(_)
+            | Expr::Exists { .. }
+            | Expr::Default => {}
             Expr::Unary { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Cast { expr, .. }
@@ -656,9 +728,10 @@ impl Expr {
                 f(pattern);
             }
             Expr::Row(items) => items.iter_mut().for_each(&mut *f),
-            Expr::Function { args, filter, .. } => {
+            Expr::Function { args, filter, order_by, .. } => {
                 args.iter_mut().for_each(&mut *f);
                 filter.iter_mut().for_each(|e| f(e));
+                order_by.iter_mut().for_each(|o| f(&mut o.expr));
             }
             Expr::Window { args, filter, over, .. } => {
                 args.iter_mut().for_each(&mut *f);
@@ -708,6 +781,10 @@ pub fn is_aggregate(name: &str) -> bool {
             | "json_agg"
             | "json_group_object"
             | "json_object_agg"
+            | "array_agg"
+            | "median"
+            | "percentile_cont"
+            | "percentile_disc"
     )
 }
 
@@ -825,16 +902,23 @@ impl fmt::Display for Expr {
             Expr::Function { name, args, .. } if name == "interval" && args.len() == 1 => {
                 write!(f, "INTERVAL {}", args[0])
             }
-            Expr::Function { name, args, distinct, filter, .. } => {
+            Expr::Function { name, args, distinct, filter, order_by, .. } => {
                 let args: Vec<String> = args.iter().map(ToString::to_string).collect();
                 let filter = filter.as_ref().map(|e| format!(" FILTER (WHERE {e})")).unwrap_or_default();
-                write!(f, "{name}({}{}){filter}", if *distinct { "DISTINCT " } else { "" }, args.join(", "))
+                let order = if order_by.is_empty() {
+                    String::new()
+                } else {
+                    let keys: Vec<String> = order_by.iter().map(ToString::to_string).collect();
+                    format!(" ORDER BY {}", keys.join(", "))
+                };
+                write!(f, "{name}({}{}{order}){filter}", if *distinct { "DISTINCT " } else { "" }, args.join(", "))
             }
             Expr::Cast { expr, ty } => write!(f, "CAST({expr} AS {ty})"),
             Expr::Row(items) => {
                 let items: Vec<String> = items.iter().map(ToString::to_string).collect();
                 write!(f, "({})", items.join(", "))
             }
+            Expr::Default => f.write_str("DEFAULT"),
             Expr::Case { operand: op, branches, otherwise } => {
                 f.write_str("CASE")?;
                 if let Some(op) = op {

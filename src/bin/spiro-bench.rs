@@ -188,18 +188,29 @@ fn main() -> ExitCode {
             .count();
         format!("{found} found")
     });
+    // Scans lend each entry, as the other engines' iterators do.
     run("readseq", n, Some(entry), || {
         let mut count = 0u64;
-        for item in db.iter() {
-            item.unwrap();
-            count += 1;
-        }
+        db.scan::<&[u8], _>(.., |_, value| {
+            count += (value.len() == cfg.value_size) as u64;
+            true
+        })
+        .unwrap();
         format!("{} entries", group(count))
     });
     let scans = (n / 100).max(1);
     run("scan100", scans, None, || {
         let mut rng = Rng(3);
-        let total: usize = (0..scans).map(|_| db.range(key(rng.below(n))..).take(100).count()).sum();
+        let mut total = 0usize;
+        for _ in 0..scans {
+            let mut left = 100;
+            db.scan(key(rng.below(n)).., |_, value| {
+                total += (value.len() == cfg.value_size) as usize;
+                left -= 1;
+                left > 0
+            })
+            .unwrap();
+        }
         format!("{} scans of 100 keys, {} entries", group(scans), group(total as u64))
     });
 

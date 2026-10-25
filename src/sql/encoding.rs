@@ -5,7 +5,7 @@
 //! engine's sorted storage doubles as a primary-key index and secondary
 //! indexes. Row contents use a compact encoding that needn't preserve order.
 
-use crate::coding::{Reader, get_varint, put_bytes, put_varint};
+use crate::coding::{Reader, fast_varint, put_bytes, put_varint};
 use crate::error::{Error, Result, corruption};
 
 use super::value::Value;
@@ -13,7 +13,7 @@ use super::value::Value;
 const KEY_NULL: u8 = 0x00;
 const KEY_FALSE: u8 = 0x10;
 const KEY_TRUE: u8 = 0x11;
-const KEY_INTEGER: u8 = 0x20;
+pub(crate) const KEY_INTEGER: u8 = 0x20;
 const KEY_REAL: u8 = 0x30;
 const KEY_TEXT: u8 = 0x40;
 
@@ -284,11 +284,30 @@ impl RawValue<'_> {
 /// Calls `f` with each column of a stored row that `needed` marks, in order,
 /// without decoding the rest. Columns added after the row was written read
 /// as NULL. For scans that only look at values, this skips building a row.
-pub fn visit_row<'a>(data: &'a [u8], needed: &[bool], mut f: impl FnMut(usize, RawValue<'a>)) -> Result<()> {
+pub fn visit_row<'a>(data: &'a [u8], needed: &[bool], f: impl FnMut(usize, RawValue<'a>)) -> Result<()> {
+    let stop = needed.iter().rposition(|&n| n).map_or(0, |last| last + 1);
+    visit_values(data, Some(stop), |i| needed[i], f)
+}
+
+/// Calls `f` with every value a stored row holds, in column order.
+pub fn visit_all<'a>(data: &'a [u8], f: impl FnMut(usize, RawValue<'a>)) -> Result<()> {
+    visit_values(data, None, |_| true, f)
+}
+
+/// Walks a row's values up to column `stop` (all stored ones if `None`),
+/// handing `f` those `wanted` says to.
+#[inline(always)]
+fn visit_values<'a>(
+    data: &'a [u8],
+    stop: Option<usize>,
+    wanted: impl Fn(usize) -> bool,
+    mut f: impl FnMut(usize, RawValue<'a>),
+) -> Result<()> {
     let mut pos = 0;
     let Some(stored) = fast_varint(data, &mut pos) else { return Err(malformed()) };
-    let stop = needed.iter().rposition(|&n| n).map_or(0, |last| last + 1);
-    for (i, &wanted) in needed[..stop].iter().enumerate() {
+    let stop = stop.unwrap_or(usize::try_from(stored).map_err(|_| malformed())?);
+    for i in 0..stop {
+        let wanted = wanted(i);
         if i as u64 >= stored {
             if wanted {
                 f(i, RawValue::Null);
@@ -330,30 +349,6 @@ pub fn visit_row<'a>(data: &'a [u8], needed: &[bool], mut f: impl FnMut(usize, R
 #[cold]
 fn malformed() -> Error {
     corruption("row is truncated or malformed")
-}
-
-/// Reads a varint, with the short lengths (most values) unrolled.
-#[inline(always)]
-fn fast_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
-    let p = *pos;
-    let b0 = u64::from(*data.get(p)?);
-    if b0 < 0x80 {
-        *pos = p + 1;
-        return Some(b0);
-    }
-    let b1 = u64::from(*data.get(p + 1)?);
-    if b1 < 0x80 {
-        *pos = p + 2;
-        return Some((b0 & 0x7f) | b1 << 7);
-    }
-    let b2 = u64::from(*data.get(p + 2)?);
-    if b2 < 0x80 {
-        *pos = p + 3;
-        return Some((b0 & 0x7f) | (b1 & 0x7f) << 7 | b2 << 14);
-    }
-    let (v, n) = get_varint(&data[p..])?;
-    *pos = p + n;
-    Some(v)
 }
 
 /// The smallest key greater than every key starting with `prefix`, or `None`

@@ -31,7 +31,7 @@ fn sampled(key: &[u8]) -> bool {
 }
 
 /// A `None` value is a tombstone: the key was deleted.
-type Map = KeyMap<Option<Vec<u8>>>;
+type Map = KeyMap;
 
 pub struct MemTable {
     map: RwLock<Map>,
@@ -53,10 +53,9 @@ impl MemTable {
         let mut map = self.map.write().unwrap();
         let mut size = self.size.load(Ordering::Relaxed);
         for (key, value) in batch.iter() {
-            let value = value.map(<[u8]>::to_vec);
-            size += value.as_ref().map_or(0, Vec::len);
+            size += value.map_or(0, <[u8]>::len);
             match map.insert(key, value) {
-                Some(old) => size -= old.as_ref().map_or(0, Vec::len),
+                Some(old) => size -= old.unwrap_or(0),
                 None => {
                     size += ENTRY_OVERHEAD + key.len();
                     if sampled(key) {
@@ -70,7 +69,7 @@ impl MemTable {
 
     /// `None` if the key isn't here; `Some(None)` if it was deleted here.
     pub fn get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        self.map.read().unwrap().get(key).cloned()
+        self.map.read().unwrap().get(key).map(|v| v.map(<[u8]>::to_vec))
     }
 
     pub fn approximate_size(&self) -> usize {
@@ -84,9 +83,27 @@ impl MemTable {
     /// Visits every entry in key order, holding a read lock throughout.
     pub fn for_each(&self, mut f: impl FnMut(&[u8], Option<&[u8]>) -> Result<()>) -> Result<()> {
         for (key, value) in self.map.read().unwrap().iter() {
-            f(key, value.as_deref())?;
+            f(key, value)?;
         }
         Ok(())
+    }
+
+    /// Calls `f` with entries from `from` on, in key order, under the read
+    /// lock, until it returns `false`. Keep the visits short: writers wait.
+    pub fn visit_range(&self, from: Bound<&[u8]>, mut f: impl FnMut(&[u8], Option<&[u8]>) -> bool) {
+        let map = self.map.read().unwrap();
+        for (key, value) in map.range_from(from) {
+            if !f(key, value) {
+                break;
+            }
+        }
+    }
+
+    /// Runs `f` on the entries from `from` on, in key order, holding the read
+    /// lock meanwhile. Keep it short: writers wait.
+    pub fn with_range<R>(&self, from: Bound<&[u8]>, f: impl FnOnce(crate::keymap::Iter<'_>) -> R) -> R {
+        let map = self.map.read().unwrap();
+        f(map.range_from(from))
     }
 
     /// The sampled keys inside `(start, end)`, sorted.
@@ -172,7 +189,7 @@ impl MemIter {
                     (start, data.len() as u32)
                 };
                 let key = copy(key);
-                let value = value.as_deref().map(&mut copy);
+                let value = value.map(&mut copy);
                 self.entries.push(Copied { key, value });
             }
         }

@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 
 use crate::batch::WriteBatch;
@@ -21,7 +21,7 @@ use crate::iter::{KvIter, LevelIter, MergeIter};
 use crate::manifest::Manifest;
 use crate::memtable::MemTable;
 use crate::options::Options;
-use crate::table::{Table, TableBuilder, TableMeta};
+use crate::table::{SectionBuilder, Table, TableBuilder, TableMeta};
 use crate::wal::{self, WalWriter};
 
 fn table_path(dir: &Path, number: u64) -> PathBuf {
@@ -110,6 +110,21 @@ impl ReadView {
         raw
     }
 
+    /// The memtables, newest first.
+    pub(crate) fn memtables(&self) -> impl Iterator<Item = &Arc<MemTable>> {
+        std::iter::once(&self.0.mem).chain(&self.0.imm)
+    }
+
+    /// Level 0's tables, newest first; their key ranges may overlap.
+    pub(crate) fn level0(&self) -> &[Arc<Table>] {
+        &self.0.version.l0
+    }
+
+    /// Level 1's tables, sorted by key, without overlap.
+    pub(crate) fn level1(&self) -> &[Arc<Table>] {
+        &self.0.version.l1
+    }
+
     /// Keys inside `(start, end)` at which to split it into parts of roughly
     /// equal size: the boundaries of the tables' data blocks (about 4 KiB
     /// each), sorted. Data still in memtables isn't counted.
@@ -185,10 +200,18 @@ struct Counters {
     bytes_compacted: AtomicU64,
 }
 
+/// Makes a builder for each new table file's column section.
+pub(crate) type SectionFactory = Arc<dyn Fn() -> Box<dyn SectionBuilder> + Send + Sync>;
+/// Prepares a newly written table's column section for reading, on the
+/// background thread that wrote it, so no query has to.
+pub(crate) type SectionWarmer = Arc<dyn Fn(&Table) + Send + Sync>;
+
 struct Inner {
     dir: PathBuf,
     opts: Options,
     cache: Arc<BlockCache>,
+    /// Set by the layer above to add column sections to new table files.
+    sections: OnceLock<(SectionFactory, SectionWarmer)>,
     next_file: AtomicU64,
     /// Serialises writers and owns the active log.
     wal: Mutex<WalWriter>,
@@ -295,7 +318,7 @@ impl Db {
         }
         if !recovered.is_empty() {
             let number = next_file.fetch_add(1, Ordering::SeqCst);
-            l0.insert(0, Arc::new(write_memtable(&dir, number, &recovered, &opts, &cache)?));
+            l0.insert(0, Arc::new(write_memtable(&dir, number, &recovered, &opts, &cache, None)?));
         }
         let wal_number = next_file.fetch_add(1, Ordering::SeqCst);
         let wal = WalWriter::create(&log_path(&dir, wal_number), opts.sync)?;
@@ -329,6 +352,7 @@ impl Db {
             dir,
             opts,
             cache,
+            sections: OnceLock::new(),
             next_file,
             wal: Mutex::new(wal),
             log_number: Mutex::new(wal_number),
@@ -435,9 +459,47 @@ impl Db {
         DbIterator { raw: self.raw_range(start, end), done: false }
     }
 
+    /// Calls `f` with each key and value in `range`, in key order, until it
+    /// returns `false`. Unlike [`range`](Db::range), which copies every entry
+    /// it yields, this lends them from the engine's own buffers, so a scan
+    /// allocates nothing per entry.
+    ///
+    /// ```no_run
+    /// # let db = spirodb::Db::open("./my-data")?;
+    /// let mut bytes = 0;
+    /// db.scan("a".."m", |key, value| {
+    ///     bytes += key.len() + value.len();
+    ///     true
+    /// })?;
+    /// # Ok::<(), spirodb::Error>(())
+    /// ```
+    pub fn scan<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+        mut f: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<()> {
+        let start = match range.start_bound() {
+            Bound::Included(start) => Bound::Included(start.as_ref()),
+            Bound::Excluded(start) => Bound::Excluded(start.as_ref()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(end) => Bound::Included(end.as_ref().to_vec()),
+            Bound::Excluded(end) => Bound::Excluded(end.as_ref().to_vec()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        self.raw_range(start, end).for_each(|key, value| Ok(f(key, value)))
+    }
+
     /// Like `range`, but lends each key and value instead of copying them.
     pub(crate) fn raw_range(&self, start: Bound<&[u8]>, end: Bound<Vec<u8>>) -> RawIter {
         self.read_view().raw_range(start, end)
+    }
+
+    /// Has every table file written from now on carry a column section,
+    /// built by what `make` returns. Set once, by the SQL layer.
+    pub(crate) fn set_section_builder(&self, make: SectionFactory, warm: SectionWarmer) {
+        let _ = self.inner.sections.set((make, warm));
     }
 
     /// The current memtables and tables, held fixed so several threads can
@@ -495,6 +557,16 @@ impl Drop for Db {
 }
 
 impl Inner {
+    fn section_builder(&self) -> Option<Box<dyn SectionBuilder>> {
+        self.sections.get().map(|(make, _)| make())
+    }
+
+    fn warm(&self, table: &Table) {
+        if let Some((_, warm)) = self.sections.get() {
+            warm(table);
+        }
+    }
+
     fn super_version(&self) -> Arc<SuperVersion> {
         self.read_slots[read_slot()].0.read().unwrap().clone()
     }
@@ -594,7 +666,9 @@ impl Inner {
             None
         } else {
             let number = self.next_file.fetch_add(1, Ordering::SeqCst);
-            Some(Arc::new(write_memtable(&self.dir, number, imm, &self.opts, &self.cache)?))
+            let table = write_memtable(&self.dir, number, imm, &self.opts, &self.cache, self.section_builder())?;
+            self.warm(&table);
+            Some(Arc::new(table))
         };
 
         let mut log_number = self.log_number.lock().unwrap();
@@ -699,7 +773,8 @@ impl Inner {
                 if builder.is_none() {
                     let number = self.next_file.fetch_add(1, Ordering::SeqCst);
                     created.push(number);
-                    builder = Some(TableBuilder::create(&table_path(&self.dir, number), number, &self.opts)?);
+                    let path = table_path(&self.dir, number);
+                    builder = Some(TableBuilder::create(&path, number, &self.opts, self.section_builder())?);
                 }
                 let b = builder.as_mut().unwrap();
                 b.add(merged.key(), Some(value))?;
@@ -723,7 +798,9 @@ impl Inner {
 
     fn finish_table(&self, builder: TableBuilder) -> Result<Arc<Table>> {
         let meta = builder.finish()?;
-        Ok(Arc::new(Table::open(&table_path(&self.dir, meta.number), meta, self.cache.clone())?))
+        let table = Table::open(&table_path(&self.dir, meta.number), meta, self.cache.clone())?;
+        self.warm(&table);
+        Ok(Arc::new(table))
     }
 
     fn remove_tables(&self, numbers: &[u64]) {
@@ -738,9 +815,16 @@ impl Inner {
 }
 
 /// Writes a non-empty memtable to table `number` and opens it.
-fn write_memtable(dir: &Path, number: u64, mem: &MemTable, opts: &Options, cache: &Arc<BlockCache>) -> Result<Table> {
+fn write_memtable(
+    dir: &Path,
+    number: u64,
+    mem: &MemTable,
+    opts: &Options,
+    cache: &Arc<BlockCache>,
+    section: Option<Box<dyn SectionBuilder>>,
+) -> Result<Table> {
     let path = table_path(dir, number);
-    let mut builder = TableBuilder::create(&path, number, opts)?;
+    let mut builder = TableBuilder::create(&path, number, opts, section)?;
     mem.for_each(|key, value| builder.add(key, value))?;
     Table::open(&path, builder.finish()?, cache.clone())
 }

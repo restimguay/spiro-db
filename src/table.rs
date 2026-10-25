@@ -9,6 +9,7 @@
 //! a point lookup costs one bloom probe, one in-memory index search and at most
 //! one block read.
 
+use std::any::Any;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::ops::Bound;
@@ -27,6 +28,19 @@ use crate::options::Options;
 
 const MAGIC: u64 = 0x5453_534f_5249_5053; // "SPIROSST"
 const FOOTER_LEN: usize = 48;
+/// Footer of tables that may carry a column section: two more fields.
+const MAGIC_V2: u64 = 0x3253_534f_5249_5053; // "SPIROSS2"
+const FOOTER_V2_LEN: usize = 64;
+
+/// Builds a table file's *column section* from its entries, which arrive in
+/// key order. The storage engine stores the bytes; what they mean is up to
+/// the layer that supplies the builder (the SQL layer lays out its rows'
+/// columns there, for scans that read only the columns they need).
+pub trait SectionBuilder: Send {
+    fn add(&mut self, key: &[u8], value: Option<&[u8]>);
+    /// The section, or nothing to store.
+    fn finish(&mut self) -> Vec<u8>;
+}
 
 /// What the manifest records about a table.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,10 +64,11 @@ pub struct TableBuilder {
     last_key: Vec<u8>,
     /// Sync fully on finishing, rather than just in order (`Options::sync`).
     full_sync: bool,
+    section: Option<Box<dyn SectionBuilder>>,
 }
 
 impl TableBuilder {
-    pub fn create(path: &Path, number: u64, opts: &Options) -> Result<Self> {
+    pub fn create(path: &Path, number: u64, opts: &Options, section: Option<Box<dyn SectionBuilder>>) -> Result<Self> {
         Ok(TableBuilder {
             number,
             file: BufWriter::with_capacity(256 << 10, File::create(path)?),
@@ -66,6 +81,7 @@ impl TableBuilder {
             smallest: Vec::new(),
             last_key: Vec::new(),
             full_sync: opts.sync,
+            section,
         })
     }
 
@@ -77,6 +93,9 @@ impl TableBuilder {
         }
         self.bloom.add(key);
         self.data.add(key, value);
+        if let Some(section) = &mut self.section {
+            section.add(key, value);
+        }
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
         self.entries += 1;
@@ -117,10 +136,14 @@ impl TableBuilder {
         let (filter_offset, filter_len) = self.write_checksummed(&self.bloom.finish())?;
         let index = self.index.finish();
         let (index_offset, index_len) = self.write_checksummed(&index)?;
-        for v in [filter_offset, filter_len, index_offset, index_len, self.entries, MAGIC] {
+        let section = self.section.as_mut().map(|s| s.finish()).unwrap_or_default();
+        let (section_offset, section_len) = if section.is_empty() { (0, 0) } else { self.write_checksummed(&section)? };
+        let footer =
+            [filter_offset, filter_len, index_offset, index_len, section_offset, section_len, self.entries, MAGIC_V2];
+        for v in footer {
             self.file.write_all(&v.to_le_bytes())?;
         }
-        self.offset += FOOTER_LEN as u64;
+        self.offset += FOOTER_V2_LEN as u64;
         self.file.flush()?;
         sync_file(self.file.get_ref(), self.full_sync)?;
         Ok(TableMeta { number: self.number, size: self.offset, smallest: self.smallest, largest: self.last_key })
@@ -137,6 +160,10 @@ pub struct Table {
     cache: Arc<BlockCache>,
     /// Every data block's last key, read from the index when first needed.
     boundaries: OnceLock<Vec<Vec<u8>>>,
+    /// Where the column section is (offset, length); length 0 if none.
+    section: (u64, u64),
+    /// The column section as the layer above parsed it, on first use.
+    columnar: OnceLock<Arc<dyn Any + Send + Sync>>,
 }
 
 impl Table {
@@ -146,14 +173,28 @@ impl Table {
         if size != meta.size || size < FOOTER_LEN as u64 {
             return Err(corruption(format!("table {} is {size} bytes, expected {}", meta.number, meta.size)));
         }
-        let mut footer = [0u8; FOOTER_LEN];
-        read_exact_at(&file, &mut footer, size - FOOTER_LEN as u64)?;
-        if u64_at(&footer, 40) != MAGIC {
-            return Err(corruption(format!("table {} has a bad footer", meta.number)));
-        }
+        let mut magic = [0u8; 8];
+        read_exact_at(&file, &mut magic, size - 8)?;
+        let footer_len = match u64::from_le_bytes(magic) {
+            MAGIC => FOOTER_LEN,
+            MAGIC_V2 if size >= FOOTER_V2_LEN as u64 => FOOTER_V2_LEN,
+            _ => return Err(corruption(format!("table {} has a bad footer", meta.number))),
+        };
+        let mut footer = vec![0u8; footer_len];
+        read_exact_at(&file, &mut footer, size - footer_len as u64)?;
         let filter = read_block(&file, size, u64_at(&footer, 0), u64_at(&footer, 8))?;
         let index = Block::new(read_block(&file, size, u64_at(&footer, 16), u64_at(&footer, 24))?)?;
-        Ok(Table { meta, file, index: Arc::new(index), filter, cache, boundaries: OnceLock::new() })
+        let section = if footer_len == FOOTER_V2_LEN { (u64_at(&footer, 32), u64_at(&footer, 40)) } else { (0, 0) };
+        Ok(Table {
+            meta,
+            file,
+            index: Arc::new(index),
+            filter,
+            cache,
+            boundaries: OnceLock::new(),
+            section,
+            columnar: OnceLock::new(),
+        })
     }
 
     /// Whether `key` falls inside this table's key range.
@@ -175,6 +216,21 @@ impl Table {
         let mut it = BlockIter::new(&*block);
         it.seek(key);
         Ok((it.valid() && it.key() == key).then(|| it.value().map(<[u8]>::to_vec)))
+    }
+
+    /// What the layer above built from this table's column section with
+    /// `parse`, or `None` if the table has no section. The section is read
+    /// and parsed once, then kept while the table is open.
+    pub fn columnar<T: Any + Send + Sync>(&self, parse: impl FnOnce(Vec<u8>) -> Result<T>) -> Result<Option<Arc<T>>> {
+        if self.section.1 == 0 {
+            return Ok(None);
+        }
+        if self.columnar.get().is_none() {
+            let bytes = read_block(&self.file, self.meta.size, self.section.0, self.section.1)?;
+            // Two threads may parse at once; the first to finish is kept.
+            let _ = self.columnar.set(Arc::new(parse(bytes)?));
+        }
+        Ok(self.columnar.get().and_then(|parsed| parsed.clone().downcast::<T>().ok()))
     }
 
     /// The keys that end this table's data blocks, inside `(start, end)`:
@@ -360,7 +416,7 @@ mod tests {
     fn build(dir: &TempDir, n: usize) -> Arc<Table> {
         let path = dir.path().join("1.sst");
         let opts = Options { block_size: 512, ..Options::default() };
-        let mut b = TableBuilder::create(&path, 1, &opts).unwrap();
+        let mut b = TableBuilder::create(&path, 1, &opts, None).unwrap();
         for i in 0..n {
             let value = (i % 5 != 0).then(|| format!("value{i}").into_bytes());
             b.add(&key(i * 2), value.as_deref()).unwrap();

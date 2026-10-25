@@ -166,6 +166,30 @@ impl std::borrow::Borrow<KeyRef> for Key {
     }
 }
 
+/// Reads a varint, with the short lengths (most values) unrolled.
+#[inline(always)]
+pub fn fast_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let p = *pos;
+    let b0 = u64::from(*data.get(p)?);
+    if b0 < 0x80 {
+        *pos = p + 1;
+        return Some(b0);
+    }
+    let b1 = u64::from(*data.get(p + 1)?);
+    if b1 < 0x80 {
+        *pos = p + 2;
+        return Some((b0 & 0x7f) | b1 << 7);
+    }
+    let b2 = u64::from(*data.get(p + 2)?);
+    if b2 < 0x80 {
+        *pos = p + 3;
+        return Some((b0 & 0x7f) | (b1 & 0x7f) << 7 | b2 << 14);
+    }
+    let (v, n) = get_varint(&data[p..])?;
+    *pos = p + n;
+    Some(v)
+}
+
 pub fn get_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut v = 0u64;
     for (i, &b) in buf.iter().take(10).enumerate() {

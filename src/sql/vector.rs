@@ -30,6 +30,7 @@ use crate::error::Result;
 
 use super::ast::BinaryOp;
 use super::catalog::TableSchema;
+use super::columnar::{self, Chunk, ColumnView, Kind};
 use super::encoding::{RawValue, encode_key, visit_row};
 use super::exec::{ReadSpec, read};
 use super::expr::{Accumulator, Aggregate, BExpr};
@@ -78,10 +79,15 @@ pub fn aggregate(txn: &Txn, plan: &Arc<SelectPlan>, params: &[Value]) -> Result<
     let mut worker = Worker::new(plan, params);
     if let Access::Scan = base.access {
         let (lower, upper) = base.schema.rows_range();
-        txn.scan(lower, upper, &mut |_, data| {
-            worker.push_stored(data)?;
-            Ok(true)
-        })?;
+        match txn.shared_view(&lower, &upper) {
+            // Column chunks where the files have them.
+            Some(view) => columnar::scan(&view, &base.schema, &base.needed, &lower, &upper, &mut worker)?,
+            // The transaction's own writes must be merged in: rows it is.
+            None => txn.scan(lower, upper, &mut |_, data| {
+                worker.push_stored(data)?;
+                Ok(true)
+            })?,
+        }
         worker.flush()?;
         return merge(vec![worker.groups]);
     }
@@ -220,15 +226,8 @@ impl Job {
                 let Some((lower, upper)) = self.ranges.get(self.next.fetch_add(1, Ordering::Relaxed)) else {
                     break;
                 };
-                let start = match lower {
-                    Bound::Included(k) => Bound::Included(k.as_slice()),
-                    Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
-                    Bound::Unbounded => Bound::Unbounded,
-                };
-                self.view.raw_range(start, upper.clone()).for_each(|_, data| {
-                    worker.push_stored(data)?;
-                    Ok(true)
-                })?;
+                let base = self.plan.base.as_ref().expect("a FROM table");
+                columnar::scan(&self.view, &base.schema, &base.needed, lower, upper, &mut worker)?;
             }
             worker.flush()
         })();
@@ -331,6 +330,131 @@ struct Worker<'a> {
     /// Whether the read was narrowed by its access path, so only the
     /// residual base conditions need checking.
     narrowed: bool,
+    /// For the simplest queries: how to aggregate straight from stored
+    /// columns, without gathering a batch first.
+    direct: Option<Direct>,
+    /// Decoded values of one stored row, for `direct`.
+    scratch: Vec<Slot>,
+    /// Each row's group in a run, for `direct`; reused from run to run.
+    ids: Vec<u32>,
+    /// Rows per group in a block, and the groups with any, for counting.
+    counts: Vec<usize>,
+    touched: Vec<u32>,
+    /// Group keys of a block, for `direct`.
+    keys: Vec<i64>,
+}
+
+/// A decoded number, or NULL.
+#[derive(Clone, Copy)]
+enum Slot {
+    Null,
+    Integer(i64),
+    Real(f64),
+}
+
+/// An aggregation simple enough to feed from stored columns directly: no
+/// filter, at most one integer group key (a column, or a column combined
+/// with an integer constant), and aggregates of plain columns or `count(*)`.
+struct Direct {
+    /// Per aggregate, the column it reads (`None` for `count(*)`).
+    args: Vec<Option<usize>>,
+    key: Option<(usize, Option<(BinaryOp, i64)>)>,
+}
+
+impl Direct {
+    fn of(plan: &SelectPlan) -> Option<Direct> {
+        let (base, group) = (plan.base.as_ref()?, plan.grouping.as_ref()?);
+        if plan.base_filter.is_some() || plan.filter.is_some() || group.aggregates.iter().any(|a| a.distinct) {
+            return None;
+        }
+        let args = group
+            .aggregates
+            .iter()
+            .map(|a| match &a.arg {
+                None => Some(None),
+                Some(BExpr::Column(c)) => Some(Some(*c)),
+                Some(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let integer = |c: usize| base.schema.columns[c].ty == DataType::Integer;
+        let key = match group.keys.as_slice() {
+            [] => None,
+            [BExpr::Column(c)] if integer(*c) => Some((*c, None)),
+            [BExpr::Binary(op, a, b)] => match (&**a, &**b) {
+                (BExpr::Column(c), BExpr::Literal(Value::Integer(n)))
+                    if integer(*c)
+                        && matches!(
+                            op,
+                            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem
+                        )
+                        && (*n != 0 || !matches!(op, BinaryOp::Div | BinaryOp::Rem)) =>
+                {
+                    Some((*c, Some((*op, *n))))
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(Direct { args, key })
+    }
+
+    /// Turns column values into group keys in place. Returns `false` if any
+    /// computation overflows (possibly for a row that would be skipped: the
+    /// ordinary path then sorts it out).
+    fn apply_key(&self, values: &mut [i64]) -> bool {
+        match self.key.and_then(|(_, op)| op) {
+            None => true,
+            // Never overflows: the divisor is neither 0 nor -1.
+            Some((BinaryOp::Rem, n)) if n != -1 => {
+                values.iter_mut().for_each(|x| *x %= n);
+                true
+            }
+            Some((BinaryOp::Add, n)) => {
+                let mut overflow = false;
+                values.iter_mut().for_each(|x| {
+                    let (r, o) = x.overflowing_add(n);
+                    (*x, overflow) = (r, overflow | o);
+                });
+                !overflow
+            }
+            Some((BinaryOp::Sub, n)) => {
+                let mut overflow = false;
+                values.iter_mut().for_each(|x| {
+                    let (r, o) = x.overflowing_sub(n);
+                    (*x, overflow) = (r, overflow | o);
+                });
+                !overflow
+            }
+            Some((BinaryOp::Mul, n)) => {
+                let mut overflow = false;
+                values.iter_mut().for_each(|x| {
+                    let (r, o) = x.overflowing_mul(n);
+                    (*x, overflow) = (r, overflow | o);
+                });
+                !overflow
+            }
+            Some(_) => values.iter_mut().all(|x| match self.key_of(*x) {
+                Some(key) => {
+                    *x = key;
+                    true
+                }
+                None => false,
+            }),
+        }
+    }
+
+    /// The group key for a column value; `None` if computing it fails (an
+    /// overflow), which the ordinary path then reports.
+    fn key_of(&self, x: i64) -> Option<i64> {
+        match self.key.and_then(|(_, op)| op) {
+            None => Some(x),
+            Some((BinaryOp::Add, n)) => x.checked_add(n),
+            Some((BinaryOp::Sub, n)) => x.checked_sub(n),
+            Some((BinaryOp::Mul, n)) => x.checked_mul(n),
+            Some((BinaryOp::Div, n)) => x.checked_div(n),
+            Some((_, n)) => x.checked_rem(n),
+        }
+    }
 }
 
 impl<'a> Worker<'a> {
@@ -345,7 +469,250 @@ impl<'a> Worker<'a> {
             batch: Batch::new(&base.schema, &base.needed),
             groups: GroupTable::new(group),
             narrowed: false,
+            direct: Direct::of(plan),
+            scratch: vec![Slot::Null; base.schema.columns.len()],
+            ids: Vec::new(),
+            counts: Vec::new(),
+            touched: Vec::new(),
+            keys: Vec::new(),
         }
+    }
+
+    /// A run of chunk rows, aggregated straight from its columns. Returns
+    /// `false`, having done nothing, if a group key can't be computed.
+    fn direct_chunk(&mut self, chunk: &Chunk, rows: std::ops::Range<usize>, skip: &[usize]) -> Result<bool> {
+        let Some(direct) = &self.direct else { return Ok(false) };
+        let groups = &mut self.groups;
+        // Whether row `start + i` is to be used; `skip` is walked in step.
+        let kept = || {
+            let mut s = 0;
+            move |row: usize| {
+                if skip.get(s) == Some(&row) {
+                    s += 1;
+                    false
+                } else {
+                    true
+                }
+            }
+        };
+        let Some((key_column, _)) = direct.key else {
+            // One group: each aggregate takes the whole run at once.
+            for (a, arg) in direct.args.iter().enumerate() {
+                let accumulator = groups.accumulator(0, a);
+                let Some(c) = arg else {
+                    accumulator.add_rows(rows.len() - skip.len());
+                    continue;
+                };
+                let Some(view) = chunk.column(*c) else { continue }; // all NULL: skipped
+                let valid = view.validity(rows.clone());
+                let present = |i: usize| valid.is_none_or(|v| v[i] != 0);
+                let mut keep = kept();
+                match view.kind() {
+                    Kind::Nulls => {}
+                    Kind::Integer => accumulator.add_integers_from(
+                        view.words(rows.clone())
+                            .enumerate()
+                            .map(|(i, w)| (keep(rows.start + i) && present(i)).then_some(w as i64)),
+                    )?,
+                    Kind::Real => accumulator.add_reals_from(
+                        view.words(rows.clone())
+                            .enumerate()
+                            .map(|(i, w)| (keep(rows.start + i) && present(i)).then_some(f64::from_bits(w))),
+                    )?,
+                    Kind::Other => {
+                        for i in rows.clone().filter(|&i| keep(i)) {
+                            accumulator.add_value(Cow::Owned(view.value(i)?))?;
+                        }
+                    }
+                }
+            }
+            return Ok(true);
+        };
+        // Grouped: every group key first, so a key that can't be computed
+        // leaves nothing half done.
+        // A block at a time, so the group ids stay in cache.
+        if rows.len() > DIRECT_BLOCK {
+            let mut start = rows.start;
+            let mut s = 0;
+            while start < rows.end {
+                let end = (start + DIRECT_BLOCK).min(rows.end);
+                let n = skip[s..].partition_point(|&row| row < end);
+                if !self.direct_chunk(chunk, start..end, &skip[s..s + n])? {
+                    // Earlier blocks are done: the rest goes the ordinary way,
+                    // which reports what went wrong.
+                    self.batch_chunk(chunk, start..rows.end, &skip[s..])?;
+                    return Ok(true);
+                }
+                (start, s) = (end, s + n);
+            }
+            return Ok(true);
+        }
+        // Only `count(*)`: one pass, counting each group's rows in a
+        // reused array, then adding each count once.
+        if direct.args.iter().all(Option::is_none) {
+            let view = match chunk.column(key_column) {
+                Some(view) if view.kind() == Kind::Integer => Some(view),
+                Some(view) if view.kind() != Kind::Nulls => return Ok(false),
+                _ => None,
+            };
+            // Keys first, as below: a key that can't be computed must leave
+            // nothing done. A block is short, so this stays in cache.
+            let ids = &mut self.ids;
+            ids.clear();
+            let mut keep = kept();
+            match view {
+                Some(view) => {
+                    // The keys for the whole block in simple loops, which the
+                    // compiler keeps tight; then each key's group.
+                    let keys = &mut self.keys;
+                    keys.clear();
+                    keys.extend(view.words(rows.clone()).map(|w| w as i64));
+                    if !direct.apply_key(keys) {
+                        return Ok(false);
+                    }
+                    let valid = view.validity(rows.clone());
+                    for (i, &key) in keys.iter().enumerate() {
+                        let id = if !keep(rows.start + i) {
+                            SKIPPED
+                        } else if valid.is_some_and(|v| v[i] == 0) {
+                            groups.null_group()
+                        } else {
+                            groups.int_group(key)
+                        };
+                        ids.push(id);
+                    }
+                }
+                None => {
+                    for row in rows.clone() {
+                        ids.push(if keep(row) { groups.null_group() } else { SKIPPED });
+                    }
+                }
+            }
+            let (counts, touched) = (&mut self.counts, &mut self.touched);
+            for &id in ids.iter().filter(|&&id| id != SKIPPED) {
+                let id = id as usize;
+                if counts.len() <= id {
+                    counts.resize(id + 1, 0);
+                }
+                if counts[id] == 0 {
+                    touched.push(id as u32);
+                }
+                counts[id] += 1;
+            }
+            for &id in touched.iter() {
+                let n = std::mem::take(&mut counts[id as usize]);
+                for a in 0..direct.args.len() {
+                    groups.accumulator(id, a).add_rows(n);
+                }
+            }
+            touched.clear();
+            return Ok(true);
+        }
+        // Skipped rows get no group: they mustn't create one.
+        let ids = &mut self.ids;
+        ids.clear();
+        let mut keep = kept();
+        match chunk.column(key_column) {
+            Some(view) if view.kind() == Kind::Integer => {
+                let valid = view.validity(rows.clone());
+                for (i, w) in view.words(rows.clone()).enumerate() {
+                    if !keep(rows.start + i) {
+                        ids.push(SKIPPED);
+                    } else if valid.is_some_and(|v| v[i] == 0) {
+                        ids.push(groups.null_group());
+                    } else {
+                        let Some(key) = direct.key_of(w as i64) else { return Ok(false) };
+                        ids.push(groups.int_group(key));
+                    }
+                }
+            }
+            Some(view) if view.kind() != Kind::Nulls => return Ok(false),
+            _ => {
+                for row in rows.clone() {
+                    ids.push(if keep(row) { groups.null_group() } else { SKIPPED });
+                }
+            }
+        }
+        let ids = &*ids;
+        for (a, arg) in direct.args.iter().enumerate() {
+            let Some(c) = arg else {
+                ids.iter().filter(|&&id| id != SKIPPED).for_each(|&id| groups.accumulator(id, a).add_row());
+                continue;
+            };
+            let Some(view) = chunk.column(*c) else { continue }; // all NULL: skipped
+            let valid = view.validity(rows.clone());
+            let present = |i: usize| valid.is_none_or(|v| v[i] != 0);
+            match view.kind() {
+                Kind::Nulls => {}
+                Kind::Integer => {
+                    for (i, w) in view.words(rows.clone()).enumerate() {
+                        if ids[i] != SKIPPED && present(i) {
+                            groups.accumulator(ids[i], a).add_integer(w as i64)?;
+                        }
+                    }
+                }
+                Kind::Real => {
+                    for (i, w) in view.words(rows.clone()).enumerate() {
+                        if ids[i] != SKIPPED && present(i) {
+                            groups.accumulator(ids[i], a).add_real(f64::from_bits(w))?;
+                        }
+                    }
+                }
+                Kind::Other => {
+                    for (i, row) in rows.clone().enumerate() {
+                        if ids[i] != SKIPPED {
+                            groups.accumulator(ids[i], a).add_value(Cow::Owned(view.value(row)?))?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// One stored row, aggregated straight from its needed values. Returns
+    /// `false`, having done nothing, if its group key can't be computed or
+    /// it holds values other than numbers.
+    fn direct_row(&mut self, data: &[u8]) -> Result<bool> {
+        let Some(direct) = &self.direct else { return Ok(false) };
+        let scratch = &mut self.scratch;
+        let mut other = false;
+        visit_row(data, self.needed, |i, value| {
+            scratch[i] = match value {
+                RawValue::Null => Slot::Null,
+                RawValue::Integer(x) => Slot::Integer(x),
+                RawValue::Real(x) => Slot::Real(x),
+                _ => {
+                    other = true;
+                    Slot::Null
+                }
+            }
+        })?;
+        if other {
+            return Ok(false);
+        }
+        let groups = &mut self.groups;
+        let id = match direct.key {
+            None => 0,
+            Some((c, _)) => match scratch[c] {
+                Slot::Null => groups.null_group(),
+                Slot::Integer(x) => match direct.key_of(x) {
+                    Some(key) => groups.int_group(key),
+                    None => return Ok(false),
+                },
+                Slot::Real(_) => return Ok(false),
+            },
+        };
+        for (a, arg) in direct.args.iter().enumerate() {
+            let accumulator = groups.accumulator(id, a);
+            match arg.map(|c| scratch[c]) {
+                None => accumulator.add_row(),
+                Some(Slot::Null) => {}
+                Some(Slot::Integer(x)) => accumulator.add_integer(x)?,
+                Some(Slot::Real(x)) => accumulator.add_real(x)?,
+            }
+        }
+        Ok(true)
     }
 
     /// Adds a decoded row.
@@ -356,8 +723,39 @@ impl<'a> Worker<'a> {
 
     /// Adds a row as stored, decoding only the columns the query reads.
     fn push_stored(&mut self, data: &[u8]) -> Result<()> {
+        if self.direct_row(data)? {
+            return Ok(());
+        }
         self.batch.push_stored(data, self.needed)?;
         if self.batch.len == BATCH { self.flush() } else { Ok(()) }
+    }
+
+    /// Adds a chunk's rows, but those in `skip`: straight to the
+    /// accumulators if the query allows, otherwise a batch's worth at a time.
+    fn push_chunk(&mut self, chunk: &Chunk, rows: std::ops::Range<usize>, skip: &[usize]) -> Result<()> {
+        if self.direct_chunk(chunk, rows.clone(), skip)? {
+            return Ok(());
+        }
+        self.batch_chunk(chunk, rows, skip)
+    }
+
+    /// Adds a chunk's rows, but those in `skip`, to batches.
+    fn batch_chunk(&mut self, chunk: &Chunk, rows: std::ops::Range<usize>, skip: &[usize]) -> Result<()> {
+        // The live stretches between skipped rows.
+        let ends = skip.iter().copied().chain(std::iter::once(rows.end));
+        let mut start = rows.start;
+        for end in ends {
+            while start < end {
+                let take = (BATCH - self.batch.len).min(end - start);
+                self.batch.push_chunk(chunk, start..start + take)?;
+                start += take;
+                if self.batch.len == BATCH {
+                    self.flush()?;
+                }
+            }
+            start = end + 1;
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -374,6 +772,27 @@ impl<'a> Worker<'a> {
         }
         if self.batch.len > 0 {
             let keys = self.group.keys.iter().map(|k| eval(k, &self.batch, self.params)).collect::<Result<Vec<_>>>()?;
+            if self.group.keys.is_empty() {
+                // One group: whole columns go to each accumulator at once.
+                for (a, aggregate) in self.group.aggregates.iter().enumerate() {
+                    let accumulator = self.groups.accumulator(0, a);
+                    let Some(arg) = &aggregate.arg else {
+                        accumulator.add_rows(self.batch.len);
+                        continue;
+                    };
+                    match eval(arg, &self.batch, self.params)? {
+                        Vector::Int(xs, valid) => accumulator.add_integers(&xs, valid.as_deref())?,
+                        Vector::Real(xs, valid) => accumulator.add_reals(&xs, valid.as_deref())?,
+                        values => {
+                            for i in 0..self.batch.len {
+                                accumulator.add_value(Cow::Owned(values.get(i)))?;
+                            }
+                        }
+                    }
+                }
+                self.batch.clear();
+                return Ok(());
+            }
             let ids = self.groups.assign(self.group, &keys, self.batch.len);
             for (a, aggregate) in self.group.aggregates.iter().enumerate() {
                 let Some(arg) = &aggregate.arg else {
@@ -487,6 +906,44 @@ impl Column {
         Ok(())
     }
 
+    fn push_nulls(&mut self, n: usize) {
+        match self {
+            Column::Int(xs, valid) => {
+                xs.resize(xs.len() + n, 0);
+                valid.resize(valid.len() + n, false);
+            }
+            Column::Real(xs, valid) => {
+                xs.resize(xs.len() + n, 0.0);
+                valid.resize(valid.len() + n, false);
+            }
+            Column::Any(vs) => vs.resize(vs.len() + n, Value::Null),
+        }
+    }
+
+    fn extend_from(&mut self, view: &ColumnView, rows: std::ops::Range<usize>) -> Result<()> {
+        let extend_valid = |valid: &mut Vec<bool>| match view.validity(rows.clone()) {
+            Some(bytes) => valid.extend(bytes.iter().map(|&b| b != 0)),
+            None => valid.resize(valid.len() + rows.len(), true),
+        };
+        match (&mut *self, view.kind()) {
+            (_, Kind::Nulls) => self.push_nulls(rows.len()),
+            (Column::Int(xs, valid), Kind::Integer) => {
+                xs.extend(view.words(rows.clone()).map(|w| w as i64));
+                extend_valid(valid);
+            }
+            (Column::Real(xs, valid), Kind::Real) => {
+                xs.extend(view.words(rows.clone()).map(f64::from_bits));
+                extend_valid(valid);
+            }
+            (column, _) => {
+                for i in rows {
+                    column.push(view.value(i)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn make_any(&mut self) {
         let len = self.len();
         let values = (0..len).map(|i| self.get(i)).collect();
@@ -571,6 +1028,23 @@ struct Batch {
     columns: Vec<Option<Column>>,
 }
 
+impl columnar::Sink for Worker<'_> {
+    fn row(&mut self, data: &[u8]) -> Result<()> {
+        self.push_stored(data)
+    }
+
+    fn rows(&mut self, rows: &[&[u8]]) -> Result<()> {
+        for row in rows {
+            self.push_stored(row)?;
+        }
+        Ok(())
+    }
+
+    fn chunk(&mut self, chunk: &Chunk, rows: std::ops::Range<usize>, skip: &[usize]) -> Result<()> {
+        self.push_chunk(chunk, rows, skip)
+    }
+}
+
 impl Batch {
     fn new(table: &TableSchema, needed: &[bool]) -> Batch {
         let columns = table.columns.iter().zip(needed).map(|(c, &n)| n.then(|| Column::for_type(c.ty))).collect();
@@ -595,6 +1069,20 @@ impl Batch {
         })?;
         result?;
         self.len += 1;
+        Ok(())
+    }
+
+    /// Adds a run of a chunk's rows: integer and real columns are copied as
+    /// they lie, without decoding row by row.
+    fn push_chunk(&mut self, chunk: &Chunk, rows: std::ops::Range<usize>) -> Result<()> {
+        for (c, column) in self.columns.iter_mut().enumerate() {
+            let Some(column) = column else { continue };
+            match chunk.column(c) {
+                None => column.push_nulls(rows.len()),
+                Some(view) => column.extend_from(&view, rows.clone())?,
+            }
+        }
+        self.len += rows.len();
         Ok(())
     }
 
@@ -954,8 +1442,17 @@ impl Hasher for FastHasher {
 
 type Fast = BuildHasherDefault<FastHasher>;
 
+/// The group of a row that is passed over.
+const SKIPPED: u32 = u32::MAX;
+
+/// Rows per block when grouping straight from a chunk.
+const DIRECT_BLOCK: usize = 2048;
+
 /// Slots in a group table's cache of recent integer keys (a power of two).
 const RECENT: usize = 256;
+
+/// Integer keys below this get a group table's array, not its hash table.
+const DENSE: usize = 1024;
 
 /// The groups one worker has found, and their accumulators.
 struct GroupTable {
@@ -965,6 +1462,9 @@ struct GroupTable {
     null_group: Option<u32>,
     /// Every other group, by its encoded key.
     by_bytes: HashMap<Vec<u8>, u32, Fast>,
+    /// Groups of small non-negative integer keys (below `DENSE`), by key:
+    /// one array lookup, as for `GROUP BY x % 10`.
+    dense: Vec<u32>,
     /// The integer keys found most recently, by a hash of the key: most
     /// lookups end here, without a probe of `by_int`.
     recent: Box<[(i64, u32); RECENT]>,
@@ -981,6 +1481,7 @@ impl GroupTable {
             by_int: HashMap::default(),
             null_group: None,
             by_bytes: HashMap::default(),
+            dense: Vec::new(),
             recent: Box::new([(0, u32::MAX); RECENT]),
             keys: Vec::new(),
             accumulators: Vec::new(),
@@ -1005,6 +1506,24 @@ impl GroupTable {
     }
 
     fn int_group(&mut self, key: i64) -> u32 {
+        if (0..DENSE as i64).contains(&key) {
+            let k = key as usize;
+            if let Some(&id) = self.dense.get(k)
+                && id != u32::MAX
+            {
+                return id;
+            }
+            let id = self.int_group_slow(key);
+            if self.dense.len() <= k {
+                self.dense.resize(k + 1, u32::MAX);
+            }
+            self.dense[k] = id;
+            return id;
+        }
+        self.int_group_slow(key)
+    }
+
+    fn int_group_slow(&mut self, key: i64) -> u32 {
         let slot = ((key as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - RECENT.trailing_zeros())) as usize;
         let (recent_key, recent_id) = self.recent[slot];
         if recent_key == key && recent_id != u32::MAX {
@@ -1225,6 +1744,21 @@ mod tests {
             check(&mut session, &sql.replace('?', "3"));
         }
         session.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn scans_without_column_sections_agree() {
+        // Files written without sections are read row by row.
+        let dir = TempDir::new("vector-no-sections");
+        let opts = Options { memtable_size: 256 << 10, column_sections: false, ..Options::default() };
+        let db = Database::open_with(dir.path(), opts).unwrap();
+        fill(&db);
+        db.kv().flush().unwrap();
+        db.execute("UPDATE t SET a = a + 1 WHERE id % 13 = 0").unwrap();
+        let mut session = db.session();
+        for sql in QUERIES {
+            check(&mut session, &sql.replace('?', "3"));
+        }
     }
 
     #[test]

@@ -25,6 +25,7 @@
 
 mod ast;
 mod catalog;
+mod columnar;
 mod encoding;
 mod exec;
 mod expr;
@@ -225,7 +226,16 @@ impl Database {
     }
 
     pub fn open_with(path: impl AsRef<Path>, opts: Options) -> Result<Database> {
+        let column_sections = opts.column_sections;
         let kv = Arc::new(Db::open_with(path, opts)?);
+        if column_sections {
+            // Table files also keep each table's columns, for scans to read.
+            kv.set_section_builder(
+                Arc::new(|| Box::new(columnar::SectionWriter::default())),
+                // A failure here resurfaces when a query reads the section.
+                Arc::new(|table| drop(table.columnar(columnar::Section::parse))),
+            );
+        }
         let repl = Arc::new(Replication::load(&kv)?);
         Ok(Database {
             shared: Arc::new(Shared {

@@ -1,16 +1,20 @@
-//! A sorted map from byte-string keys, built for the memtable.
+//! A sorted map from byte-string keys to byte-string values (or deletion
+//! markers), built for the memtable.
 //!
 //! The standard `BTreeMap` searches each node from the left. Keys that
 //! arrive in increasing order, the common case for tables with growing
 //! primary keys, always land at the right edge, so every insert scans every
-//! node on the way down. This B+tree differs in three ways:
+//! node on the way down. This B+tree differs in four ways:
 //!
 //! - nodes are searched by bisection, and hold up to 64 entries;
 //! - it remembers the last few leaves it inserted into (its *fingers*), and
 //!   a key that belongs in one of them skips the search from the root. There
 //!   are several because writes interleave: a table's row keys and its index
 //!   keys grow in different parts of the tree;
-//! - leaves are linked, so ordered iteration walks from leaf to leaf.
+//! - leaves are linked, so ordered iteration walks from leaf to leaf;
+//! - each leaf keeps its values back to back in one buffer, rather than one
+//!   allocation per value: storing a value allocates nothing most of the
+//!   time, and a scan reads a leaf's values from contiguous memory.
 //!
 //! Entries are never removed (the memtable records deletions as values), so
 //! nodes only ever split. Nodes live in a vector and refer to each other by
@@ -25,10 +29,29 @@ const CAPACITY: usize = 64;
 const NONE: u32 = u32::MAX;
 const FINGERS: usize = 4;
 
-enum Node<V> {
+/// Where a value lies in its leaf's buffer; a deletion has no bytes.
+#[derive(Clone, Copy)]
+struct Span {
+    start: u32,
+    len: u32,
+}
+
+const DELETED: u32 = u32::MAX;
+
+impl Span {
+    fn len(self) -> usize {
+        if self.len == DELETED { 0 } else { self.len as usize }
+    }
+}
+
+enum Node {
     Leaf {
         keys: Vec<Key>,
-        values: Vec<V>,
+        spans: Vec<Span>,
+        /// The values, back to back. Replaced values stay until the leaf
+        /// next compacts; `garbage` counts their bytes.
+        data: Vec<u8>,
+        garbage: usize,
         /// The leaf with the next keys, or `NONE`.
         next: u32,
     },
@@ -36,8 +59,33 @@ enum Node<V> {
     Inner { keys: Vec<Key>, children: Vec<u32> },
 }
 
-pub struct KeyMap<V> {
-    nodes: Vec<Node<V>>,
+fn value(data: &[u8], span: Span) -> Option<&[u8]> {
+    (span.len != DELETED).then(|| &data[span.start as usize..span.start as usize + span.len as usize])
+}
+
+/// Appends `value` to a leaf buffer and says where it went.
+fn store(data: &mut Vec<u8>, value: Option<&[u8]>) -> Span {
+    match value {
+        None => Span { start: 0, len: DELETED },
+        Some(v) => {
+            let start = data.len() as u32;
+            data.extend_from_slice(v);
+            Span { start, len: v.len() as u32 }
+        }
+    }
+}
+
+/// A fresh buffer holding just the values `spans` point to, re-pointed.
+fn compacted(data: &[u8], spans: &mut [Span]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(spans.iter().map(|s| s.len()).sum());
+    for span in spans {
+        *span = store(&mut out, value(data, *span));
+    }
+    out
+}
+
+pub struct KeyMap {
+    nodes: Vec<Node>,
     root: u32,
     first_leaf: u32,
     /// Leaves recently inserted into, and which to replace next.
@@ -46,9 +94,9 @@ pub struct KeyMap<V> {
     len: usize,
 }
 
-impl<V> Default for KeyMap<V> {
+impl Default for KeyMap {
     fn default() -> Self {
-        let leaf = Node::Leaf { keys: Vec::new(), values: Vec::new(), next: NONE };
+        let leaf = Node::Leaf { keys: Vec::new(), spans: Vec::new(), data: Vec::new(), garbage: 0, next: NONE };
         KeyMap { nodes: vec![leaf], root: 0, first_leaf: 0, fingers: [0; FINGERS], next_finger: 0, len: 0 }
     }
 }
@@ -58,7 +106,7 @@ fn search(keys: &[Key], key: &[u8]) -> Result<usize, usize> {
     keys.binary_search_by(|k| key_cmp(k.as_slice(), key))
 }
 
-impl<V> KeyMap<V> {
+impl KeyMap {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.len
@@ -101,24 +149,37 @@ impl<V> KeyMap<V> {
         }
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<&V> {
-        let Node::Leaf { keys, values, .. } = &self.nodes[self.find_leaf(key).0 as usize] else { unreachable!() };
-        search(keys, key).ok().map(|i| &values[i])
+    /// `None` if the key isn't here; `Some(None)` if it is a deletion.
+    pub fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
+        let Node::Leaf { keys, spans, data, .. } = &self.nodes[self.find_leaf(key).0 as usize] else { unreachable!() };
+        search(keys, key).ok().map(|i| value(data, spans[i]))
     }
 
-    /// Inserts or replaces, returning the value replaced.
-    pub fn insert(&mut self, key: &[u8], value: V) -> Option<V> {
+    /// Inserts or replaces a value (`None` records a deletion). Returns
+    /// `None` for a new key, or the length of the value replaced (`Some(None)`
+    /// if that was a deletion).
+    pub fn insert(&mut self, key: &[u8], new: Option<&[u8]>) -> Option<Option<usize>> {
         let (leaf, fingered) = self.find_leaf(key);
         if !fingered {
             self.fingers[self.next_finger] = leaf;
             self.next_finger = (self.next_finger + 1) % FINGERS;
         }
-        let Node::Leaf { keys, values, .. } = &mut self.nodes[leaf as usize] else { unreachable!() };
+        let Node::Leaf { keys, spans, data, garbage, .. } = &mut self.nodes[leaf as usize] else { unreachable!() };
         match search(keys, key) {
-            Ok(i) => return Some(std::mem::replace(&mut values[i], value)),
+            Ok(i) => {
+                let old = spans[i];
+                *garbage += old.len();
+                spans[i] = store(data, new);
+                if *garbage > 4096 && *garbage * 2 > data.len() {
+                    *data = compacted(data, spans);
+                    *garbage = 0;
+                }
+                return Some((old.len != DELETED).then(|| old.len()));
+            }
             Err(i) => {
                 keys.insert(i, Key::new(key));
-                values.insert(i, value);
+                let span = store(data, new);
+                spans.insert(i, span);
             }
         }
         self.len += 1;
@@ -146,13 +207,25 @@ impl<V> KeyMap<V> {
             }
             let new_index = self.nodes.len() as u32;
             let sibling = match &mut self.nodes[node as usize] {
-                Node::Leaf { keys, values, next } if keys.len() > CAPACITY => {
+                Node::Leaf { keys, spans, data, garbage, next } if keys.len() > CAPACITY => {
                     let half = keys.len() / 2;
                     let right_keys = keys.split_off(half);
-                    let right_values = values.split_off(half);
+                    let mut right_spans = spans.split_off(half);
+                    let right_data = compacted(data, &mut right_spans);
+                    *data = compacted(data, spans);
+                    *garbage = 0;
                     let separator = right_keys[0].clone();
                     let right_next = std::mem::replace(next, new_index);
-                    Some((separator, Node::Leaf { keys: right_keys, values: right_values, next: right_next }))
+                    Some((
+                        separator,
+                        Node::Leaf {
+                            keys: right_keys,
+                            spans: right_spans,
+                            data: right_data,
+                            garbage: 0,
+                            next: right_next,
+                        },
+                    ))
                 }
                 Node::Inner { keys, children } if keys.len() > CAPACITY => {
                     let half = keys.len() / 2;
@@ -174,7 +247,7 @@ impl<V> KeyMap<V> {
     }
 
     /// Entries in key order, starting at `from`.
-    pub fn range_from(&self, from: Bound<&[u8]>) -> Iter<'_, V> {
+    pub fn range_from(&self, from: Bound<&[u8]>) -> Iter<'_> {
         let (leaf, pos) = match from {
             Bound::Unbounded => (self.first_leaf, 0),
             Bound::Included(key) | Bound::Excluded(key) => {
@@ -189,29 +262,31 @@ impl<V> KeyMap<V> {
         Iter { map: self, leaf, pos }
     }
 
-    pub fn iter(&self) -> Iter<'_, V> {
+    pub fn iter(&self) -> Iter<'_> {
         self.range_from(Bound::Unbounded)
     }
 }
 
-pub struct Iter<'a, V> {
-    map: &'a KeyMap<V>,
+pub struct Iter<'a> {
+    map: &'a KeyMap,
     leaf: u32,
     pos: usize,
 }
 
-impl<'a, V> Iterator for Iter<'a, V> {
-    type Item = (&'a [u8], &'a V);
+impl<'a> Iterator for Iter<'a> {
+    type Item = (&'a [u8], Option<&'a [u8]>);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.leaf == NONE {
                 return None;
             }
-            let Node::Leaf { keys, values, next } = &self.map.nodes[self.leaf as usize] else { unreachable!() };
+            let Node::Leaf { keys, spans, data, next, .. } = &self.map.nodes[self.leaf as usize] else {
+                unreachable!()
+            };
             if self.pos < keys.len() {
                 self.pos += 1;
-                return Some((keys[self.pos - 1].as_slice(), &values[self.pos - 1]));
+                return Some((keys[self.pos - 1].as_slice(), value(data, spans[self.pos - 1])));
             }
             (self.leaf, self.pos) = (*next, 0);
         }
@@ -234,29 +309,33 @@ mod tests {
             x % n
         };
         for order in 0..3 {
-            let (mut ours, mut model) = (KeyMap::default(), BTreeMap::new());
+            let (mut ours, mut model) = (KeyMap::default(), BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new());
             for i in 0..20_000u64 {
                 let k = match order {
-                    0 => i,           // increasing: the finger's case
+                    0 => i,           // increasing: the fingers' case
                     1 => 20_000 - i,  // decreasing
                     _ => rand(5_000), // random, with many overwrites
                 };
                 // Mixed lengths, some longer than a key stores inline.
                 let key = format!("{k:06}{}", "x".repeat((k % 40) as usize)).into_bytes();
-                assert_eq!(ours.insert(&key, i), model.insert(key.clone(), i));
+                // Values of varying sizes, and deletions.
+                let value = (rand(7) != 0).then(|| format!("{i}-{}", "v".repeat(rand(200) as usize)).into_bytes());
+                let old = model.insert(key.clone(), value.clone());
+                assert_eq!(ours.insert(&key, value.as_deref()), old.map(|v| v.map(|v| v.len())));
             }
             assert_eq!(ours.len(), model.len());
-            let all: Vec<_> = ours.iter().map(|(k, v)| (k.to_vec(), *v)).collect();
-            assert_eq!(all, model.iter().map(|(k, v)| (k.clone(), *v)).collect::<Vec<_>>());
+            let all: Vec<_> = ours.iter().map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect();
+            assert_eq!(all, model.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>());
             for _ in 0..2_000 {
                 let probe = format!("{:06}", rand(21_000)).into_bytes();
-                assert_eq!(ours.get(&probe), model.get(&probe));
+                assert_eq!(ours.get(&probe), model.get(&probe).map(|v| v.as_deref()));
                 for bound in [Bound::Included(probe.as_slice()), Bound::Excluded(probe.as_slice())] {
-                    let got: Vec<_> = ours.range_from(bound).take(5).map(|(k, v)| (k.to_vec(), *v)).collect();
+                    let got: Vec<_> =
+                        ours.range_from(bound).take(5).map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect();
                     let want: Vec<_> = model
                         .range::<[u8], _>((bound, Bound::Unbounded))
                         .take(5)
-                        .map(|(k, v)| (k.clone(), *v))
+                        .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     assert_eq!(got, want);
                 }

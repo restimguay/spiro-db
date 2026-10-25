@@ -349,3 +349,37 @@ fn db_is_send_and_sync() {
     send_sync::<Db>();
     send::<DbIterator>();
 }
+
+#[test]
+fn scan_lends_the_same_entries_as_range() {
+    let dir = TempDir::new("scan");
+    let db = Db::open_with(&dir.0, Options { memtable_size: 64 << 10, ..Options::default() }).unwrap();
+    for i in 0..5000u32 {
+        db.put(format!("key{i:05}"), format!("value{i}")).unwrap();
+        if i % 7 == 0 {
+            db.delete(format!("key{:05}", i / 2)).unwrap();
+        }
+    }
+    db.flush().unwrap();
+    for i in (0..5000u32).step_by(3) {
+        db.put(format!("key{i:05}"), "again").unwrap();
+    }
+    for (lo, hi) in [("key00000", "key99999"), ("key01234", "key03000"), ("key04999", "key05000"), ("z", "zz")] {
+        let copied: Vec<_> = db.range(lo..hi).map(Result::unwrap).collect();
+        let mut lent = Vec::new();
+        db.scan(lo..hi, |k, v| {
+            lent.push((k.to_vec(), v.to_vec()));
+            true
+        })
+        .unwrap();
+        assert_eq!(lent, copied, "{lo}..{hi}");
+    }
+    // Stopping early.
+    let mut first = Vec::new();
+    db.scan::<&str, _>(.., |k, _| {
+        first.push(k.to_vec());
+        first.len() < 10
+    })
+    .unwrap();
+    assert_eq!(first.len(), 10);
+}

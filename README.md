@@ -119,11 +119,26 @@ Queries that group, sort or remove duplicates need every row first; those are co
 
 Aggregate queries on one table (`count`, `sum`, `avg`, `min`, `max`, with or without `GROUP BY`, `WHERE` and `HAVING`) take a faster path:
 
+- **Columns.** Every table file also stores its SQL rows column by column (see [column sections](#column-sections)), so a full scan reads only the columns the query uses. Integers and reals are fixed-width arrays, copied into the batch a run at a time without decoding any rows.
 - **Batches.** Rows are gathered 1,024 at a time, decoding only the columns the query reads straight from the stored bytes. Integer and real columns become plain arrays, with a mask for NULLs. Expressions such as `score % 10` or `price * qty > 100` then run as tight loops over the arrays, and groups are found by hashing, with a fast path for a single integer key.
 - **Every core.** A full scan of a large table is split into key ranges at the boundaries of the stored blocks, plus sampled keys from the in-memory table. A pool of threads, one per core, takes turns claiming ranges, so the faster cores take more. Each thread aggregates its share, and the partial groups are merged. The threads read from one fixed set of files, so they all see the same data. `db.set_scan_threads(n)` caps the threads one query may use; 1 keeps every query on a single core.
 - **Same answers.** Anything without a fast path (text functions, `CASE`, an integer overflow, a division by zero) is evaluated row by row with the ordinary evaluator, so results and error messages are the same. A test runs about 45 aggregate queries both ways over 20,000 random rows with NULLs, reals, text and booleans, single-threaded and split, and requires identical results.
 
 Scans also got cheaper underneath. Each layer of the storage engine now loops over its own entries, instead of every entry climbing through all the layers. A block whose last key is inside the range needs no per-entry bound checks.
+
+### Column sections
+
+Rows stay in the table files' blocks, where point lookups, inserts and updates want them. Whenever the engine writes a table file (a flush or a compaction), it also passes every entry to the SQL layer, which lays out each SQL table's rows in that file as a *chunk*:
+
+- the primary keys in order (plain integers for an `INTEGER PRIMARY KEY` or the hidden row id);
+- one flag per row that marks deletions;
+- each column as its own array: 8 bytes per integer or real, a byte per boolean, offsets and bytes for text, with a mask for NULLs.
+
+The section is stored in the table file it describes, after the index, with its own checksum, so it is written, compacted and deleted along with that file. The background thread that writes a file also parses its section, so queries find it ready.
+
+A full scan merges the newest data with the files, as every read in an LSM tree does: each key's newest version counts, and deletions hide older ones. The memtable's rows are laid out the same way as they are read, a few thousand at a time and decoding only the columns needed. For aggregates the order of rows doesn't matter, so tables keyed by integers skip the ordered merge. Each source in turn, newest first, hands over every row that no newer source has a version of, jumping from one newer key to the next, and the long stretches between go over whole. Other tables use an ordered merge that still moves in runs.
+
+Sections cost disk space and background work. For the benchmark's table, mostly text, the database takes 30 MB with them and 17 MB without; insert speed is unchanged. Turn them off with `Options { column_sections: false, .. }`; full scans then read rows, as before.
 
 ## The `spiro` shell
 
@@ -293,6 +308,7 @@ for item in db.range("user:".."user;") {
 - **New row ids skip the uniqueness check.** A table's row-id counter is above every id it has ever stored, and it is written in the same atomic batch as the rows. An `INSERT` with an id at or past the counter therefore can't collide, and doesn't probe the memtable and every table's bloom filter to make sure, as SQLite knows for its rowid tables.
 - **Flushes.** When the memtable reaches `memtable_size`, it is frozen and a fresh one takes over. A background thread writes the frozen memtable out as an immutable, sorted table file in level 0.
 - **Compaction.** When level 0 holds `l0_compaction_trigger` tables, a second background thread merges them with the overlapping level-1 tables. Overwritten values and deletion markers disappear in the process. If level 0 backs up to `l0_stop_writes_trigger`, writers pause until compaction catches up.
+- **Scans** come in two forms: `db.range(..)`, a standard iterator that yields owned copies, and `db.scan(.., |key, value| ...)`, which lends each entry from the engine's own buffers and allocates nothing per entry.
 - **Reads** consult the memtables, then level 0 newest first, then level 1 by binary search. In each table, a bloom filter rules out most absent keys without touching disk, an in-memory index locates the one block that could hold the key, and a CLOCK block cache keeps hot blocks in memory.
 - **Concurrent reads.** Readers never touch the global lock. The current set of memtables and tables (the *super version*) is published into 32 cache-line-padded slots, and each thread reads its own, so readers on different cores don't contend.
 
@@ -310,10 +326,10 @@ for item in db.range("user:".."user;") {
 | File | Layout |
 |---|---|
 | `NNNNNN.log` | records of `[crc32c u32][len u32][write batch]` |
-| `NNNNNN.sst` | `[data block + crc]… [bloom filter + crc] [index block + crc] [48-byte footer]` |
+| `NNNNNN.sst` | `[data block + crc]… [bloom filter + crc] [index block + crc] [column section + crc] [64-byte footer]` |
 | `MANIFEST` | `[magic][crc][next file, log number, per level: tables with number, size, key range]` |
 
-Data blocks are about 4 KiB. Each key is stored as the length it shares with the previous key plus the remainder, with a full key every 16 entries (a *restart point*). A lookup binary-searches the restart points, then scans at most 16 entries.
+The column section is optional, and files with the older 48-byte footer (no section) still open. Its layout is described in [`src/sql/columnar.rs`](src/sql/columnar.rs). Data blocks are about 4 KiB. Each key is stored as the length it shares with the previous key plus the remainder, with a full key every 16 entries (a *restart point*). A lookup binary-searches the restart points, then scans at most 16 entries.
 
 ## Performance: SpiroDB vs SQLite, PostgreSQL, MariaDB, RocksDB and DuckDB
 
@@ -341,18 +357,18 @@ A table with an `INTEGER PRIMARY KEY`, three other columns and a secondary index
 
 | Workload | SpiroDB | SQLite | PostgreSQL | MariaDB | DuckDB |
 |---|---:|---:|---:|---:|---:|
-| `INSERT`, autocommit | **2.1** | 17.1 | 12.8 | 17.8 | 110 |
-| `UPDATE` by primary key | **3.7** | 12.3 | 15.2 | 18.4 | 119 |
-| `SELECT` by primary key | **0.66** | 2.0 | 11.7 | 11.3 | 98 |
-| `SELECT` by index (10 rows) | **1.6** | 2.3 | 15.9 | 13.5 | 78 |
-| `INSERT`, 1,000 per transaction | **0.65** | 0.82 | 12.0 | 13.3 | 43 |
-| `SELECT` 100-row range | **3.3** | 4.5 | 26.0 | 24.0 | 254 |
-| `count(*)` + `avg()`, full scan (per row) | 0.026 | 0.015 | 0.038 | 0.058 | **0.012** |
-| `GROUP BY`, full scan (per row) | 0.025 | 0.068 | 0.056 | 0.088 | **0.014** |
+| `INSERT`, autocommit | **2.5** | 18.0 | 13.1 | 18.4 | 115 |
+| `UPDATE` by primary key | **4.0** | 13.1 | 15.0 | 20.1 | 126 |
+| `SELECT` by primary key | **0.78** | 2.1 | 11.4 | 11.8 | 101 |
+| `SELECT` by index (10 rows) | **1.6** | 2.4 | 16.0 | 14.6 | 79 |
+| `INSERT`, 1,000 per transaction | **0.67** | 0.84 | 11.6 | 13.7 | 43 |
+| `SELECT` 100-row range | **3.4** | 4.9 | 26.3 | 25.9 | 257 |
+| `count(*)` + `avg()`, full scan (per row) | **0.006** | 0.016 | 0.038 | 0.061 | 0.007 |
+| `GROUP BY`, full scan (per row) | **0.007** | 0.070 | 0.057 | 0.088 | 0.008 |
 
-SpiroDB is fastest at every transactional workload here, including batched inserts and range scans, where SQLite used to lead.
+SpiroDB is fastest at every workload here. This run was made on a busy machine (load average about 3.5, the same for every engine), which is why some rows read slower than in a quiet run.
 
-DuckDB stores data by column and processes it in batches, which makes it hard to beat on full-table aggregates and slow at single-row work. It is built for analytics, not for the transactional workload the rest of these rows measure. On a single core, SpiroDB's batched aggregation (see [aggregates](#aggregates-batches-and-every-core)) beats SQLite, PostgreSQL and MariaDB on `GROUP BY`, while SQLite is faster at `count` + `avg`. With every core, the default, SpiroDB's full scans measure 0.007 (`count` + `avg`) and 0.006 (`GROUP BY`) here, though by then they also depend on whatever else the machine is doing.
+The two full scans are the closest. DuckDB stores data by column and processes it in batches, which makes it very fast at full-table aggregates (and slow at single-row work). SpiroDB keeps a copy of each table's columns in its table files ([column sections](#column-sections)) and aggregates them in batches, which brings it level with DuckDB or just ahead: in other runs DuckDB's `GROUP BY` measured anywhere from 0.006 to 0.015, so on that row the order can flip from one run to the next. With every core, the default, SpiroDB's full scans measure 0.004 to 0.005 (`count` + `avg`) and 0.003 (`GROUP BY`).
 
 PostgreSQL and MariaDB are servers: every statement crosses a socket to another process, which costs them 11 to 12 µs per statement here before any work is done. Their small-query numbers mostly measure that, as for any client-server database. Their query engines show in the full scans, where that cost is paid once.
 
@@ -362,14 +378,16 @@ The storage engine on its own, against RocksDB and against the other three used 
 
 | Workload | SpiroDB | RocksDB | SQLite | PostgreSQL | MariaDB |
 |---|---:|---:|---:|---:|---:|
-| Sequential writes | **1.4** | 1.7 | 9.9 | 11.5 | 16.5 |
-| Batched writes (1,000 per batch) | **0.15** | 0.33 | 0.84 | 10.0 | 11.9 |
-| Random writes | **1.5** | 2.0 | 47.8 | 12.1 | 35.6 |
-| Random reads | **1.0** | 1.4 | 5.2 | 14.7 | 21.8 |
-| Random reads, 10 threads (per read) | **0.31** | 0.43 | 3.6 | 3.8 | 5.7 |
-| Reads of missing keys | **0.16** | 0.29 | 3.5 | 11.5 | 21.1 |
-| Seek + read 100 keys | **8.6** | 11.9 | 9.1 | 92 | 124 |
-| Full scan (per key) | 0.074 | 0.090 | **0.053** | 0.114 | 0.313 |
+| Sequential writes | **1.4** | 1.6 | 9.9 | 11.7 | 15.8 |
+| Batched writes (1,000 per batch) | **0.16** | 0.34 | 0.83 | 10.1 | 11.9 |
+| Random writes | **1.5** | 2.1 | 48.5 | 12.3 | 34.8 |
+| Random reads | **1.1** | 1.5 | 5.0 | 14.6 | 21.6 |
+| Random reads, 10 threads (per read) | **0.30** | 0.45 | 3.4 | 3.7 | 5.6 |
+| Reads of missing keys | **0.16** | 0.28 | 5.3 | 11.7 | 21.5 |
+| Seek + read 100 keys | **4.9** | 12.2 | 8.9 | 92 | 125 |
+| Full scan (per key) | **0.037** | 0.092 | 0.075 | 0.117 | 0.293 |
+
+Scans read each entry where it lies, as the other engines' iterators hand out pointers into their own buffers. SpiroDB's benchmark uses `Db::scan`, which lends each key and value to a closure. `Db::range` is a standard Rust iterator, so it must copy every entry it yields, which roughly doubles the cost of a scan.
 
 RocksDB shares SpiroDB's LSM design, so it is the like-for-like comparison. Configured with the same memtable, block size, bloom filters, cache and no compression, it trails SpiroDB on every workload here. Batched writes used to be its win. The memtable's B+tree (see [the storage engine](#the-storage-engine)) and ordered rather than full syncs of background table files took SpiroDB from 0.47 to 0.15.
 

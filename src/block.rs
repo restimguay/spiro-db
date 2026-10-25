@@ -11,7 +11,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::coding::{get_varint, key_lt, put_varint, u32_at};
+use crate::coding::{fast_varint, key_lt, put_varint, u32_at};
 use crate::error::{Result, corruption};
 use crate::iter::Visit;
 
@@ -114,15 +114,12 @@ struct Entry {
     end: usize,
 }
 
+#[inline]
 fn decode_entry(data: &[u8], mut pos: usize) -> Option<Entry> {
     if pos >= data.len() {
         return None;
     }
-    let mut varint = || {
-        let (v, n) = get_varint(&data[pos..])?;
-        pos += n;
-        usize::try_from(v).ok()
-    };
+    let mut varint = || usize::try_from(fast_varint(data, &mut pos)?).ok();
     let (shared, key_len, tag) = (varint()?, varint()?, varint()?);
     let key_start = pos;
     let value_start = key_start.checked_add(key_len)?;

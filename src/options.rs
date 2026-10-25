@@ -23,6 +23,11 @@ pub struct Options {
     pub l0_stop_writes_trigger: usize,
     /// Size at which a compaction starts a new output table.
     pub target_file_size: u64,
+    /// For SQL databases: also store each table's rows column by column in
+    /// every table file, so aggregates over whole tables read only the
+    /// columns they need. Costs disk space (up to about as much again for
+    /// the rows) and background work when tables are written.
+    pub column_sections: bool,
 }
 
 impl Default for Options {
@@ -36,6 +41,7 @@ impl Default for Options {
             l0_compaction_trigger: 4,
             l0_stop_writes_trigger: 12,
             target_file_size: 16 << 20,
+            column_sections: true,
         }
     }
 }

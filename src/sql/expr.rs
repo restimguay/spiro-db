@@ -637,6 +637,145 @@ impl Accumulator {
         }
     }
 
+    /// Counts `n` rows, for `count(*)`.
+    pub fn add_rows(&mut self, n: usize) {
+        if let State::Count(count) = &mut self.state {
+            *count += n as i64;
+        }
+    }
+
+    /// `add_integer` for each value whose `valid` flag is set (all of them
+    /// if `None`), with the state looked at once rather than per value.
+    pub fn add_integers(&mut self, xs: &[i64], valid: Option<&[bool]>) -> Result<()> {
+        let keep = |i: usize| valid.is_none_or(|v| v[i]);
+        match &mut self.state {
+            _ if self.seen.is_some() => {}
+            State::Count(n) => {
+                *n += valid.map_or(xs.len(), |v| v.iter().filter(|&&b| b).count()) as i64;
+                return Ok(());
+            }
+            State::Sum(Value::Integer(sum)) => {
+                let mut total = *sum;
+                for (i, &x) in xs.iter().enumerate() {
+                    if keep(i) {
+                        total = total.checked_add(x).ok_or_else(|| sql_error("integer overflow"))?;
+                    }
+                }
+                *sum = total;
+                return Ok(());
+            }
+            State::Avg(sum, n) => {
+                for (i, &x) in xs.iter().enumerate() {
+                    if keep(i) {
+                        *sum += x as f64;
+                        *n += 1;
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        for (i, &x) in xs.iter().enumerate() {
+            if keep(i) {
+                self.add_integer(x)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `add_integer` for each value that isn't NULL (`None`), with the state
+    /// looked at once.
+    pub fn add_integers_from(&mut self, values: impl Iterator<Item = Option<i64>>) -> Result<()> {
+        match &mut self.state {
+            _ if self.seen.is_some() => {}
+            State::Count(n) => {
+                *n += values.filter(Option::is_some).count() as i64;
+                return Ok(());
+            }
+            State::Sum(Value::Integer(sum)) => {
+                let mut total = *sum;
+                for x in values.flatten() {
+                    total = total.checked_add(x).ok_or_else(|| sql_error("integer overflow"))?;
+                }
+                *sum = total;
+                return Ok(());
+            }
+            State::Avg(sum, n) => {
+                // Summed exactly as integers, then added once: the same
+                // result as adding each value to the real sum while the
+                // partial sums stay exact (below 2^53), and much faster.
+                let (mut total, mut count) = (0i128, 0i64);
+                for x in values.flatten() {
+                    total += x as i128;
+                    count += 1;
+                }
+                *sum += total as f64;
+                *n += count;
+                return Ok(());
+            }
+            _ => {}
+        }
+        values.flatten().try_for_each(|x| self.add_integer(x))
+    }
+
+    /// `add_real` for each value that isn't NULL; see `add_integers_from`.
+    pub fn add_reals_from(&mut self, values: impl Iterator<Item = Option<f64>>) -> Result<()> {
+        match &mut self.state {
+            _ if self.seen.is_some() => {}
+            State::Count(n) => {
+                *n += values.filter(Option::is_some).count() as i64;
+                return Ok(());
+            }
+            State::Avg(sum, n) => {
+                for x in values.flatten() {
+                    *sum += x;
+                    *n += 1;
+                }
+                return Ok(());
+            }
+            State::Sum(Value::Real(sum)) => {
+                for x in values.flatten() {
+                    *sum += x;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        values.flatten().try_for_each(|x| self.add_real(x))
+    }
+
+    /// `add_real` for each value whose `valid` flag is set; see `add_integers`.
+    pub fn add_reals(&mut self, xs: &[f64], valid: Option<&[bool]>) -> Result<()> {
+        let keep = |i: usize| valid.is_none_or(|v| v[i]);
+        match &mut self.state {
+            _ if self.seen.is_some() => {}
+            State::Avg(sum, n) => {
+                for (i, &x) in xs.iter().enumerate() {
+                    if keep(i) {
+                        *sum += x;
+                        *n += 1;
+                    }
+                }
+                return Ok(());
+            }
+            State::Sum(Value::Real(sum)) => {
+                for (i, &x) in xs.iter().enumerate() {
+                    if keep(i) {
+                        *sum += x;
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        for (i, &x) in xs.iter().enumerate() {
+            if keep(i) {
+                self.add_real(x)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Adds a non-NULL integer argument: `add_value` without the boxing.
     pub fn add_integer(&mut self, x: i64) -> Result<()> {
         match &mut self.state {

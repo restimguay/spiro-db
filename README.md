@@ -422,16 +422,16 @@ A table with an `INTEGER PRIMARY KEY`, three other columns and a secondary index
 
 | Workload | SpiroDB | SQLite | PostgreSQL | MariaDB | DuckDB |
 |---|---:|---:|---:|---:|---:|
-| `INSERT`, autocommit | **2.5** | 18.0 | 13.1 | 18.4 | 115 |
-| `UPDATE` by primary key | **4.0** | 13.1 | 15.0 | 20.1 | 126 |
-| `SELECT` by primary key | **0.78** | 2.1 | 11.4 | 11.8 | 101 |
-| `SELECT` by index (10 rows) | **1.6** | 2.4 | 16.0 | 14.6 | 79 |
-| `INSERT`, 1,000 per transaction | **0.67** | 0.84 | 11.6 | 13.7 | 43 |
-| `SELECT` 100-row range | **3.4** | 4.9 | 26.3 | 25.9 | 257 |
-| `count(*)` + `avg()`, full scan (per row) | **0.006** | 0.016 | 0.038 | 0.061 | 0.007 |
-| `GROUP BY`, full scan (per row) | **0.007** | 0.070 | 0.057 | 0.088 | 0.008 |
+| `INSERT`, autocommit | **2.2** | 16.5 | 13.3 | 18.4 | 114 |
+| `UPDATE` by primary key | **3.9** | 12.5 | 15.2 | 18.4 | 124 |
+| `SELECT` by primary key | **0.67** | 2.1 | 11.8 | 12.0 | 102 |
+| `SELECT` by index (10 rows) | **1.6** | 2.3 | 15.8 | 13.5 | 80 |
+| `INSERT`, 1,000 per transaction | **0.66** | 0.95 | 12.2 | 13.3 | 45 |
+| `SELECT` 100-row range | **3.3** | 4.7 | 26.3 | 24.2 | 257 |
+| `count(*)` + `avg()`, full scan (per row) | **0.006** | 0.015 | 0.039 | 0.058 | 0.012 |
+| `GROUP BY`, full scan (per row) | **0.007** | 0.069 | 0.056 | 0.088 | 0.014 |
 
-SpiroDB is fastest at every workload here. This run was made on a busy machine (load average about 3.5, the same for every engine), which is why some rows read slower than in a quiet run.
+SpiroDB is fastest at every workload here. This run was made on a busy machine (load average about 2.5, the same for every engine), which is why some rows read slower than in a quiet run.
 
 The two full scans are the closest. DuckDB stores data by column and processes it in batches, which makes it very fast at full-table aggregates (and slow at single-row work). SpiroDB keeps a copy of each table's columns in its table files ([column sections](#column-sections)) and aggregates them in batches, which brings it level with DuckDB or just ahead: in other runs DuckDB's `GROUP BY` measured anywhere from 0.006 to 0.015, so on that row the order can flip from one run to the next. With every core, the default, SpiroDB's full scans measure 0.004 to 0.005 (`count` + `avg`) and 0.003 (`GROUP BY`).
 
@@ -443,14 +443,14 @@ The storage engine on its own, against RocksDB and against the other three used 
 
 | Workload | SpiroDB | RocksDB | SQLite | PostgreSQL | MariaDB |
 |---|---:|---:|---:|---:|---:|
-| Sequential writes | **1.4** | 1.6 | 9.9 | 11.7 | 15.8 |
-| Batched writes (1,000 per batch) | **0.16** | 0.34 | 0.83 | 10.1 | 11.9 |
-| Random writes | **1.5** | 2.1 | 48.5 | 12.3 | 34.8 |
-| Random reads | **1.1** | 1.5 | 5.0 | 14.6 | 21.6 |
-| Random reads, 10 threads (per read) | **0.30** | 0.45 | 3.4 | 3.7 | 5.6 |
-| Reads of missing keys | **0.16** | 0.28 | 5.3 | 11.7 | 21.5 |
-| Seek + read 100 keys | **4.9** | 12.2 | 8.9 | 92 | 125 |
-| Full scan (per key) | **0.037** | 0.092 | 0.075 | 0.117 | 0.293 |
+| Sequential writes | **1.3** | 1.7 | 9.9 | 11.6 | 16.6 |
+| Batched writes (1,000 per batch) | **0.14** | 0.31 | 0.84 | 10.4 | 11.9 |
+| Random writes | **1.6** | 2.1 | 52.9 | 12.0 | 45.0 |
+| Random reads | **1.2** | 1.5 | 3.7 | 15.9 | 22.8 |
+| Random reads, 10 threads (per read) | **0.31** | 0.45 | 3.7 | 4.2 | 6.0 |
+| Reads of missing keys | **0.17** | 0.29 | 4.0 | 11.9 | 23.0 |
+| Seek + read 100 keys | **4.9** | 12.7 | 9.2 | 106 | 129 |
+| Full scan (per key) | **0.035** | 0.094 | 0.054 | 0.121 | 0.313 |
 
 Scans read each entry where it lies, as the other engines' iterators hand out pointers into their own buffers. SpiroDB's benchmark uses `Db::scan`, which lends each key and value to a closure. `Db::range` is a standard Rust iterator, so it must copy every entry it yields, which roughly doubles the cost of a scan.
 

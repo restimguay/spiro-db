@@ -1,5 +1,6 @@
 //! The syntax tree produced by the parser.
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use super::value::{DataType, Value};
@@ -262,8 +263,7 @@ impl fmt::Display for WindowSpec {
             parts.push(format!("PARTITION BY {}", exprs.join(", ")));
         }
         if !self.order_by.is_empty() {
-            let exprs: Vec<String> =
-                self.order_by.iter().map(|o| format!("{}{}", o.expr, if o.desc { " DESC" } else { "" })).collect();
+            let exprs: Vec<String> = self.order_by.iter().map(ToString::to_string).collect();
             parts.push(format!("ORDER BY {}", exprs.join(", ")));
         }
         if let Some(frame) = &self.frame {
@@ -428,6 +428,47 @@ pub enum JoinKind {
 pub struct OrderBy {
     pub expr: Expr,
     pub desc: bool,
+    /// `NULLS FIRST` (true) or `NULLS LAST` (false), if given.
+    pub nulls_first: Option<bool>,
+}
+
+impl OrderBy {
+    pub fn sort(&self) -> Sort {
+        // NULLs sort below every value unless told otherwise, as in SQLite.
+        Sort { desc: self.desc, nulls_first: self.nulls_first.unwrap_or(!self.desc) }
+    }
+}
+
+impl fmt::Display for OrderBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", self.expr, if self.desc { " DESC" } else { "" })?;
+        match self.nulls_first {
+            Some(true) => f.write_str(" NULLS FIRST"),
+            Some(false) => f.write_str(" NULLS LAST"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// How an ORDER BY key sorts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sort {
+    pub desc: bool,
+    pub nulls_first: bool,
+}
+
+impl Sort {
+    pub fn compare(self, a: &Value, b: &Value) -> Ordering {
+        match (a.is_null(), b.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) if self.nulls_first => Ordering::Less,
+            (true, false) => Ordering::Greater,
+            (false, true) if self.nulls_first => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ if self.desc => b.total_cmp(a),
+            _ => a.total_cmp(b),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -475,12 +516,15 @@ pub enum Expr {
         args: Vec<Expr>,
         distinct: bool,
         star: bool,
+        /// An aggregate's `FILTER (WHERE ...)`.
+        filter: Option<Box<Expr>>,
     },
     /// `name(args) OVER (...)`: a window function.
     Window {
         name: String,
         args: Vec<Expr>,
         star: bool,
+        filter: Option<Box<Expr>>,
         over: Box<WindowSpec>,
     },
     Cast {
@@ -535,9 +579,13 @@ impl Expr {
                 expr.walk(f);
                 pattern.walk(f);
             }
-            Expr::Function { args, .. } => args.iter().for_each(|e| e.walk(f)),
-            Expr::Window { args, over, .. } => {
+            Expr::Function { args, filter, .. } => {
                 args.iter().for_each(|e| e.walk(f));
+                filter.iter().for_each(|e| e.walk(f));
+            }
+            Expr::Window { args, filter, over, .. } => {
+                args.iter().for_each(|e| e.walk(f));
+                filter.iter().for_each(|e| e.walk(f));
                 over.partition_by.iter().for_each(|e| e.walk(f));
                 over.order_by.iter().for_each(|o| o.expr.walk(f));
             }
@@ -583,9 +631,13 @@ impl Expr {
                 f(expr);
                 f(pattern);
             }
-            Expr::Function { args, .. } => args.iter_mut().for_each(&mut *f),
-            Expr::Window { args, over, .. } => {
+            Expr::Function { args, filter, .. } => {
                 args.iter_mut().for_each(&mut *f);
+                filter.iter_mut().for_each(|e| f(e));
+            }
+            Expr::Window { args, filter, over, .. } => {
+                args.iter_mut().for_each(&mut *f);
+                filter.iter_mut().for_each(|e| f(e));
                 over.partition_by.iter_mut().for_each(&mut *f);
                 over.order_by.iter_mut().for_each(|o| f(&mut o.expr));
             }
@@ -608,7 +660,26 @@ impl Expr {
 }
 
 pub fn is_aggregate(name: &str) -> bool {
-    matches!(name, "count" | "sum" | "avg" | "min" | "max")
+    matches!(
+        name,
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "total"
+            | "group_concat"
+            | "string_agg"
+            | "bool_and"
+            | "every"
+            | "bool_or"
+            | "variance"
+            | "var_samp"
+            | "var_pop"
+            | "stddev"
+            | "stddev_samp"
+            | "stddev_pop"
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -702,7 +773,10 @@ impl fmt::Display for Expr {
                 let op = if *case_insensitive { "ILIKE" } else { "LIKE" };
                 write!(f, "{} {}{op} {}", operand(expr), not(negated), operand(pattern))
             }
-            Expr::Function { name, star: true, .. } => write!(f, "{name}(*)"),
+            Expr::Function { name, star: true, filter, .. } => {
+                let filter = filter.as_ref().map(|e| format!(" FILTER (WHERE {e})")).unwrap_or_default();
+                write!(f, "{name}(*){filter}")
+            }
             // Written without parentheses, as SQL spells them.
             Expr::Function { name, args, .. }
                 if args.is_empty()
@@ -713,17 +787,19 @@ impl fmt::Display for Expr {
             {
                 f.write_str(&name.to_ascii_uppercase())
             }
-            Expr::Window { name, args, star, over } => {
+            Expr::Window { name, args, star, filter, over } => {
                 let args: Vec<String> = args.iter().map(ToString::to_string).collect();
                 let args = if *star { "*".to_string() } else { args.join(", ") };
-                write!(f, "{name}({args}) OVER {over}")
+                let filter = filter.as_ref().map(|e| format!(" FILTER (WHERE {e})")).unwrap_or_default();
+                write!(f, "{name}({args}){filter} OVER {over}")
             }
             Expr::Function { name, args, .. } if name == "interval" && args.len() == 1 => {
                 write!(f, "INTERVAL {}", args[0])
             }
-            Expr::Function { name, args, distinct, .. } => {
+            Expr::Function { name, args, distinct, filter, .. } => {
                 let args: Vec<String> = args.iter().map(ToString::to_string).collect();
-                write!(f, "{name}({}{})", if *distinct { "DISTINCT " } else { "" }, args.join(", "))
+                let filter = filter.as_ref().map(|e| format!(" FILTER (WHERE {e})")).unwrap_or_default();
+                write!(f, "{name}({}{}){filter}", if *distinct { "DISTINCT " } else { "" }, args.join(", "))
             }
             Expr::Cast { expr, ty } => write!(f, "CAST({expr} AS {ty})"),
             Expr::Case { operand: op, branches, otherwise } => {

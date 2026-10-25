@@ -995,7 +995,13 @@ impl Parser<'_> {
                     if is_interval(&interval) =>
                 {
                     let name = if op == BinaryOp::Add { "date_add" } else { "date_sub" };
-                    Expr::Function { name: name.into(), args: vec![time, interval], distinct: false, star: false }
+                    Expr::Function {
+                        name: name.into(),
+                        args: vec![time, interval],
+                        distinct: false,
+                        star: false,
+                        filter: None,
+                    }
                 }
                 (op, lhs, rhs) => Expr::Binary { op, left: Box::new(lhs), right: Box::new(rhs) },
             };
@@ -1100,7 +1106,13 @@ impl Parser<'_> {
                         text = format!("{text} {}", unit.to_ascii_lowercase());
                     }
                     let literal = Expr::Literal(Value::Text(text));
-                    Ok(Expr::Function { name: "interval".into(), args: vec![literal], distinct: false, star: false })
+                    Ok(Expr::Function {
+                        name: "interval".into(),
+                        args: vec![literal],
+                        distinct: false,
+                        star: false,
+                        filter: None,
+                    })
                 }
                 "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME"
                     if *self.peek_nth(1) != Token::LParen =>
@@ -1111,6 +1123,7 @@ impl Parser<'_> {
                         args: Vec::new(),
                         distinct: false,
                         star: false,
+                        filter: None,
                     })
                 }
                 // EXTRACT(field FROM time) is date_part('field', time).
@@ -1125,7 +1138,7 @@ impl Parser<'_> {
                     let time = self.expr()?;
                     self.expect(Token::RParen)?;
                     let args = vec![Expr::Literal(Value::Text(field)), time];
-                    Ok(Expr::Function { name: "date_part".into(), args, distinct: false, star: false })
+                    Ok(Expr::Function { name: "date_part".into(), args, distinct: false, star: false, filter: None })
                 }
                 // MySQL's VALUES(column) in ON DUPLICATE KEY UPDATE.
                 "VALUES" if *self.peek_nth(1) == Token::LParen => {
@@ -1133,7 +1146,13 @@ impl Parser<'_> {
                     self.advance();
                     let column = self.column()?;
                     self.expect(Token::RParen)?;
-                    Ok(Expr::Function { name: "values".into(), args: vec![column], distinct: false, star: false })
+                    Ok(Expr::Function {
+                        name: "values".into(),
+                        args: vec![column],
+                        distinct: false,
+                        star: false,
+                        filter: None,
+                    })
                 }
                 _ if *self.peek_nth(1) == Token::LParen && !is_reserved(&word) => self.function(),
                 _ => self.column(),
@@ -1163,14 +1182,91 @@ impl Parser<'_> {
     fn function(&mut self) -> Result<Expr> {
         let name = self.ident()?;
         self.expect(Token::LParen)?;
-        let (args, distinct, star) = if self.eat(&Token::Star) {
+        let call = |name: &str, args: Vec<Expr>| Expr::Function {
+            name: name.into(),
+            args,
+            distinct: false,
+            star: false,
+            filter: None,
+        };
+        // Standard SQL's keyword forms: POSITION(sub IN s),
+        // SUBSTRING(s FROM start FOR length), TRIM([LEADING | TRAILING | BOTH] [chars] FROM s).
+        let mut first = None;
+        match name.to_ascii_lowercase().as_str() {
+            "position" => {
+                let sub = self.expr_bp(P_CMP + 1)?;
+                self.expect_kw("IN")?;
+                let s = self.expr()?;
+                self.expect(Token::RParen)?;
+                return Ok(call("strpos", vec![s, sub]));
+            }
+            "substring" | "substr" if *self.peek() != Token::RParen => {
+                let s = self.expr()?;
+                if self.is_kw("FROM") || self.is_kw("FOR") {
+                    let start = if self.eat_kw("FROM") { self.expr()? } else { Expr::Literal(Value::Integer(1)) };
+                    let mut args = vec![s, start];
+                    if self.eat_kw("FOR") {
+                        args.push(self.expr()?);
+                    }
+                    self.expect(Token::RParen)?;
+                    return Ok(call("substr", args));
+                }
+                first = Some(s);
+            }
+            "trim" if *self.peek() != Token::RParen => {
+                let side = ["LEADING", "TRAILING", "BOTH"].into_iter().find(|kw| self.eat_kw(kw));
+                let function = match side {
+                    Some("LEADING") => "ltrim",
+                    Some("TRAILING") => "rtrim",
+                    _ => "trim",
+                };
+                let (chars, s) = if side.is_some() && self.eat_kw("FROM") {
+                    (None, self.expr()?)
+                } else {
+                    let e = self.expr()?;
+                    if self.eat_kw("FROM") {
+                        (Some(e), self.expr()?)
+                    } else if side.is_some() {
+                        return Err(self.unexpected("FROM"));
+                    } else {
+                        first = Some(e);
+                        (None, Expr::Literal(Value::Null))
+                    }
+                };
+                if first.is_none() {
+                    self.expect(Token::RParen)?;
+                    return Ok(call(function, std::iter::once(s).chain(chars).collect()));
+                }
+            }
+            _ => {}
+        }
+        let (args, distinct, star) = if first.is_none() && self.eat(&Token::Star) {
             (Vec::new(), false, true)
         } else {
-            let distinct = self.eat_kw("DISTINCT");
-            let args = if *self.peek() == Token::RParen { Vec::new() } else { self.expr_list()? };
+            let distinct = first.is_none() && self.eat_kw("DISTINCT");
+            let mut args: Vec<Expr> = first.into_iter().collect();
+            if args.is_empty() {
+                if *self.peek() != Token::RParen {
+                    args = self.expr_list()?;
+                }
+            } else {
+                while self.eat(&Token::Comma) {
+                    args.push(self.expr()?);
+                }
+            }
             (args, distinct, false)
         };
         self.expect(Token::RParen)?;
+        let filter = if self.is_kw("FILTER") && *self.peek_nth(1) == Token::LParen {
+            self.advance();
+            self.advance();
+            self.expect_kw("WHERE")?;
+            let filter = self.expr()?;
+            self.expect(Token::RParen)?;
+            Some(Box::new(filter))
+        } else {
+            None
+        };
         if self.eat_kw("OVER") {
             if distinct {
                 return Err(self.error("DISTINCT is not supported in window functions"));
@@ -1180,9 +1276,9 @@ impl Parser<'_> {
             } else {
                 WindowSpec { base: Some(self.ident()?), ..WindowSpec::default() }
             };
-            return Ok(Expr::Window { name, args, star, over: Box::new(over) });
+            return Ok(Expr::Window { name, args, star, filter, over: Box::new(over) });
         }
-        Ok(Expr::Function { name, args, distinct, star })
+        Ok(Expr::Function { name, args, distinct, star, filter })
     }
 
     /// `expr [ASC | DESC], ...` after ORDER BY.
@@ -1194,7 +1290,17 @@ impl Parser<'_> {
             if !desc {
                 self.eat_kw("ASC");
             }
-            items.push(OrderBy { expr, desc });
+            let nulls_first = if self.eat_kw("NULLS") {
+                if self.eat_kw("FIRST") {
+                    Some(true)
+                } else {
+                    self.expect_kw("LAST")?;
+                    Some(false)
+                }
+            } else {
+                None
+            };
+            items.push(OrderBy { expr, desc, nulls_first });
             if !self.eat(&Token::Comma) {
                 return Ok(items);
             }

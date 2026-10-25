@@ -18,6 +18,7 @@ use super::catalog::TableSchema;
 use super::datetime::{self, Kind, Moment};
 use super::encoding::{encode_key, encode_keys};
 use super::exec;
+use super::functions::{self, Scalar};
 use super::plan::{CteScope, SelectPlan, WINDOW_BASE, WINDOW_TABLE, plan_select};
 use super::txn::Txn;
 use super::value::{DataType, Value, sql_error};
@@ -618,6 +619,7 @@ pub enum Function {
     DateSub,
     Datediff,
     Interval,
+    Scalar(Scalar),
 }
 
 impl Function {
@@ -631,7 +633,7 @@ impl Function {
             "replace" => (Function::Replace, args == 3),
             "round" => (Function::Round, args == 1 || args == 2),
             "substr" | "substring" => (Function::Substr, args == 2 || args == 3),
-            "trim" => (Function::Trim, args == 1),
+            "trim" if args == 1 => (Function::Trim, true),
             "typeof" => (Function::Typeof, args == 1),
             "upper" => (Function::Upper, args == 1),
             "now" | "current_timestamp" | "localtimestamp" => (Function::Now, args == 0),
@@ -649,7 +651,10 @@ impl Function {
             "date_sub" | "subdate" => (Function::DateSub, args == 2),
             "datediff" => (Function::Datediff, args == 2),
             "interval" => (Function::Interval, args == 1),
-            _ => return Err(sql_error(format!("no such function: {name}"))),
+            _ => match functions::resolve(name, args) {
+                Some((scalar, ok)) => (Function::Scalar(scalar), ok),
+                None => return Err(sql_error(format!("no such function: {name}"))),
+            },
         };
         if !arity_ok {
             return Err(sql_error(format!("wrong number of arguments to {name}()")));
@@ -659,8 +664,12 @@ impl Function {
 
     fn call(self, mut args: Vec<Value>, env: &Env) -> Result<Value> {
         let text = |v: &Value| v.to_string();
-        if !matches!(self, Function::Coalesce | Function::Nullif | Function::Typeof) && args.iter().any(Value::is_null)
-        {
+        let takes_nulls = match self {
+            Function::Coalesce | Function::Nullif | Function::Typeof => true,
+            Function::Scalar(scalar) => scalar.takes_nulls(),
+            _ => false,
+        };
+        if !takes_nulls && args.iter().any(Value::is_null) {
             return Ok(Value::Null);
         }
         Ok(match self {
@@ -733,6 +742,7 @@ impl Function {
             Function::DateSub => datetime::date_add(&args[0], &args[1], -1)?,
             Function::Datediff => datetime::datediff(&args[0], &args[1])?,
             Function::Interval => datetime::interval(&args[0])?,
+            Function::Scalar(scalar) => scalar.call(args)?,
         })
     }
 
@@ -756,6 +766,37 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// SQLite's `total`: a REAL sum, 0.0 over no rows.
+    Total,
+    /// `group_concat` and `string_agg`.
+    Concat,
+    BoolAnd,
+    BoolOr,
+    VarSamp,
+    VarPop,
+    StddevSamp,
+    StddevPop,
+}
+
+impl AggFunc {
+    pub fn of(name: &str) -> Option<AggFunc> {
+        Some(match name {
+            "count" => AggFunc::Count,
+            "sum" => AggFunc::Sum,
+            "avg" => AggFunc::Avg,
+            "min" => AggFunc::Min,
+            "max" => AggFunc::Max,
+            "total" => AggFunc::Total,
+            "group_concat" | "string_agg" => AggFunc::Concat,
+            "bool_and" | "every" => AggFunc::BoolAnd,
+            "bool_or" => AggFunc::BoolOr,
+            "variance" | "var_samp" => AggFunc::VarSamp,
+            "var_pop" => AggFunc::VarPop,
+            "stddev" | "stddev_samp" => AggFunc::StddevSamp,
+            "stddev_pop" => AggFunc::StddevPop,
+            _ => return None,
+        })
+    }
 }
 
 /// An aggregate call. `arg` is `None` for `count(*)`.
@@ -764,6 +805,45 @@ pub struct Aggregate {
     pub func: AggFunc,
     pub arg: Option<BExpr>,
     pub distinct: bool,
+    /// `FILTER (WHERE ...)`: only rows it accepts are aggregated.
+    pub filter: Option<BExpr>,
+    /// What `group_concat` puts between values.
+    pub separator: String,
+}
+
+impl Aggregate {
+    /// Builds an aggregate call of `name`, binding its argument and filter
+    /// with `bind`.
+    pub fn build(
+        name: &str,
+        args: &[Expr],
+        distinct: bool,
+        star: bool,
+        filter: Option<&Expr>,
+        bind: &mut dyn FnMut(&Expr) -> Result<BExpr>,
+    ) -> Result<Aggregate> {
+        let func = AggFunc::of(name).ok_or_else(|| sql_error(format!("{name}() is not an aggregate")))?;
+        let filter = filter.map(&mut *bind).transpose()?;
+        let mut aggregate = Aggregate { func, arg: None, distinct, filter, separator: ",".into() };
+        if star {
+            return match func {
+                AggFunc::Count if !distinct => Ok(aggregate),
+                _ => Err(sql_error(format!("{name}(*) is not allowed; only count(*)"))),
+            };
+        }
+        match (func, args) {
+            (_, [arg]) => aggregate.arg = Some(bind(arg)?),
+            (AggFunc::Concat, [arg, separator]) => {
+                let Expr::Literal(Value::Text(separator)) = separator else {
+                    return Err(sql_error(format!("{name}()'s separator must be a text literal")));
+                };
+                aggregate.separator = separator.clone();
+                aggregate.arg = Some(bind(arg)?);
+            }
+            _ => return Err(sql_error(format!("wrong number of arguments to {name}()"))),
+        }
+        Ok(aggregate)
+    }
 }
 
 /// The grouping of an aggregate query. After aggregation, a row holds the
@@ -872,11 +952,14 @@ impl<'a> Binder<'a> {
                 return Ok(Some(BExpr::Column(i)));
             }
             match e {
-                Expr::Function { name, args, distinct, star } if is_aggregate(name) => {
+                Expr::Function { name, args, distinct, star, filter } if is_aggregate(name) => {
                     let position = match grouping.aggregates.iter().position(|(seen, _)| seen == e) {
                         Some(j) => j,
                         None => {
-                            let aggregate = self.aggregate(name, args, *distinct, *star, scope)?;
+                            let aggregate =
+                                Aggregate::build(name, args, *distinct, *star, filter.as_deref(), &mut |e| {
+                                    self.bind(e, scope, "an aggregate's argument")
+                                })?;
                             grouping.aggregates.push((e.clone(), aggregate));
                             grouping.aggregates.len() - 1
                         }
@@ -894,24 +977,6 @@ impl<'a> Binder<'a> {
                 _ => Ok(None),
             }
         })
-    }
-
-    fn aggregate(&self, name: &str, args: &[Expr], distinct: bool, star: bool, scope: &Scope) -> Result<Aggregate> {
-        let func = match name {
-            "count" => AggFunc::Count,
-            "sum" => AggFunc::Sum,
-            "avg" => AggFunc::Avg,
-            "min" => AggFunc::Min,
-            _ => AggFunc::Max,
-        };
-        if star {
-            return match func {
-                AggFunc::Count => Ok(Aggregate { func, arg: None, distinct: false }),
-                _ => Err(sql_error(format!("{name}(*) is not allowed; only count(*)"))),
-            };
-        }
-        let [arg] = args else { return Err(sql_error(format!("{name}() takes exactly one argument"))) };
-        Ok(Aggregate { func, arg: Some(self.bind(arg, scope, "an aggregate's argument")?), distinct })
     }
 
     /// Binds every node, giving `leaf` the first chance at each one.
@@ -955,7 +1020,10 @@ impl<'a> Binder<'a> {
             Expr::Like { expr, pattern, negated, case_insensitive } => {
                 BExpr::Like(sub(expr)?, sub(pattern)?, *negated, *case_insensitive)
             }
-            Expr::Function { name, args, distinct, star } => {
+            Expr::Function { name, args, distinct, star, filter } => {
+                if filter.is_some() {
+                    return Err(sql_error(format!("FILTER is only for aggregates, not {name}()")));
+                }
                 if *star || *distinct {
                     return Err(sql_error(format!(
                         "{name}() does not accept {}",
@@ -981,6 +1049,14 @@ impl<'a> Binder<'a> {
     }
 }
 
+/// A value given to `bool_and` or `bool_or`.
+fn boolean(value: &Value, name: &str) -> Result<bool> {
+    match value {
+        Value::Boolean(b) => Ok(*b),
+        v => Err(sql_error(format!("{name}() needs booleans, got {}", v.type_name()))),
+    }
+}
+
 /// Running state for one aggregate in one group.
 #[derive(Clone)]
 pub struct Accumulator {
@@ -996,6 +1072,19 @@ enum State {
     Avg(f64, i64),
     Min(Value),
     Max(Value),
+    Total(f64),
+    /// The separator, and the text so far.
+    Concat(String, Option<String>),
+    BoolAnd(Option<bool>),
+    BoolOr(Option<bool>),
+    /// Welford's running count, mean and sum of squared deviations, which
+    /// stay accurate where summing squares would cancel out.
+    Variance {
+        func: AggFunc,
+        n: i64,
+        mean: f64,
+        m2: f64,
+    },
 }
 
 impl Accumulator {
@@ -1006,11 +1095,21 @@ impl Accumulator {
             AggFunc::Avg => State::Avg(0.0, 0),
             AggFunc::Min => State::Min(Value::Null),
             AggFunc::Max => State::Max(Value::Null),
+            AggFunc::Total => State::Total(0.0),
+            AggFunc::Concat => State::Concat(aggregate.separator.clone(), None),
+            AggFunc::BoolAnd => State::BoolAnd(None),
+            AggFunc::BoolOr => State::BoolOr(None),
+            func => State::Variance { func, n: 0, mean: 0.0, m2: 0.0 },
         };
         Accumulator { state, seen: aggregate.distinct.then(HashSet::new) }
     }
 
     pub fn add(&mut self, aggregate: &Aggregate, row: &[Value], env: &Env) -> Result<()> {
+        if let Some(filter) = &aggregate.filter
+            && !filter.matches(row, env)?
+        {
+            return Ok(());
+        }
         match &aggregate.arg {
             None => {
                 self.add_row();
@@ -1236,6 +1335,33 @@ impl Accumulator {
                     *max = value.into_owned();
                 }
             }
+            State::Total(sum) => {
+                numeric(&value, "total")?;
+                *sum += value.as_f64().unwrap();
+            }
+            State::Concat(separator, text) => match text {
+                Some(text) => {
+                    text.push_str(separator);
+                    text.push_str(&value.to_string());
+                }
+                None => *text = Some(value.to_string()),
+            },
+            State::BoolAnd(all) => {
+                let b = boolean(&value, "bool_and")?;
+                *all = Some(all.unwrap_or(true) && b);
+            }
+            State::BoolOr(any) => {
+                let b = boolean(&value, "bool_or")?;
+                *any = Some(any.unwrap_or(false) || b);
+            }
+            State::Variance { n, mean, m2, .. } => {
+                numeric(&value, "variance")?;
+                let x = value.as_f64().unwrap();
+                *n += 1;
+                let delta = x - *mean;
+                *mean += delta / *n as f64;
+                *m2 += delta * (x - *mean);
+            }
         }
         Ok(())
     }
@@ -1259,6 +1385,24 @@ impl Accumulator {
             (State::Max(a), State::Max(b)) if !b.is_null() && (a.is_null() || b.total_cmp(a) == Ordering::Greater) => {
                 *a = b;
             }
+            (State::Total(a), State::Total(b)) => *a += b,
+            (State::Concat(separator, a), State::Concat(_, Some(b))) => match a {
+                Some(a) => {
+                    a.push_str(separator);
+                    a.push_str(&b);
+                }
+                None => *a = Some(b),
+            },
+            (State::BoolAnd(a), State::BoolAnd(Some(b))) => *a = Some(a.unwrap_or(true) && b),
+            (State::BoolOr(a), State::BoolOr(Some(b))) => *a = Some(a.unwrap_or(false) || b),
+            // Chan et al.'s formula for combining two runs of Welford's.
+            (State::Variance { n, mean, m2, .. }, State::Variance { n: n2, mean: mean2, m2: m22, .. }) if n2 > 0 => {
+                let total = *n + n2;
+                let delta = mean2 - *mean;
+                *m2 += m22 + delta * delta * (*n as f64) * (n2 as f64) / total as f64;
+                *mean += delta * n2 as f64 / total as f64;
+                *n = total;
+            }
             _ => {}
         }
         Ok(())
@@ -1270,6 +1414,21 @@ impl Accumulator {
             State::Avg(_, 0) => Value::Null,
             State::Avg(sum, n) => Value::Real(sum / n as f64),
             State::Sum(v) | State::Min(v) | State::Max(v) => v,
+            State::Total(sum) => Value::Real(sum),
+            State::Concat(_, text) => text.map_or(Value::Null, Value::Text),
+            State::BoolAnd(b) | State::BoolOr(b) => b.map_or(Value::Null, Value::Boolean),
+            State::Variance { func, n, m2, .. } => {
+                let sample = matches!(func, AggFunc::VarSamp | AggFunc::StddevSamp);
+                let divisor = if sample { n - 1 } else { n };
+                if divisor <= 0 {
+                    return Value::Null;
+                }
+                let variance = m2 / divisor as f64;
+                match func {
+                    AggFunc::StddevSamp | AggFunc::StddevPop => Value::Real(variance.sqrt()),
+                    _ => Value::Real(variance),
+                }
+            }
         }
     }
 }

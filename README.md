@@ -46,9 +46,12 @@ println!("{}", rows.to_json()); // [{"name":"Alan"}]
 - Arithmetic, comparisons and `||`, with SQL's three-valued `NULL` logic
 - `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN`, `[NOT] BETWEEN`, and `[NOT] LIKE`/`ILIKE`
 - `CASE`, `CAST`
-- Aggregates: `count(*)`, `count`, `sum`, `avg`, `min` and `max`, each optionally with `DISTINCT`
+- Aggregates: `count(*)`, `count`, `sum`, `avg`, `min`, `max`, `total`, `group_concat`/`string_agg(x, sep)`, `bool_and`/`every`, `bool_or`, `variance`/`var_samp`, `var_pop`, `stddev`/`stddev_samp` and `stddev_pop`, each optionally with `DISTINCT` and `FILTER (WHERE ...)`
 - Window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, and the aggregates, with `OVER (PARTITION BY ... ORDER BY ... [ROWS | RANGE frame])` and named windows (`WINDOW w AS (...)`)
-- Functions: `lower`, `upper`, `length`, `trim`, `substr`, `replace`, `abs`, `round`, `coalesce`, `nullif` and `typeof`
+- Text functions: `lower`, `upper`, `length`, `octet_length`, `trim`/`ltrim`/`rtrim` (with optional characters, or `TRIM(LEADING 'x' FROM s)`), `substr` (or `SUBSTRING(s FROM a FOR n)`), `replace`, `strpos`/`instr` (or `POSITION(sub IN s)`), `concat`, `concat_ws`, `left`, `right`, `lpad`, `rpad`, `repeat`, `reverse`, `initcap`, `split_part`, `starts_with`, `ascii`, `chr`, `hex` and `to_hex`
+- Numeric functions: `abs`, `round`, `trunc`, `ceil`, `floor`, `sign`, `mod`, `sqrt`, `power`, `exp`, `ln`, `log`, `log10`, `log2`, `pi`, `random`, `degrees`, `radians` and the trigonometric functions
+- Other functions: `coalesce`/`ifnull`, `nullif`, `iif`, `greatest` and `least` (which pass over NULLs, as in PostgreSQL), and `typeof`
+- `ORDER BY ... [ASC | DESC] [NULLS FIRST | NULLS LAST]`, in queries and windows. By default NULLs sort below every value, as in SQLite.
 - Dates and times: see below
 
 **Subqueries** may refer to the columns of the query around them (*correlated* subqueries), one level out:

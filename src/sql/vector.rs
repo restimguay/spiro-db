@@ -66,7 +66,11 @@ pub fn applies(plan: &SelectPlan) -> bool {
     if DISABLED.with(|d| d.get()) {
         return false;
     }
-    plan.base.is_some() && plan.joins.is_empty() && plan.grouping.is_some() && plan.is_simple()
+    // FILTER clauses are checked row by row, which the batches don't do.
+    plan.base.is_some()
+        && plan.joins.is_empty()
+        && plan.grouping.as_ref().is_some_and(|g| g.aggregates.iter().all(|a| a.filter.is_none()))
+        && plan.is_simple()
 }
 
 /// Runs the query's read, filters and aggregation. Only for plans that

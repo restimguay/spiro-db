@@ -30,6 +30,7 @@ mod datetime;
 mod encoding;
 mod exec;
 mod expr;
+mod functions;
 mod integrity;
 mod lexer;
 mod notify;

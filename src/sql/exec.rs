@@ -547,12 +547,12 @@ fn finish(plan: &SelectPlan, mut out: Vec<(Vec<Value>, Vec<Value>)>, limit: Opti
     }
     if !plan.order_by.is_empty() && !plan.presorted {
         out.sort_by(|(a_row, a_keys), (b_row, b_keys)| {
-            for (i, (key, desc)) in plan.order_by.iter().enumerate() {
+            for (i, (key, sort)) in plan.order_by.iter().enumerate() {
                 let (a, b) = match key {
                     SortKey::Output(c) => (&a_row[*c], &b_row[*c]),
                     SortKey::Expr(_) => (&a_keys[i], &b_keys[i]),
                 };
-                let ordering = if *desc { b.total_cmp(a) } else { a.total_cmp(b) };
+                let ordering = sort.compare(a, b);
                 if ordering.is_ne() {
                     return ordering;
                 }

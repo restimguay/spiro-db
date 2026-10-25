@@ -35,8 +35,8 @@ fn compute_one(w: &WindowFunc, rows: &[Vec<Value>], env: &Env) -> Result<Vec<Val
         keys.push((partition, order));
     }
     let compare = |a: &[Value], b: &[Value]| {
-        for ((x, y), (_, desc)) in a.iter().zip(b).zip(&w.order) {
-            let ordering = if *desc { y.total_cmp(x) } else { x.total_cmp(y) };
+        for ((x, y), (_, sort)) in a.iter().zip(b).zip(&w.order) {
+            let ordering = sort.compare(x, y);
             if ordering.is_ne() {
                 return ordering;
             }

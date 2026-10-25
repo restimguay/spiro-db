@@ -1639,3 +1639,90 @@ fn savepoints() {
     s.execute("ROLLBACK").unwrap();
     assert_eq!(query(&db, "SELECT count(*) FROM t"), rows![[2]]);
 }
+
+#[test]
+fn more_functions() {
+    let (_dir, db) = open("functions");
+    run(
+        &db,
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, grp TEXT, x REAL, ok BOOLEAN, name TEXT);
+         INSERT INTO m (grp, x, ok, name) VALUES
+             ('a', 2, true, 'ann'), ('a', 4, true, NULL), ('a', 4, false, 'cat'), ('a', 5, true, 'dan'),
+             ('b', 5, true, 'eve'), ('b', 7, true, 'fay'), ('b', 9, true, 'gus'), ('c', NULL, NULL, NULL)",
+    );
+    // Aggregates: total, group_concat/string_agg, bool_and/bool_or, variance and stddev.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT grp, total(x), group_concat(name), string_agg(name, '|'), bool_and(ok), bool_or(NOT ok),
+                    var_pop(x), stddev_samp(x)
+             FROM m GROUP BY grp ORDER BY grp"
+        ),
+        rows![
+            ["a", 15.0, "ann,cat,dan", "ann|cat|dan", false, true, 1.1875, 1.2583057392117916],
+            ["b", 21.0, "eve,fay,gus", "eve|fay|gus", true, false, 8.0 / 3.0, 2.0],
+            ["c", 0.0, NULL, NULL, NULL, NULL, NULL, NULL],
+        ]
+    );
+    // FILTER, in plain aggregates (batched or not) and window aggregates.
+    assert_eq!(
+        query(&db, "SELECT count(*) FILTER (WHERE x > 4), sum(x) FILTER (WHERE ok), count(*) FROM m"),
+        rows![[4, 32.0, 8]]
+    );
+    assert_eq!(
+        query(&db, "SELECT grp, count(*) FILTER (WHERE NOT ok) FROM m GROUP BY grp ORDER BY grp"),
+        rows![["a", 1], ["b", 0], ["c", 0]]
+    );
+    assert_eq!(
+        query(&db, "SELECT id, sum(x) FILTER (WHERE grp = 'b') OVER (ORDER BY id) FROM m WHERE id >= 4 ORDER BY id"),
+        rows![[4, NULL], [5, 5.0], [6, 12.0], [7, 21.0], [8, 21.0]]
+    );
+    assert!(error(&db, "SELECT upper(name) FILTER (WHERE ok) FROM m").contains("only for aggregates"));
+    assert!(error(&db, "SELECT string_agg(name, grp) FROM m").contains("text literal"));
+
+    // NULLS FIRST / LAST, in ORDER BY and windows.
+    assert_eq!(query(&db, "SELECT id FROM m WHERE id >= 6 ORDER BY x"), rows![[8], [6], [7]]);
+    assert_eq!(query(&db, "SELECT id FROM m WHERE id >= 6 ORDER BY x NULLS LAST"), rows![[6], [7], [8]]);
+    assert_eq!(query(&db, "SELECT id FROM m WHERE id >= 6 ORDER BY x DESC NULLS FIRST"), rows![[8], [7], [6]]);
+    assert_eq!(
+        query(&db, "SELECT id, row_number() OVER (ORDER BY name NULLS FIRST) FROM m WHERE id <= 3 ORDER BY id"),
+        rows![[1, 2], [2, 1], [3, 3]]
+    );
+
+    // Scalar functions, including SQL's keyword forms.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT position('lo' IN 'hello'), substring('hello' FROM 2 FOR 3), trim(LEADING 'x' FROM 'xxhix'),
+                    trim(BOTH FROM '  hi  '), trim('-' FROM '--a--'), concat('a', NULL, 1), lpad('5', 3, '0'),
+                    initcap('hello world'), split_part('a.b.c', '.', 2), iif(1 > 2, 'yes', 'no'),
+                    greatest(3, NULL, 7), least(2.5, 1), ceil(1.2), floor(-1.2), round(sqrt(16)), power(2, 10),
+                    mod(10, 3), abs(sign(-3)), reverse('abc'), repeat('ab', 3), starts_with('spiro', 'sp')"
+        ),
+        rows![[
+            4,
+            "ell",
+            "hix",
+            "hi",
+            "a",
+            "a1",
+            "005",
+            "Hello World",
+            "b",
+            "no",
+            7,
+            1,
+            2.0,
+            -2.0,
+            4.0,
+            1024.0,
+            1,
+            1,
+            "cba",
+            "ababab",
+            true
+        ]]
+    );
+    assert!(error(&db, "SELECT sqrt(-1)").contains("negative"));
+    assert!(error(&db, "SELECT nosuch(1)").contains("no such function"));
+}

@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::ast::{BinaryOp, Expr};
 use super::ast::{
-    Cte, Frame, FrameBound, JoinKind, OrderBy, Select, SelectItem, SetOp, TableRef, WindowSpec, With, is_aggregate,
+    Cte, Frame, FrameBound, JoinKind, OrderBy, Select, SelectItem, SetOp, Sort, TableRef, WindowSpec, With,
+    is_aggregate,
 };
 use super::catalog::{self, Column, IndexSchema, TableSchema, ViewSchema};
-use super::expr::{AggFunc, Aggregate, BExpr, Binder, Grouping, Scope, ScopeColumn};
+use super::expr::{Aggregate, BExpr, Binder, Grouping, Scope, ScopeColumn};
 use super::txn::Txn;
 use super::value::{DataType, Value, sql_error};
 use crate::error::Result;
@@ -307,7 +308,7 @@ pub struct SelectPlan {
     pub projection: Vec<BExpr>,
     pub columns: Vec<String>,
     pub distinct: bool,
-    pub order_by: Vec<(SortKey, bool)>,
+    pub order_by: Vec<(SortKey, Sort)>,
     /// Rows already arrive in ORDER BY order, so no sort is needed.
     pub presorted: bool,
     /// Constant expressions (they may be parameters), evaluated per run.
@@ -335,8 +336,7 @@ pub struct WindowFunc {
     pub kind: WindowKind,
     pub args: Vec<BExpr>,
     pub partition: Vec<BExpr>,
-    /// Each expression with whether it sorts descending.
-    pub order: Vec<(BExpr, bool)>,
+    pub order: Vec<(BExpr, Sort)>,
     pub frame: Frame,
 }
 
@@ -416,7 +416,7 @@ fn resolve_window(over: &mut WindowSpec, named: &[(String, WindowSpec)]) -> Resu
 
 /// Binds a window function, its arguments and its window with `bind`.
 fn bind_window(w: &Expr, bind: &mut dyn FnMut(&Expr) -> Result<BExpr>) -> Result<WindowFunc> {
-    let Expr::Window { name, args, star, over } = w else { unreachable!("only windows are extracted") };
+    let Expr::Window { name, args, star, filter, over } = w else { unreachable!("only windows are extracted") };
     let n = args.len();
     let arity = |ok: bool| if ok { Ok(()) } else { Err(sql_error(format!("wrong number of arguments to {name}()"))) };
     let kind = match name.as_str() {
@@ -446,35 +446,23 @@ fn bind_window(w: &Expr, bind: &mut dyn FnMut(&Expr) -> Result<BExpr>) -> Result
             arity(n == 2)?;
             WindowKind::NthValue
         }
-        "count" | "sum" | "avg" | "min" | "max" => {
-            let func = match name.as_str() {
-                "count" => AggFunc::Count,
-                "sum" => AggFunc::Sum,
-                "avg" => AggFunc::Avg,
-                "min" => AggFunc::Min,
-                _ => AggFunc::Max,
-            };
-            let arg = match (*star, func) {
-                (true, AggFunc::Count) => None,
-                (true, _) => return Err(sql_error(format!("{name}(*) is not allowed; only count(*)"))),
-                (false, _) => {
-                    arity(n == 1)?;
-                    Some(bind(&args[0])?)
-                }
-            };
-            WindowKind::Aggregate(Aggregate { func, arg, distinct: false })
+        name if is_aggregate(name) => {
+            WindowKind::Aggregate(Aggregate::build(name, args, false, *star, filter.as_deref(), bind)?)
         }
         _ => return Err(sql_error(format!("{name}() is not a window function"))),
     };
     if *star && !matches!(kind, WindowKind::Aggregate(_)) {
         return Err(sql_error(format!("{name}(*) is not allowed")));
     }
+    if filter.is_some() && !matches!(kind, WindowKind::Aggregate(_)) {
+        return Err(sql_error(format!("FILTER is only for aggregates, not {name}()")));
+    }
     let args = match kind {
         WindowKind::Aggregate(_) => Vec::new(),
         _ => args.iter().map(&mut *bind).collect::<Result<_>>()?,
     };
     let partition = over.partition_by.iter().map(&mut *bind).collect::<Result<_>>()?;
-    let order = over.order_by.iter().map(|o| Ok((bind(&o.expr)?, o.desc))).collect::<Result<Vec<_>>>()?;
+    let order = over.order_by.iter().map(|o| Ok((bind(&o.expr)?, o.sort()))).collect::<Result<Vec<_>>>()?;
     // Without a frame: up to the current row and its peers when ordered,
     // otherwise the whole partition (every row is then a peer).
     let end = if order.is_empty() { FrameBound::UnboundedFollowing } else { FrameBound::CurrentRow };
@@ -645,7 +633,7 @@ fn plan_compound(txn: &Txn, select: &Select, binder: &Binder) -> Result<SelectPl
                     select.compound[0].0, o.expr
                 ))
             })?;
-            Ok((SortKey::Output(column), o.desc))
+            Ok((SortKey::Output(column), o.sort()))
         })
         .collect::<Result<Vec<_>>>()?;
     let count =
@@ -906,7 +894,7 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
                     Some(i) => SortKey::Output(i),
                     None => SortKey::Expr(binder.bind_grouped(&o.expr, &scope, &mut g)?),
                 };
-                Ok((key, o.desc))
+                Ok((key, o.sort()))
             })
             .collect::<Result<Vec<_>>>()?;
         windows = window_exprs
@@ -940,7 +928,7 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
                     Some(i) => SortKey::Output(i),
                     None => SortKey::Expr(binder.bind(&o.expr, &output_scope, "ORDER BY")?),
                 };
-                Ok((key, o.desc))
+                Ok((key, o.sort()))
             })
             .collect::<Result<Vec<_>>>()?;
         windows = window_exprs
@@ -956,8 +944,8 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
 
     // A single-table scan in primary-key order already satisfies ORDER BY <pk>.
     let presorted = match (&base, &order_by[..]) {
-        (Some(t), [(key, false)])
-            if joins.is_empty() && grouping.is_none() && !select.distinct && windows.is_empty() =>
+        (Some(t), [(key, sort)])
+            if !sort.desc && joins.is_empty() && grouping.is_none() && !select.distinct && windows.is_empty() =>
         {
             let sorted_column = match key {
                 SortKey::Output(i) => projection.get(*i),
@@ -976,14 +964,14 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
     match &grouping {
         Some(g) => {
             source_exprs.extend(&g.keys);
-            source_exprs.extend(g.aggregates.iter().filter_map(|a| a.arg.as_ref()));
+            source_exprs.extend(g.aggregates.iter().flat_map(|a| a.arg.iter().chain(&a.filter)));
         }
         None => {
             source_exprs.extend(&projection);
             for w in &windows {
                 source_exprs.extend(w.args.iter().chain(&w.partition).chain(w.order.iter().map(|(e, _)| e)));
-                if let WindowKind::Aggregate(Aggregate { arg: Some(arg), .. }) = &w.kind {
-                    source_exprs.push(arg);
+                if let WindowKind::Aggregate(aggregate) = &w.kind {
+                    source_exprs.extend(aggregate.arg.iter().chain(&aggregate.filter));
                 }
             }
             source_exprs.extend(order_by.iter().filter_map(|(k, _)| match k {

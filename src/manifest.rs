@@ -53,7 +53,8 @@ impl Manifest {
         }))
     }
 
-    pub fn store(&self, dir: &Path) -> Result<()> {
+    /// Replaces the MANIFEST atomically. `full` is [`sync_file`]'s.
+    pub fn store(&self, dir: &Path, full: bool) -> Result<()> {
         let mut body = Vec::new();
         put_varint(&mut body, self.next_file);
         put_varint(&mut body, self.log_number);
@@ -71,9 +72,9 @@ impl Manifest {
         file.write_all(&MAGIC.to_le_bytes())?;
         file.write_all(&crc32c(&body).to_le_bytes())?;
         file.write_all(&body)?;
-        file.sync_all()?;
+        sync_file(&file, full)?;
         fs::rename(&tmp, dir.join("MANIFEST"))?;
-        sync_dir(dir)?;
+        sync_dir(dir, full)?;
         Ok(())
     }
 }
@@ -92,10 +93,42 @@ fn read_level(r: &mut Reader) -> Result<Vec<TableMeta>> {
     Ok(tables)
 }
 
-/// Makes renames and newly created files in `dir` durable.
-pub fn sync_dir(dir: &Path) -> io::Result<()> {
+/// Gets a file's data to disk ahead of anything written after it.
+///
+/// With `full`, the data also survives a power failure. On macOS that means
+/// flushing the drive's cache (`F_FULLFSYNC`), which is slow and holds up
+/// every other write to the disk meanwhile. Without it, macOS gets a write
+/// barrier (`F_BARRIERFSYNC`): what was written before stays ahead of what
+/// comes after, so tables are always on disk before the MANIFEST naming
+/// them, but the newest data can be lost if the power fails. That is the
+/// guarantee the database makes when `Options::sync` is off; SQLite doesn't
+/// flush the drive's cache by default either. Elsewhere both are `fsync`.
+pub fn sync_file(file: &File, full: bool) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    if !full {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_BARRIERFSYNC: i32 = 85;
+        // SAFETY: F_BARRIERFSYNC takes no argument and only acts on the
+        // descriptor, which `file` keeps open for the duration of the call.
+        if unsafe { fcntl(file.as_raw_fd(), F_BARRIERFSYNC) } == 0 {
+            return Ok(());
+        }
+        // Not every file system supports barriers: sync fully instead.
+    }
+    let _ = full;
+    file.sync_all()
+}
+
+/// Makes renames and newly created files in `dir` durable (`full`), or
+/// ordered ahead of later writes; see [`sync_file`].
+pub fn sync_dir(dir: &Path, full: bool) -> io::Result<()> {
     #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
+    sync_file(&File::open(dir)?, full)?;
+    #[cfg(not(unix))]
+    let _ = full;
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
@@ -113,7 +146,7 @@ mod tests {
         let table =
             |n: u64| TableMeta { number: n, size: n * 100, smallest: vec![b'a'; n as usize], largest: vec![b'z'] };
         let m = Manifest { next_file: 9, log_number: 7, l0: vec![table(5), table(4)], l1: vec![table(2)] };
-        m.store(dir.path()).unwrap();
+        m.store(dir.path(), false).unwrap();
         assert_eq!(Manifest::load(dir.path()).unwrap(), Some(m));
 
         let path = dir.path().join("MANIFEST");

@@ -100,6 +100,31 @@ spiro> EXPLAIN SELECT * FROM users WHERE id > 10 AND name LIKE 'A%';
 
 A test runs thousands of random queries and updates against an indexed table and an identical unindexed one, and requires identical results every time.
 
+### Reading rows as they come
+
+`execute_prepared` and `query` collect every row into owned values. For big results, `query_each` hands each row to a closure as it is produced instead. The row is lent from one buffer that is reused for the next row, text included, so a streaming query allocates nothing per row:
+
+```rust
+let range = db.prepare("SELECT id, name FROM users WHERE id >= ? AND id < ?")?;
+let mut session = db.session();
+session.query_each(&range, &[Value::Integer(100), Value::Integer(200)], |row| {
+    println!("{} {}", row[0], row[1]);
+    true // false stops early
+})?;
+```
+
+Queries that group, sort or remove duplicates need every row first; those are collected, then handed over one by one.
+
+### Aggregates: batches and every core
+
+Aggregate queries on one table (`count`, `sum`, `avg`, `min`, `max`, with or without `GROUP BY`, `WHERE` and `HAVING`) take a faster path:
+
+- **Batches.** Rows are gathered 1,024 at a time, decoding only the columns the query reads straight from the stored bytes. Integer and real columns become plain arrays, with a mask for NULLs. Expressions such as `score % 10` or `price * qty > 100` then run as tight loops over the arrays, and groups are found by hashing, with a fast path for a single integer key.
+- **Every core.** A full scan of a large table is split into key ranges at the boundaries of the stored blocks, plus sampled keys from the in-memory table. A pool of threads, one per core, takes turns claiming ranges, so the faster cores take more. Each thread aggregates its share, and the partial groups are merged. The threads read from one fixed set of files, so they all see the same data. `db.set_scan_threads(n)` caps the threads one query may use; 1 keeps every query on a single core.
+- **Same answers.** Anything without a fast path (text functions, `CASE`, an integer overflow, a division by zero) is evaluated row by row with the ordinary evaluator, so results and error messages are the same. A test runs about 45 aggregate queries both ways over 20,000 random rows with NULLs, reals, text and booleans, single-threaded and split, and requires identical results.
+
+Scans also got cheaper underneath. Each layer of the storage engine now loops over its own entries, instead of every entry climbing through all the layers. A block whose last key is inside the range needs no per-entry bound checks.
+
 ## The `spiro` shell
 
 ```sh
@@ -264,6 +289,8 @@ for item in db.range("user:".."user;") {
 ```
 
 - **Writes** append one record to the write-ahead log, then insert into the in-memory, sorted *memtable*. There is no random I/O on the write path.
+- **The memtable** is a B+tree built for this job: nodes of 64 short keys stored inline, searched by bisection, and a few *fingers* remembering the leaves last written. Keys that keep growing (a table's row ids, its index entries) land in a remembered leaf without a search from the root. The standard library's `BTreeMap` searches each node from the left, so increasing keys scan every node on the way down.
+- **New row ids skip the uniqueness check.** A table's row-id counter is above every id it has ever stored, and it is written in the same atomic batch as the rows. An `INSERT` with an id at or past the counter therefore can't collide, and doesn't probe the memtable and every table's bloom filter to make sure, as SQLite knows for its rowid tables.
 - **Flushes.** When the memtable reaches `memtable_size`, it is frozen and a fresh one takes over. A background thread writes the frozen memtable out as an immutable, sorted table file in level 0.
 - **Compaction.** When level 0 holds `l0_compaction_trigger` tables, a second background thread merges them with the overlapping level-1 tables. Overwritten values and deletion markers disappear in the process. If level 0 backs up to `l0_stop_writes_trigger`, writers pause until compaction catches up.
 - **Reads** consult the memtables, then level 0 newest first, then level 1 by binary search. In each table, a bloom filter rules out most absent keys without touching disk, an in-memory index locates the one block that could hold the key, and a CLOCK block cache keeps hot blocks in memory.
@@ -275,6 +302,7 @@ for item in db.range("user:".."user;") {
 - The `MANIFEST` lists the live tables and the oldest log still needed. It is rewritten whole and atomically (write a temp file, fsync, rename), so a crash leaves either the old version or the new one.
 - On open, SpiroDB replays any unflushed logs and stops at a torn tail left by a crash mid-write. It writes the replayed data to a table, then deletes files the manifest no longer references. If the manifest itself is missing while tables exist, it refuses to open rather than guess.
 - With `Options::sync = false` (the default), acknowledged writes survive a process crash but may be lost if the machine loses power. Set `sync = true` to fsync the log on every write.
+- Table files and the manifest are always synced before anything depends on them. With `sync = false` on macOS, that sync is a write barrier (`F_BARRIERFSYNC`), which keeps writes in order without flushing the drive's cache. SQLite doesn't flush the drive's cache by default either. A power failure can then lose the newest data but never leaves a manifest naming a table that isn't there. With `sync = true` it is a full flush (`F_FULLFSYNC`). A full flush holds up every other write to the disk, so using one for each background table write slowed foreground inserts by about 20%.
 - A `LOCK` file prevents two processes from opening the same database.
 
 ### On-disk formats
@@ -293,7 +321,8 @@ Data blocks are about 4 KiB. Each key is stored as the length it shares with the
 
 - **Durability:** commits survive a crash of the database process but may be lost if the machine loses power. That means SQLite in WAL mode with `synchronous=NORMAL`, PostgreSQL with `synchronous_commit=off`, MariaDB with `innodb_flush_log_at_trx_commit=2` and the binary log off, and RocksDB's log without an fsync per write.
 - **Memory:** each engine gets a 64 MiB cache (SQLite's page cache, PostgreSQL's `shared_buffers`, MariaDB's InnoDB buffer pool, RocksDB's block cache).
-- **One core per query:** PostgreSQL's parallel workers are off and DuckDB runs one thread, since the others run each query on a single core.
+- **One core per query:** PostgreSQL's parallel workers are off, DuckDB runs one thread, and SpiroDB runs with `--scan-threads 1`, since SQLite and MariaDB run each query on a single core.
+- **Rows read as they come:** each query's rows are read as the engine produces them, as SQLite's `sqlite3_step` hands them out. SpiroDB's benchmark uses [`query_each`](#reading-rows-as-they-come) for this. With `execute_prepared`, which collects every row into owned values first, the 100-row range costs about 8 µs instead of 3.3.
 - **RocksDB matches SpiroDB's storage configuration:** an 8 MiB memtable, 4 KiB blocks, 10-bit bloom filters, and no compression.
 - **Prepared statements** everywhere, with the two servers reached over Unix sockets, their fastest local connection.
 
@@ -312,16 +341,18 @@ A table with an `INTEGER PRIMARY KEY`, three other columns and a secondary index
 
 | Workload | SpiroDB | SQLite | PostgreSQL | MariaDB | DuckDB |
 |---|---:|---:|---:|---:|---:|
-| `INSERT`, autocommit | **3.0** | 15.9 | 12.9 | 17.7 | 111 |
-| `UPDATE` by primary key | **4.0** | 12.5 | 11.6 | 19.8 | 121 |
-| `SELECT` by primary key | **0.63** | 2.0 | 11.2 | 11.9 | 99 |
-| `SELECT` by index (10 rows) | **2.2** | 2.3 | 12.9 | 13.5 | 79 |
-| `INSERT`, 1,000 per transaction | 1.3 | **0.79** | 11.9 | 13.4 | 43 |
-| `SELECT` 100-row range | 8.6 | **4.5** | 24.9 | 24.3 | 251 |
-| `count(*)` + `avg()`, full scan (per row) | 0.043 | 0.015 | 0.042 | 0.059 | **0.007** |
-| `GROUP BY`, full scan (per row) | 0.078 | 0.069 | 0.056 | 0.087 | **0.005** |
+| `INSERT`, autocommit | **2.1** | 17.1 | 12.8 | 17.8 | 110 |
+| `UPDATE` by primary key | **3.7** | 12.3 | 15.2 | 18.4 | 119 |
+| `SELECT` by primary key | **0.66** | 2.0 | 11.7 | 11.3 | 98 |
+| `SELECT` by index (10 rows) | **1.6** | 2.3 | 15.9 | 13.5 | 78 |
+| `INSERT`, 1,000 per transaction | **0.65** | 0.82 | 12.0 | 13.3 | 43 |
+| `SELECT` 100-row range | **3.3** | 4.5 | 26.0 | 24.0 | 254 |
+| `count(*)` + `avg()`, full scan (per row) | 0.026 | 0.015 | 0.038 | 0.058 | **0.012** |
+| `GROUP BY`, full scan (per row) | 0.025 | 0.068 | 0.056 | 0.088 | **0.014** |
 
-DuckDB stores data by column and processes it in batches, which makes it unbeatable on full-table aggregates and slow at single-row work. It is built for analytics, not for the transactional workload the rest of these rows measure.
+SpiroDB is fastest at every transactional workload here, including batched inserts and range scans, where SQLite used to lead.
+
+DuckDB stores data by column and processes it in batches, which makes it hard to beat on full-table aggregates and slow at single-row work. It is built for analytics, not for the transactional workload the rest of these rows measure. On a single core, SpiroDB's batched aggregation (see [aggregates](#aggregates-batches-and-every-core)) beats SQLite, PostgreSQL and MariaDB on `GROUP BY`, while SQLite is faster at `count` + `avg`. With every core, the default, SpiroDB's full scans measure 0.007 (`count` + `avg`) and 0.006 (`GROUP BY`) here, though by then they also depend on whatever else the machine is doing.
 
 PostgreSQL and MariaDB are servers: every statement crosses a socket to another process, which costs them 11 to 12 µs per statement here before any work is done. Their small-query numbers mostly measure that, as for any client-server database. Their query engines show in the full scans, where that cost is paid once.
 
@@ -331,16 +362,16 @@ The storage engine on its own, against RocksDB and against the other three used 
 
 | Workload | SpiroDB | RocksDB | SQLite | PostgreSQL | MariaDB |
 |---|---:|---:|---:|---:|---:|
-| Sequential writes | **1.6** | 1.7 | 9.6 | 11.5 | 16.1 |
-| Batched writes (1,000 per batch) | 0.47 | **0.31** | 0.83 | 10.1 | 12.0 |
-| Random writes | **1.8** | 2.0 | 47.9 | 12.3 | 33.1 |
-| Random reads | **1.1** | 1.5 | 4.7 | 14.3 | 22.0 |
-| Random reads, 10 threads (per read) | **0.31** | 0.44 | 3.7 | 3.8 | 5.7 |
-| Reads of missing keys | **0.15** | 0.29 | 3.5 | 11.7 | 21.4 |
-| Seek + read 100 keys | **8.5** | 12.2 | 9.0 | 92 | 124 |
-| Full scan (per key) | 0.074 | 0.092 | **0.052** | 0.120 | 0.321 |
+| Sequential writes | **1.4** | 1.7 | 9.9 | 11.5 | 16.5 |
+| Batched writes (1,000 per batch) | **0.15** | 0.33 | 0.84 | 10.0 | 11.9 |
+| Random writes | **1.5** | 2.0 | 47.8 | 12.1 | 35.6 |
+| Random reads | **1.0** | 1.4 | 5.2 | 14.7 | 21.8 |
+| Random reads, 10 threads (per read) | **0.31** | 0.43 | 3.6 | 3.8 | 5.7 |
+| Reads of missing keys | **0.16** | 0.29 | 3.5 | 11.5 | 21.1 |
+| Seek + read 100 keys | **8.6** | 11.9 | 9.1 | 92 | 124 |
+| Full scan (per key) | 0.074 | 0.090 | **0.053** | 0.114 | 0.313 |
 
-RocksDB shares SpiroDB's LSM design, so it is the like-for-like comparison. Configured with the same memtable, block size, bloom filters, cache and no compression, it wins batched writes, ties sequential writes, and trails SpiroDB on reads.
+RocksDB shares SpiroDB's LSM design, so it is the like-for-like comparison. Configured with the same memtable, block size, bloom filters, cache and no compression, it trails SpiroDB on every workload here. Batched writes used to be its win. The memtable's B+tree (see [the storage engine](#the-storage-engine)) and ordered rather than full syncs of background table files took SpiroDB from 0.47 to 0.15.
 
 At this size SpiroDB's simpler two-level structure is an advantage. RocksDB's multi-level compaction exists for datasets many times larger than this one, where it keeps write and space amplification bounded and SpiroDB's two levels would fall behind (see the roadmap). The other engines are B-trees, so the usual LSM trade-offs show:
 
@@ -368,7 +399,7 @@ bench/compare.sh                             # side by side with SQLite and Post
 - **SQL:** subqueries, `UNION`, `ALTER TABLE`, foreign keys, and a cost-based join order.
 - **Concurrency:** snapshots and MVCC through sequence numbers, so transactions read a consistent point in time and readers never see a half-applied scan.
 - **Storage:** leveled compaction across L1–L6 with 10× size ratios (today's two levels re-merge all of level 1 as data grows), and group commit so concurrent writers share one log write and one fsync.
-- **Speed:** a lock-free skiplist memtable, and block compression implemented from scratch.
+- **Speed:** keys and values of the memtable in one contiguous arena (recent writes interleaved with older data are now the slowest part of a full scan), batched execution for joins and plain scans as well as aggregates, and block compression implemented from scratch.
 - **Replication:** automatic failover by consensus (Raft) among the servers, TLS and authentication on the server, and replicas fed from other replicas to fan out further.
 - **Access from other languages:** a native Node.js module and a WebAssembly build for the browser.
 

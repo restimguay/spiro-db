@@ -90,8 +90,9 @@ impl TableSchema {
         }
     }
 
-    pub fn sequence_key(&self) -> Vec<u8> {
-        key(b'S', &self.id.to_be_bytes())
+    pub fn sequence_key(&self) -> [u8; 6] {
+        let id = self.id.to_be_bytes();
+        [0, b'S', id[0], id[1], id[2], id[3]]
     }
 
     /// The table as a CREATE TABLE statement.

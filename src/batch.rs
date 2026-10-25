@@ -21,6 +21,11 @@ impl WriteBatch {
         Self::default()
     }
 
+    /// An empty batch with room for about `bytes` of encoded entries.
+    pub fn with_capacity(bytes: usize) -> Self {
+        WriteBatch { rep: Vec::with_capacity(bytes), count: 0 }
+    }
+
     pub fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> &mut Self {
         self.rep.push(KIND_PUT);
         put_bytes(&mut self.rep, key.as_ref());

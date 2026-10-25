@@ -25,7 +25,7 @@ impl WalWriter {
     pub fn create(path: &Path, durable: bool) -> Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         if durable && let Some(dir) = path.parent() {
-            sync_dir(dir)?;
+            sync_dir(dir, true)?;
         }
         Ok(WalWriter { file, buf: Vec::new() })
     }

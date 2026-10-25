@@ -8,8 +8,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::batch::WriteBatch;
-use crate::coding::put_varint;
-use crate::db::Db;
+use crate::coding::{Key, KeyRef, put_varint};
+use crate::db::{Db, ReadView};
 use crate::error::{Error, Result};
 
 use super::catalog::SchemaCache;
@@ -66,12 +66,12 @@ struct Buffered {
 /// overwrote from earlier statements need saving.
 struct Undo {
     statement: u32,
-    overwritten: Vec<(Vec<u8>, Buffered)>,
+    overwritten: Vec<(Key, Buffered)>,
 }
 
 pub struct Txn {
     kv: Arc<Db>,
-    writes: BTreeMap<Vec<u8>, Buffered>,
+    writes: BTreeMap<Key, Buffered>,
     /// Kept only in explicit transactions: an autocommit transaction is
     /// discarded whole if its statement fails.
     undo: Option<Undo>,
@@ -89,6 +89,8 @@ pub struct Txn {
     /// Whether this transaction has changed table or index definitions, in
     /// which case it must read them from its own writes, not the cache.
     schema_changed: bool,
+    /// The most threads a query may use; 0 means every core.
+    scan_threads: usize,
 }
 
 impl Txn {
@@ -105,7 +107,18 @@ impl Txn {
             schemas,
             repl,
             schema_changed: false,
+            scan_threads: 0,
         }
+    }
+
+    /// Caps the threads a query in this transaction may use (0: every core).
+    pub fn with_scan_threads(mut self, threads: usize) -> Self {
+        self.scan_threads = threads;
+        self
+    }
+
+    pub fn scan_threads(&self) -> usize {
+        self.scan_threads
     }
 
     /// Makes each statement undoable on its own, for explicit transactions.
@@ -155,7 +168,7 @@ impl Txn {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.writes.get(key) {
+        match self.writes.get(KeyRef::new(key)) {
             Some(buffered) => Ok(buffered.value.clone()),
             None => self.kv.get(key),
         }
@@ -172,11 +185,11 @@ impl Txn {
     fn write(&mut self, key: Vec<u8>, value: Write) {
         debug_assert!(self.guard.is_some(), "writing without the write lock");
         let Some(undo) = &mut self.undo else {
-            self.writes.insert(key, Buffered { value, statement: 0 });
+            self.writes.insert(Key::from(key), Buffered { value, statement: 0 });
             return;
         };
         let buffered = Buffered { value, statement: undo.statement };
-        match self.writes.entry(key) {
+        match self.writes.entry(Key::from(key)) {
             Entry::Vacant(e) => {
                 e.insert(buffered);
             }
@@ -213,6 +226,16 @@ impl Txn {
     /// Calls `f` with each key and value in `[lower, upper]`, in order,
     /// including this transaction's own uncommitted writes. Keys and values
     /// are lent, not copied. `f` returns `false` to stop early.
+    /// The stored data, for reading `[lower, upper]` from several threads at
+    /// once; `None` if this transaction has its own writes there, which the
+    /// view wouldn't show.
+    pub fn shared_view(&self, lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>) -> Option<ReadView> {
+        if is_empty(lower, upper) || self.writes.range::<[u8], _>((borrowed(lower), borrowed(upper))).next().is_some() {
+            return None;
+        }
+        Some(self.kv.read_view())
+    }
+
     pub fn scan(&self, lower: Bound<Vec<u8>>, upper: Bound<Vec<u8>>, f: Visitor) -> Result<()> {
         if is_empty(&lower, &upper) {
             return Ok(());
@@ -223,7 +246,11 @@ impl Txn {
             Bound::Unbounded => Bound::Unbounded,
         };
         let mut store = self.kv.raw_range(start, upper.clone());
-        let mut overlay = self.writes.range((lower, upper)).peekable();
+        let mut overlay = self.writes.range::<[u8], _>((borrowed(&lower), borrowed(&upper))).peekable();
+        if overlay.peek().is_none() {
+            // Nothing of ours to merge in: let the store run on its own.
+            return store.for_each(|key, value| f(key, value));
+        }
         loop {
             let from_overlay = match (overlay.peek(), store.valid()) {
                 (None, false) => return store.status(),
@@ -238,7 +265,7 @@ impl Txn {
                     store.next();
                 }
                 if let Some(value) = &buffered.value
-                    && !f(key, value)?
+                    && !f(key.as_slice(), value)?
                 {
                     return Ok(());
                 }
@@ -268,7 +295,7 @@ impl Txn {
         for (key, next) in std::mem::take(&mut self.sequences) {
             let mut value = Vec::new();
             put_varint(&mut value, next as u64);
-            self.writes.insert(key, Buffered { value: Some(value), statement: 0 });
+            self.writes.insert(Key::from(key), Buffered { value: Some(value), statement: 0 });
         }
         let notifications: Vec<(String, String)> =
             std::mem::take(&mut self.notifications).into_iter().map(|(c, p, _)| (c, p)).collect();
@@ -279,11 +306,14 @@ impl Txn {
         // The commit's sequence number is stored in the same atomic batch as
         // its data, so a replica applying the batch records its progress too.
         let seq = self.repl.next_seq();
-        let mut batch = WriteBatch::new();
+        // Sized up front: a big transaction would otherwise grow it many times.
+        let bytes: usize =
+            self.writes.iter().map(|(k, b)| k.as_slice().len() + b.value.as_ref().map_or(0, Vec::len) + 12).sum();
+        let mut batch = WriteBatch::with_capacity(bytes + 32);
         for (key, buffered) in &self.writes {
             match &buffered.value {
-                Some(value) => batch.put(key, value),
-                None => batch.delete(key),
+                Some(value) => batch.put(key.as_slice(), value),
+                None => batch.delete(key.as_slice()),
             };
         }
         batch.put(SEQ_KEY, encode_u64(seq));
@@ -303,6 +333,14 @@ pub struct Committed {
     /// The commit's sequence number, if it changed anything.
     pub seq: Option<u64>,
     _guard: Option<WriteGuard>,
+}
+
+fn borrowed(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Included(k) => Bound::Included(k.as_slice()),
+        Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
 }
 
 /// Whether the range holds no keys at all. `BTreeMap::range` panics on these.

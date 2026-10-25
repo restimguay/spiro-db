@@ -693,3 +693,105 @@ fn listen_and_notify() {
     db.execute("NOTIFY jobs, 'wake up'").unwrap();
     assert_eq!(waiter.join().unwrap().map(|n| n.payload), Some("wake up".to_string()));
 }
+
+#[test]
+fn integer_primary_keys_stay_unique_without_a_lookup_for_new_ids() {
+    // New ids skip the existence check, trusting the row-id counter, so
+    // every way an id can arrive must still be caught when it repeats.
+    let (dir, db) = open("fresh-ids");
+    run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    let dup = |db: &Database, sql: &str| assert!(error(db, sql).contains("UNIQUE constraint failed: t.id"), "{sql}");
+    run(&db, "INSERT INTO t VALUES (10, 'a')");
+    run(&db, "INSERT INTO t VALUES (5, 'b')"); // below the counter: checked, free
+    dup(&db, "INSERT INTO t VALUES (5, 'c')");
+    dup(&db, "INSERT INTO t VALUES (10, 'c')");
+    run(&db, "INSERT INTO t (v) VALUES ('auto')"); // 11
+    dup(&db, "INSERT INTO t VALUES (11, 'c')");
+
+    // Within one transaction, and against rows it deleted.
+    let mut s = db.session();
+    s.execute("BEGIN").unwrap();
+    s.execute("INSERT INTO t VALUES (20, 'x')").unwrap();
+    assert!(s.execute("INSERT INTO t VALUES (20, 'y')").is_err());
+    s.execute("DELETE FROM t WHERE id = 5").unwrap();
+    s.execute("INSERT INTO t VALUES (5, 'again')").unwrap();
+    s.execute("COMMIT").unwrap();
+
+    // An UPDATE that moves a row to a new, high id moves the counter too.
+    run(&db, "UPDATE t SET id = 100 WHERE id = 10");
+    dup(&db, "INSERT INTO t VALUES (100, 'c')");
+    run(&db, "INSERT INTO t (v) VALUES ('after')");
+    assert_eq!(query(&db, "SELECT id FROM t WHERE v = 'after'"), vec![vec![Value::Integer(101)]]);
+
+    // A rolled-back insert leaves its id free, and the counter survives reopening.
+    s.execute("BEGIN").unwrap();
+    s.execute("INSERT INTO t VALUES (500, 'gone')").unwrap();
+    s.execute("ROLLBACK").unwrap();
+    drop(s);
+    run(&db, "INSERT INTO t VALUES (500, 'kept')");
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    dup(&db, "INSERT INTO t VALUES (500, 'c')");
+    dup(&db, "INSERT INTO t VALUES (101, 'c')");
+    let ids = query(&db, "SELECT id FROM t ORDER BY id");
+    assert_eq!(ids, rows![[5], [11], [20], [100], [101], [500]]);
+
+    // Tables with only the hidden row id never collide.
+    run(&db, "CREATE TABLE h (v INTEGER)");
+    run(&db, "INSERT INTO h VALUES (1), (1), (1)");
+    assert_eq!(query(&db, "SELECT count(*) FROM h"), vec![vec![Value::Integer(3)]]);
+}
+
+#[test]
+fn query_each_streams_the_same_rows_as_query() {
+    let (_dir, db) = open("query-each");
+    run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, n INTEGER)");
+    let insert = db.prepare("INSERT INTO t VALUES (?, ?, ?)").unwrap();
+    let mut session = db.session();
+    for i in 0..500i64 {
+        // Names of varying lengths, so a reused string grows and shrinks.
+        let name = if i % 7 == 0 { Value::Null } else { Value::Text("x".repeat((i % 13) as usize) + &i.to_string()) };
+        session.execute_prepared(&insert, &[Value::Integer(i), name, Value::Integer(i % 10)]).unwrap();
+    }
+    for sql in [
+        "SELECT * FROM t",
+        "SELECT id, name FROM t WHERE id >= 100 AND id < 200",
+        "SELECT name, id FROM t WHERE n = 3",
+        "SELECT id * 2, upper(name) FROM t WHERE name LIKE 'xx%' LIMIT 7 OFFSET 3",
+        "SELECT id FROM t LIMIT 0",
+        "SELECT n, count(*) FROM t GROUP BY n",
+        "SELECT name FROM t ORDER BY name DESC LIMIT 20",
+        "SELECT DISTINCT n FROM t",
+    ] {
+        let prepared = db.prepare(sql).unwrap();
+        let mut streamed = Vec::new();
+        session
+            .query_each(&prepared, &[], |row| {
+                streamed.push(row.to_vec());
+                true
+            })
+            .unwrap();
+        assert_eq!(streamed, query(&db, sql), "{sql}");
+    }
+    // Stopping early, inside a transaction that sees its own writes.
+    session.execute("BEGIN").unwrap();
+    session.execute("INSERT INTO t VALUES (1000, 'mine', 0)").unwrap();
+    let all = db.prepare("SELECT id FROM t WHERE n = 0").unwrap();
+    let mut seen = Vec::new();
+    session
+        .query_each(&all, &[], |row| {
+            seen.push(row[0].clone());
+            seen.len() < 3
+        })
+        .unwrap();
+    assert_eq!(seen, rows![[0], [10], [20]].concat());
+    let mut last = None;
+    session
+        .query_each(&all, &[], |row| {
+            last = Some(row[0].clone());
+            true
+        })
+        .unwrap();
+    assert_eq!(last, Some(Value::Integer(1000)));
+    session.execute("ROLLBACK").unwrap();
+}

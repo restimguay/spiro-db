@@ -11,8 +11,9 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::coding::{get_varint, put_varint, u32_at};
+use crate::coding::{get_varint, key_lt, put_varint, u32_at};
 use crate::error::{Result, corruption};
+use crate::iter::Visit;
 
 const RESTART_INTERVAL: usize = 16;
 
@@ -184,6 +185,23 @@ impl<B: Deref<Target = Block>> BlockIter<B> {
                 return;
             }
         }
+    }
+
+    /// Calls `f` with each entry from the current one on, while their keys
+    /// are below `limit` (if any) and `f` returns `true`. Returns `false` if
+    /// `f` asked to stop.
+    pub fn run(&mut self, limit: Option<&[u8]>, f: Visit) -> bool {
+        while self.valid {
+            if limit.is_some_and(|limit| !key_lt(&self.key, limit)) {
+                return true;
+            }
+            let go = f(&self.key, self.value());
+            self.advance();
+            if !go {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn advance(&mut self) {

@@ -5,6 +5,7 @@
 //! slot or a memtable's internal lock. Not every path takes every lock, but
 //! none takes them out of this order.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::ops::{Bound, RangeBounds};
@@ -76,6 +77,85 @@ struct SuperVersion {
 impl SuperVersion {
     fn of(state: &State) -> Arc<SuperVersion> {
         Arc::new(SuperVersion { mem: state.mem.clone(), imm: state.imm.clone(), version: state.version.clone() })
+    }
+}
+
+/// A fixed set of memtables and tables to read from. Writes made after it
+/// was taken may or may not show, as with any iterator.
+pub(crate) struct ReadView(Arc<SuperVersion>);
+
+impl ReadView {
+    pub(crate) fn raw_range(&self, start: Bound<&[u8]>, end: Bound<Vec<u8>>) -> RawIter {
+        let sv = &self.0;
+        let mut sources: Vec<Box<dyn KvIter>> = vec![Box::new(sv.mem.iter(end.clone()))];
+        if let Some(imm) = &sv.imm {
+            sources.push(Box::new(imm.iter(end.clone())));
+        }
+        sources.extend(sv.version.l0.iter().map(|t| Box::new(t.iter(true)) as Box<dyn KvIter>));
+        sources.push(Box::new(LevelIter::new(sv.version.l1.clone(), true)));
+
+        let mut it = MergeIter::new(sources);
+        match start {
+            Bound::Included(start) => it.seek(start),
+            Bound::Excluded(start) => {
+                it.seek(start);
+                if it.valid() && it.key() == start {
+                    it.next();
+                }
+            }
+            Bound::Unbounded => it.seek(&[]),
+        }
+        let mut raw = RawIter { it, end, valid: false };
+        raw.settle();
+        raw
+    }
+
+    /// Keys inside `(start, end)` at which to split it into parts of roughly
+    /// equal size: the boundaries of the tables' data blocks (about 4 KiB
+    /// each), sorted. Data still in memtables isn't counted.
+    ///
+    /// Memtables contribute sampled keys, one per `SAMPLE_EVERY` entries,
+    /// about as many as a table has blocks for the same amount of data.
+    pub(crate) fn split_points(&self, start: &Bound<Vec<u8>>, end: &Bound<Vec<u8>>) -> Vec<Cow<'_, [u8]>> {
+        let sv = &self.0;
+        // Level 1's tables are sorted and don't overlap, so its boundaries
+        // come in order; each other source's list is sorted too.
+        let mut points: Vec<Cow<[u8]>> = sv
+            .version
+            .l1
+            .iter()
+            .flat_map(|t| t.block_boundaries(start, end))
+            .map(|k| Cow::Borrowed(k.as_slice()))
+            .collect();
+        for table in &sv.version.l0 {
+            let keys = table.block_boundaries(start, end).iter().map(|k| Cow::Borrowed(k.as_slice())).collect();
+            points = merge_sorted(points, keys);
+        }
+        for mem in std::iter::once(&sv.mem).chain(&sv.imm) {
+            points = merge_sorted(points, mem.sample_keys(start, end).into_iter().map(Cow::Owned).collect());
+        }
+        points
+    }
+}
+
+/// Merges two sorted lists into one, without duplicates.
+fn merge_sorted<'a>(a: Vec<Cow<'a, [u8]>>, b: Vec<Cow<'a, [u8]>>) -> Vec<Cow<'a, [u8]>> {
+    if b.is_empty() {
+        return a;
+    }
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
+    loop {
+        let next = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if x <= y => a.next(),
+            (Some(_), Some(_)) | (None, Some(_)) => b.next(),
+            (Some(_), None) => a.next(),
+            (None, None) => return out,
+        };
+        let next = next.unwrap();
+        if out.last() != Some(&next) {
+            out.push(next);
+        }
     }
 }
 
@@ -220,7 +300,7 @@ impl Db {
         let wal_number = next_file.fetch_add(1, Ordering::SeqCst);
         let wal = WalWriter::create(&log_path(&dir, wal_number), opts.sync)?;
         let version = Version { l0, l1 };
-        write_manifest(&dir, next_file.load(Ordering::SeqCst), wal_number, &version)?;
+        write_manifest(&dir, next_file.load(Ordering::SeqCst), wal_number, &version, opts.sync)?;
 
         // Delete whatever the new manifest doesn't need: replayed logs, and
         // tables left behind by an interrupted flush or compaction.
@@ -357,28 +437,13 @@ impl Db {
 
     /// Like `range`, but lends each key and value instead of copying them.
     pub(crate) fn raw_range(&self, start: Bound<&[u8]>, end: Bound<Vec<u8>>) -> RawIter {
-        let sv = self.inner.super_version();
-        let mut sources: Vec<Box<dyn KvIter>> = vec![Box::new(sv.mem.iter(end.clone()))];
-        if let Some(imm) = &sv.imm {
-            sources.push(Box::new(imm.iter(end.clone())));
-        }
-        sources.extend(sv.version.l0.iter().map(|t| Box::new(t.iter(true)) as Box<dyn KvIter>));
-        sources.push(Box::new(LevelIter::new(sv.version.l1.clone(), true)));
+        self.read_view().raw_range(start, end)
+    }
 
-        let mut it = MergeIter::new(sources);
-        match start {
-            Bound::Included(start) => it.seek(start),
-            Bound::Excluded(start) => {
-                it.seek(start);
-                if it.valid() && it.key() == start {
-                    it.next();
-                }
-            }
-            Bound::Unbounded => it.seek(&[]),
-        }
-        let mut raw = RawIter { it, end, valid: false };
-        raw.settle();
-        raw
+    /// The current memtables and tables, held fixed so several threads can
+    /// each read part of a range from the same set.
+    pub(crate) fn read_view(&self) -> ReadView {
+        ReadView(self.inner.super_version())
     }
 
     /// Writes the memtable out to a table now, rather than when it fills.
@@ -668,7 +733,7 @@ impl Inner {
     }
 
     fn write_manifest(&self, version: &Version, log_number: u64) -> Result<()> {
-        write_manifest(&self.dir, self.next_file.load(Ordering::SeqCst), log_number, version)
+        write_manifest(&self.dir, self.next_file.load(Ordering::SeqCst), log_number, version, self.opts.sync)
     }
 }
 
@@ -680,9 +745,9 @@ fn write_memtable(dir: &Path, number: u64, mem: &MemTable, opts: &Options, cache
     Table::open(&path, builder.finish()?, cache.clone())
 }
 
-fn write_manifest(dir: &Path, next_file: u64, log_number: u64, version: &Version) -> Result<()> {
+fn write_manifest(dir: &Path, next_file: u64, log_number: u64, version: &Version, full: bool) -> Result<()> {
     let metas = |level: &[Arc<Table>]| level.iter().map(|t| t.meta.clone()).collect();
-    Manifest { next_file, log_number, l0: metas(&version.l0), l1: metas(&version.l1) }.store(dir)
+    Manifest { next_file, log_number, l0: metas(&version.l0), l1: metas(&version.l1) }.store(dir, full)
 }
 
 /// Iterates over live entries in a key range, lending each key and value
@@ -728,6 +793,33 @@ impl RawIter {
         self.settle();
     }
 
+    /// Calls `f` with each live entry from here to the end of the range,
+    /// until it returns `false` or an error. Much faster than stepping with
+    /// `next`, as each layer of the merge loops over its own entries.
+    pub fn for_each(&mut self, mut f: impl FnMut(&[u8], &[u8]) -> Result<bool>) -> Result<()> {
+        if !self.valid {
+            return self.status();
+        }
+        // The same range, as an exclusive limit: the smallest key above an
+        // inclusive end is that key with a zero byte appended.
+        let limit = match &self.end {
+            Bound::Included(end) => Some([end.as_slice(), &[0]].concat()),
+            Bound::Excluded(end) => Some(end.clone()),
+            Bound::Unbounded => None,
+        };
+        let mut result = Ok(());
+        self.it.run(limit.as_deref(), &mut |key, value| match value {
+            None => true, // deleted
+            Some(value) => f(key, value).unwrap_or_else(|e| {
+                result = Err(e);
+                false
+            }),
+        });
+        self.settle();
+        result?;
+        self.status()
+    }
+
     /// The error, if one cut the iteration short.
     pub fn status(&self) -> Result<()> {
         self.it.status()
@@ -758,5 +850,118 @@ impl Iterator for DbIterator {
         let item = (self.raw.key().to_vec(), self.raw.value().to_vec());
         self.raw.next();
         Some(Ok(item))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::testutil::TempDir;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    fn key(i: u64) -> Vec<u8> {
+        format!("k{i:06}").into_bytes()
+    }
+
+    /// Fills a database whose data is spread over the memtable, level-0
+    /// tables and level 1, with overwrites and deletions everywhere, and a
+    /// model of what it should hold.
+    fn spread_out(dir: &TempDir) -> (Db, BTreeMap<Vec<u8>, Vec<u8>>) {
+        let opts = Options {
+            memtable_size: 32 << 10,
+            block_size: 256,
+            l0_compaction_trigger: 3,
+            target_file_size: 64 << 10,
+            ..Options::default()
+        };
+        let db = Db::open_with(dir.path(), opts).unwrap();
+        let mut model = BTreeMap::new();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..6 {
+            let mut batch = WriteBatch::new();
+            for _ in 0..2000 {
+                let k = key(rng.below(5000));
+                if rng.below(6) == 0 {
+                    batch.delete(&k);
+                    model.remove(&k);
+                } else {
+                    let v = format!("v{round}-{}", rng.below(1000)).into_bytes();
+                    batch.put(&k, &v);
+                    model.insert(k, v);
+                }
+            }
+            db.write(&batch).unwrap();
+            if round < 5 {
+                db.flush().unwrap();
+            }
+        }
+        let stats = db.stats();
+        assert!(stats.memtable_bytes > 0 && stats.l1_tables > 0, "{stats:?}");
+        (db, model)
+    }
+
+    #[test]
+    fn for_each_matches_stepping_and_the_model() {
+        let dir = TempDir::new("for-each");
+        let (db, model) = spread_out(&dir);
+        let mut rng = Rng(42);
+        for _ in 0..200 {
+            let (a, b) = (rng.below(5200), rng.below(5200));
+            let (lo, hi) = (key(a.min(b)), key(a.max(b)));
+            let end = if rng.below(2) == 0 { Bound::Included(hi.clone()) } else { Bound::Excluded(hi.clone()) };
+            let expected: Vec<_> = model
+                .range::<Vec<u8>, _>((Bound::Included(lo.clone()), end.clone()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            // Stepping one entry at a time.
+            let mut stepped = Vec::new();
+            let mut it = db.raw_range(Bound::Included(&lo), end.clone());
+            while it.valid() {
+                stepped.push((it.key().to_vec(), it.value().to_vec()));
+                it.next();
+            }
+            assert_eq!(stepped, expected);
+
+            // Runs, stopping at a random point and carrying on from where the
+            // run left the iterator.
+            let stop_after = rng.below(expected.len() as u64 + 1) as usize;
+            let mut ran = Vec::new();
+            let mut it = db.raw_range(Bound::Included(&lo), end);
+            it.for_each(|k, v| {
+                ran.push((k.to_vec(), v.to_vec()));
+                Ok(ran.len() < stop_after)
+            })
+            .unwrap();
+            while it.valid() {
+                ran.push((it.key().to_vec(), it.value().to_vec()));
+                it.next();
+            }
+            assert_eq!(ran, expected);
+        }
+    }
+
+    #[test]
+    fn split_points_are_sorted_and_inside_the_range() {
+        let dir = TempDir::new("split-points");
+        let (db, _) = spread_out(&dir);
+        let (lo, hi) = (Bound::Excluded(key(1000)), Bound::Excluded(key(4000)));
+        let view = db.read_view();
+        let points = view.split_points(&lo, &hi);
+        assert!(points.len() > 10, "{}", points.len());
+        assert!(points.windows(2).all(|w| w[0] < w[1]));
+        assert!(points.iter().all(|p| p.as_ref() > key(1000).as_slice() && p.as_ref() < key(4000).as_slice()));
     }
 }

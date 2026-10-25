@@ -18,6 +18,7 @@ usage: spiro-bench [options]
   --value-size B   value size in bytes (default 100)
   --threads T      reader threads for the parallel read test (default: all cores)
   --cache-mb M     block cache size in MiB (default 64)
+  --scan-threads S threads one SQL query may use (default 0: every core)
   --sync           fsync the log on every write
   --sql            benchmark the SQL layer instead of the key-value API
   --path DIR       database directory (default: a temp dir, removed afterwards)";
@@ -30,6 +31,7 @@ struct Config {
     value_size: usize,
     threads: usize,
     cache_mb: usize,
+    scan_threads: usize,
     sync: bool,
     sql: bool,
     path: Option<PathBuf>,
@@ -41,6 +43,7 @@ fn parse_args() -> Result<Config, String> {
         value_size: 100,
         threads: thread::available_parallelism().map_or(4, |n| n.get()),
         cache_mb: Options::default().block_cache_size >> 20,
+        scan_threads: 0,
         sync: false,
         sql: false,
         path: None,
@@ -53,6 +56,7 @@ fn parse_args() -> Result<Config, String> {
             "--value-size" => cfg.value_size = value()?.parse().map_err(|e| format!("--value-size: {e}"))?,
             "--threads" => cfg.threads = value()?.parse().map_err(|e| format!("--threads: {e}"))?,
             "--cache-mb" => cfg.cache_mb = value()?.parse().map_err(|e| format!("--cache-mb: {e}"))?,
+            "--scan-threads" => cfg.scan_threads = value()?.parse().map_err(|e| format!("--scan-threads: {e}"))?,
             "--path" => cfg.path = Some(value()?.into()),
             "--sync" => cfg.sync = true,
             "--sql" => cfg.sql = true,
@@ -96,7 +100,7 @@ fn main() -> ExitCode {
     println!("{:-<90}", "");
 
     if cfg.sql {
-        sql_suite(n, &dir, opts);
+        sql_suite(n, &dir, opts, cfg.scan_threads);
         if cfg.path.is_none() {
             let _ = fs::remove_dir_all(&dir);
         }
@@ -207,9 +211,10 @@ fn main() -> ExitCode {
 }
 
 /// Benchmarks the SQL layer on a table with a secondary index.
-fn sql_suite(n: u64, dir: &Path, opts: Options) {
+fn sql_suite(n: u64, dir: &Path, opts: Options, scan_threads: usize) {
     let _ = fs::remove_dir_all(dir);
     let db = Database::open_with(dir, opts).expect("open database");
+    db.set_scan_threads(scan_threads);
     db.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score INTEGER, note TEXT)").unwrap();
     db.execute("CREATE INDEX bench_score ON bench (score)").unwrap();
     let groups = (n / 10).max(1); // each score is shared by about 10 rows
@@ -239,41 +244,55 @@ fn sql_suite(n: u64, dir: &Path, opts: Options) {
     });
     let total = n + single;
 
+    // Queries read their rows as they are produced, with `query_each`, the
+    // way the other engines' benchmarks step through theirs.
     let by_id = db.prepare("SELECT name FROM bench WHERE id = ?").unwrap();
     run("select by primary key", n, None, || {
         let mut rng = Rng(1);
-        let found = (0..n)
-            .filter(|_| {
-                let id = Value::Integer(rng.below(total) as i64);
-                !session.execute_prepared(&by_id, &[id]).unwrap().rows().unwrap().is_empty()
-            })
-            .count();
-        format!("{} of {} found", group(found as u64), group(n))
+        let mut found = 0;
+        for _ in 0..n {
+            let id = Value::Integer(rng.below(total) as i64);
+            session
+                .query_each(&by_id, &[id], |row| {
+                    found += row[0].as_str().is_some() as u64;
+                    true
+                })
+                .unwrap();
+        }
+        format!("{} of {} found", group(found), group(n))
     });
     let by_score = db.prepare("SELECT id FROM bench WHERE score = ?").unwrap();
     let lookups = (n / 10).max(1);
     run("select by index", lookups, None, || {
         let mut rng = Rng(2);
-        let rows: usize = (0..lookups)
-            .map(|_| {
-                let score = Value::Integer(rng.below(groups) as i64);
-                session.execute_prepared(&by_score, &[score]).unwrap().rows().unwrap().len()
-            })
-            .sum();
-        format!("{} rows", group(rows as u64))
+        let mut rows = 0;
+        for _ in 0..lookups {
+            let score = Value::Integer(rng.below(groups) as i64);
+            session
+                .query_each(&by_score, &[score], |row| {
+                    rows += matches!(row[0], Value::Integer(id) if id >= 0) as u64;
+                    true
+                })
+                .unwrap();
+        }
+        format!("{} rows", group(rows))
     });
     let range = db.prepare("SELECT id, name FROM bench WHERE id >= ? AND id < ?").unwrap();
     let scans = (n / 100).max(1);
     run("select 100-row range", scans, None, || {
         let mut rng = Rng(3);
-        let rows: usize = (0..scans)
-            .map(|_| {
-                let start = rng.below(total) as i64;
-                let bounds = [Value::Integer(start), Value::Integer(start + 100)];
-                session.execute_prepared(&range, &bounds).unwrap().rows().unwrap().len()
-            })
-            .sum();
-        format!("{} rows", group(rows as u64))
+        let mut rows = 0;
+        for _ in 0..scans {
+            let start = rng.below(total) as i64;
+            let bounds = [Value::Integer(start), Value::Integer(start + 100)];
+            session
+                .query_each(&range, &bounds, |row| {
+                    rows += row[1].as_str().is_some() as u64;
+                    true
+                })
+                .unwrap();
+        }
+        format!("{} rows", group(rows))
     });
     let update = db.prepare("UPDATE bench SET note = ? WHERE id = ?").unwrap();
     let updates = (n / 10).max(1);

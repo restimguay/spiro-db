@@ -45,6 +45,7 @@ mod db;
 mod error;
 mod iter;
 mod json;
+mod keymap;
 mod manifest;
 mod memtable;
 mod options;

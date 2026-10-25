@@ -2,8 +2,13 @@
 
 use std::sync::Arc;
 
+use crate::coding::key_lt;
 use crate::error::Result;
 use crate::table::{Table, TableIter};
+
+/// Receives entries from [`KvIter::run`]: a key and its value (`None` for a
+/// tombstone). Returns `false` to stop.
+pub type Visit<'a> = &'a mut dyn FnMut(&[u8], Option<&[u8]>) -> bool;
 
 /// A cursor over sorted entries, tombstones included.
 pub trait KvIter: Send {
@@ -17,6 +22,23 @@ pub trait KvIter: Send {
     fn seek(&mut self, target: &[u8]);
     /// The error, if one cut the iteration short.
     fn status(&self) -> Result<()>;
+
+    /// Calls `f` with each entry from the current one on, while their keys
+    /// are below `limit` (if any) and `f` returns `true`, moving past each
+    /// entry it is given. Returns `false` if `f` asked to stop.
+    ///
+    /// Scans use this instead of `next` so that each layer can loop over its
+    /// own entries, rather than every entry climbing through all of them.
+    fn run(&mut self, limit: Option<&[u8]>, f: Visit) -> bool {
+        while self.valid() && limit.is_none_or(|limit| self.key() < limit) {
+            let go = f(self.key(), self.value());
+            self.next();
+            if !go {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Iterates level 1, a sorted run of non-overlapping tables, as one sequence,
@@ -84,6 +106,21 @@ impl KvIter for LevelIter {
 
     fn status(&self) -> Result<()> {
         self.cur.as_ref().map_or(Ok(()), KvIter::status)
+    }
+
+    fn run(&mut self, limit: Option<&[u8]>, f: Visit) -> bool {
+        loop {
+            let Some(cur) = &mut self.cur else { return true };
+            let go = cur.run(limit, f);
+            let at_limit = cur.valid();
+            self.skip_exhausted_tables();
+            if !go {
+                return false;
+            }
+            if at_limit || !self.valid() {
+                return true;
+            }
+        }
     }
 }
 
@@ -184,6 +221,47 @@ impl KvIter for MergeIter {
     fn status(&self) -> Result<()> {
         self.sources.iter().try_for_each(|s| s.status())
     }
+
+    fn run(&mut self, limit: Option<&[u8]>, f: Visit) -> bool {
+        while let Some(c) = self.current {
+            if limit.is_some_and(|limit| !key_lt(self.sources[c].key(), limit)) {
+                return true;
+            }
+            let go = match self.runner_up {
+                None => self.sources[c].run(limit, f),
+                Some(r) if self.sources[r].key() == self.sources[c].key() => {
+                    // A tie: take one ordinary step, which skips the older
+                    // sources' shadowed entries for this key.
+                    let go = f(self.key(), self.value());
+                    self.next();
+                    if !go {
+                        return false;
+                    }
+                    continue;
+                }
+                Some(r) => {
+                    // Until the current source reaches the runner-up's key, it
+                    // alone supplies the entries. The two are distinct
+                    // sources, so one can run while the other's key is read.
+                    let (current, runner_up) = if c < r {
+                        let (low, high) = self.sources.split_at_mut(r);
+                        (&mut low[c], &high[0])
+                    } else {
+                        let (low, high) = self.sources.split_at_mut(c);
+                        (&mut high[0], &low[r])
+                    };
+                    let bound = runner_up.key();
+                    let run_limit = limit.map_or(bound, |limit| if key_lt(limit, bound) { limit } else { bound });
+                    current.run(Some(run_limit), f)
+                }
+            };
+            self.find_current();
+            if !go {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +335,66 @@ mod tests {
                 assert_eq!((merged.key(), merged.value()), (k.as_slice(), v.as_deref()));
                 merged.next();
             }
+        }
+    }
+
+    #[test]
+    fn runs_match_stepping_with_limits_and_stops() {
+        let mut x = 0x5851_f42d_4c95_7f2du64;
+        let mut rand = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut sources_ops = Vec::new();
+        for source in 0..3 {
+            let ops: Vec<(String, Option<String>)> = (0..200)
+                .map(|_| {
+                    let key = format!("{:03}", rand(300));
+                    (key, (rand(4) != 0).then(|| format!("s{source}")))
+                })
+                .collect();
+            sources_ops.push(ops);
+        }
+        let make = || {
+            let sources = sources_ops
+                .iter()
+                .map(|ops| {
+                    let ops: Vec<(&str, Option<&str>)> = ops.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+                    memtable(&ops)
+                })
+                .collect();
+            MergeIter::new(sources)
+        };
+        for _ in 0..300 {
+            let start = format!("{:03}", rand(310));
+            let limit = (rand(3) != 0).then(|| format!("{:03}", rand(310)));
+            let limit = limit.as_ref().map(|l| l.as_bytes());
+
+            let mut stepping = make();
+            stepping.seek(start.as_bytes());
+            let mut expected = Vec::new();
+            while stepping.valid() && limit.is_none_or(|l| stepping.key() < l) {
+                expected.push((stepping.key().to_vec(), stepping.value().map(<[u8]>::to_vec)));
+                stepping.next();
+            }
+
+            let stop_after = rand(expected.len() as u64 + 2) as usize;
+            let mut running = make();
+            running.seek(start.as_bytes());
+            let mut got = Vec::new();
+            let finished = running.run(limit, &mut |k, v| {
+                got.push((k.to_vec(), v.map(<[u8]>::to_vec)));
+                got.len() < stop_after
+            });
+            assert_eq!(finished, stop_after > expected.len() || stop_after == 0 && expected.is_empty());
+            // Carrying on by stepping picks up exactly where the run stopped.
+            while running.valid() && limit.is_none_or(|l| running.key() < l) {
+                got.push((running.key().to_vec(), running.value().map(<[u8]>::to_vec)));
+                running.next();
+            }
+            assert_eq!(got, expected);
         }
     }
 

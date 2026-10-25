@@ -35,10 +35,11 @@ mod plan;
 pub(crate) mod repl;
 mod txn;
 mod value;
+mod vector;
 
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -207,6 +208,8 @@ struct Shared {
     notifier: Notifier,
     repl: Arc<Replication>,
     busy_timeout: Mutex<Duration>,
+    /// Most threads one query may use; 0 means every core.
+    scan_threads: AtomicUsize,
 }
 
 /// A SQL database. Cheap to clone; clones share the same storage.
@@ -232,6 +235,7 @@ impl Database {
                 notifier: Notifier::default(),
                 repl,
                 busy_timeout: Mutex::new(Duration::from_secs(5)),
+                scan_threads: AtomicUsize::new(0),
             }),
         })
     }
@@ -245,6 +249,13 @@ impl Database {
     /// giving up with "database is locked". Defaults to 5 seconds.
     pub fn set_busy_timeout(&self, timeout: Duration) {
         *self.shared.busy_timeout.lock().unwrap() = timeout;
+    }
+
+    /// The most threads one query may use. Full scans that aggregate are
+    /// split across threads; 0, the default, uses every core, and 1 keeps
+    /// each query on a single core.
+    pub fn set_scan_threads(&self, threads: usize) {
+        self.shared.scan_threads.store(threads, Ordering::Relaxed);
     }
 
     /// A session, which can hold a transaction open across statements.
@@ -297,13 +308,15 @@ impl Database {
     fn read_txn(&self) -> Txn {
         let shared = &self.shared;
         Txn::new(shared.kv.clone(), shared.schemas.clone(), shared.repl.clone(), None)
+            .with_scan_threads(shared.scan_threads.load(Ordering::Relaxed))
     }
 
     fn write_txn(&self) -> Result<Txn> {
         let timeout = *self.shared.busy_timeout.lock().unwrap();
         let guard = self.shared.writer.acquire(timeout)?;
         let shared = &self.shared;
-        Ok(Txn::new(shared.kv.clone(), shared.schemas.clone(), shared.repl.clone(), Some(guard)))
+        Ok(Txn::new(shared.kv.clone(), shared.schemas.clone(), shared.repl.clone(), Some(guard))
+            .with_scan_threads(shared.scan_threads.load(Ordering::Relaxed)))
     }
 
     // ------------------------------------------------------------ replication
@@ -594,6 +607,52 @@ impl Session {
             return Err(Error::Sql(format!("expected {} parameters, got {}", prepared.params, params.len())));
         }
         self.run(prepared, params)
+    }
+
+    /// Runs a prepared query and hands each result row to `f` as it is
+    /// produced, instead of collecting them all. Return `false` to stop.
+    ///
+    /// The row is lent, not given: it lives in a buffer reused for the next
+    /// row, text included, so a query that streams needs no allocation per
+    /// row. Queries that group, sort or remove duplicates must see every row
+    /// first; those are collected, then handed over one by one.
+    ///
+    /// ```no_run
+    /// # use spirodb::sql::{Database, Value};
+    /// # let db = Database::open("./my-data")?;
+    /// let query = db.prepare("SELECT id, name FROM users WHERE id >= ? AND id < ?")?;
+    /// let mut session = db.session();
+    /// let mut names = 0;
+    /// session.query_each(&query, &[Value::Integer(100), Value::Integer(200)], |row| {
+    ///     names += row[1].as_str().map_or(0, str::len);
+    ///     true
+    /// })?;
+    /// # Ok::<(), spirodb::Error>(())
+    /// ```
+    pub fn query_each(
+        &mut self,
+        prepared: &Prepared,
+        params: &[Value],
+        mut f: impl FnMut(&[Value]) -> bool,
+    ) -> Result<()> {
+        if params.len() != prepared.params {
+            return Err(Error::Sql(format!("expected {} parameters, got {}", prepared.params, params.len())));
+        }
+        if !matches!(prepared.statement, Statement::Select(_)) {
+            if let QueryResult::Rows(rows) = self.run(prepared, params)? {
+                rows.rows.iter().take_while(|row| f(row)).for_each(drop);
+            }
+            return Ok(());
+        }
+        let mut visit = |row: &[Value]| Ok(f(row));
+        match &mut self.txn {
+            Some(txn) => {
+                txn.begin_statement();
+                exec::stream(txn, &prepared.statement, params, &prepared.plans, &mut visit)
+            }
+            // Reading only, so there is nothing to commit.
+            None => exec::stream(&self.db.read_txn(), &prepared.statement, params, &prepared.plans, &mut visit),
+        }
     }
 
     /// Runs a query and returns its rows.

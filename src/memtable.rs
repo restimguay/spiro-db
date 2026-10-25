@@ -1,31 +1,52 @@
 //! The memtable: recent writes, kept sorted in memory until flushed to a table.
 
-use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::WriteBatch;
 use crate::error::Result;
 use crate::iter::KvIter;
+use crate::keymap::KeyMap;
 
 /// Approximate bookkeeping cost of one entry: its share of a B-tree node plus
 /// two `Vec` headers.
 const ENTRY_OVERHEAD: usize = 64;
 
+/// About one in this many keys (a power of two) is kept as a sample of the
+/// memtable's keys.
+const SAMPLE_EVERY: u64 = 128;
+
+/// Whether `key` is one of the sampled keys. The choice goes by a hash of
+/// the key, not by the order of writes, which can be periodic (a row and an
+/// index entry per insert) and would then sample only one kind of key.
+fn sampled(key: &[u8]) -> bool {
+    let mut h = key.len() as u64;
+    for chunk in key.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        h = (h ^ u64::from_le_bytes(word)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+    }
+    h.wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 32 & (SAMPLE_EVERY - 1) == 0
+}
+
 /// A `None` value is a tombstone: the key was deleted.
-type Map = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+type Map = KeyMap<Option<Vec<u8>>>;
 
 pub struct MemTable {
     map: RwLock<Map>,
     size: AtomicUsize,
+    /// About one in `SAMPLE_EVERY` keys, in the order written. They show how
+    /// the data spreads over the key space, for splitting a scan into even
+    /// parts.
+    samples: Mutex<Vec<Vec<u8>>>,
     /// The write-ahead log holding this memtable's writes.
     pub wal_number: u64,
 }
 
 impl MemTable {
     pub fn new(wal_number: u64) -> Self {
-        MemTable { map: RwLock::default(), size: AtomicUsize::new(0), wal_number }
+        MemTable { map: RwLock::default(), size: AtomicUsize::new(0), samples: Mutex::default(), wal_number }
     }
 
     pub fn apply(&self, batch: &WriteBatch) {
@@ -34,12 +55,14 @@ impl MemTable {
         for (key, value) in batch.iter() {
             let value = value.map(<[u8]>::to_vec);
             size += value.as_ref().map_or(0, Vec::len);
-            if let Some(slot) = map.get_mut(key) {
-                size -= slot.as_ref().map_or(0, Vec::len);
-                *slot = value;
-            } else {
-                size += ENTRY_OVERHEAD + key.len();
-                map.insert(key.to_vec(), value);
+            match map.insert(key, value) {
+                Some(old) => size -= old.as_ref().map_or(0, Vec::len),
+                None => {
+                    size += ENTRY_OVERHEAD + key.len();
+                    if sampled(key) {
+                        self.samples.lock().unwrap().push(key.to_vec());
+                    }
+                }
             }
         }
         self.size.store(size, Ordering::Relaxed);
@@ -66,16 +89,48 @@ impl MemTable {
         Ok(())
     }
 
+    /// The sampled keys inside `(start, end)`, sorted.
+    pub fn sample_keys(&self, start: &Bound<Vec<u8>>, end: &Bound<Vec<u8>>) -> Vec<Vec<u8>> {
+        let after_start = |k: &[u8]| match start {
+            Bound::Included(s) | Bound::Excluded(s) => k > s.as_slice(),
+            Bound::Unbounded => true,
+        };
+        let before_end = |k: &[u8]| match end {
+            Bound::Included(e) | Bound::Excluded(e) => k < e.as_slice(),
+            Bound::Unbounded => true,
+        };
+        let mut keys: Vec<Vec<u8>> =
+            self.samples.lock().unwrap().iter().filter(|k| after_start(k) && before_end(k)).cloned().collect();
+        keys.sort_unstable();
+        keys
+    }
+
     /// Iterates entries with keys up to `end`.
     pub fn iter(self: &Arc<Self>, end: Bound<Vec<u8>>) -> MemIter {
-        MemIter { mem: self.clone(), end, batch: Vec::new(), batch_size: FIRST_BATCH, pos: 0, exhausted: true }
+        MemIter {
+            mem: self.clone(),
+            end,
+            bytes: Vec::new(),
+            entries: Vec::new(),
+            batch_size: FIRST_BATCH,
+            pos: 0,
+            exhausted: true,
+        }
     }
 }
 
 /// Entries copied by a seek. Short scans are common, so start small and
 /// double with each refill, up to `MAX_BATCH`.
 const FIRST_BATCH: usize = 2;
-const MAX_BATCH: usize = 128;
+const MAX_BATCH: usize = 512;
+
+/// Where one copied entry lies in `MemIter::bytes`.
+#[derive(Clone, Copy)]
+struct Copied {
+    key: (u32, u32),
+    /// `None` for a tombstone.
+    value: Option<(u32, u32)>,
+}
 
 /// Iterates a memtable without holding its lock: entries are copied out a
 /// batch at a time, so writers are never blocked for long. Writes that land
@@ -84,7 +139,10 @@ pub struct MemIter {
     mem: Arc<MemTable>,
     /// Entries past this are never copied out.
     end: Bound<Vec<u8>>,
-    batch: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// The copied keys and values, back to back. One buffer, reused for
+    /// every batch, so a scan doesn't allocate per entry.
+    bytes: Vec<u8>,
+    entries: Vec<Copied>,
     batch_size: usize,
     pos: usize,
     exhausted: bool,
@@ -92,45 +150,58 @@ pub struct MemIter {
 
 impl MemIter {
     fn fill(&mut self, from: Bound<&[u8]>) {
-        self.batch.clear();
+        self.bytes.clear();
+        self.entries.clear();
         self.pos = 0;
         let end = match &self.end {
             Bound::Included(e) => Bound::Included(e.as_slice()),
             Bound::Excluded(e) => Bound::Excluded(e.as_slice()),
             Bound::Unbounded => Bound::Unbounded,
         };
-        // `BTreeMap::range` panics on an inverted range; that's just an empty one.
-        let empty = match (from, end) {
-            (Bound::Included(f), Bound::Included(e)) => f > e,
-            (Bound::Included(f) | Bound::Excluded(f), Bound::Included(e) | Bound::Excluded(e)) => f >= e,
-            _ => false,
+        let before_end = |key: &[u8]| match end {
+            Bound::Included(e) => key <= e,
+            Bound::Excluded(e) => key < e,
+            Bound::Unbounded => true,
         };
-        if !empty {
+        {
             let map = self.mem.map.read().unwrap();
-            let entries = map.range::<[u8], _>((from, end)).take(self.batch_size);
-            self.batch.extend(entries.map(|(k, v)| (k.clone(), v.clone())));
+            for (key, value) in map.range_from(from).take_while(|(k, _)| before_end(k)).take(self.batch_size) {
+                let mut copy = |data: &[u8]| {
+                    let start = self.bytes.len() as u32;
+                    self.bytes.extend_from_slice(data);
+                    (start, data.len() as u32)
+                };
+                let key = copy(key);
+                let value = value.as_deref().map(&mut copy);
+                self.entries.push(Copied { key, value });
+            }
         }
-        self.exhausted = self.batch.len() < self.batch_size;
+        self.exhausted = self.entries.len() < self.batch_size;
+    }
+
+    fn slice(&self, (start, len): (u32, u32)) -> &[u8] {
+        &self.bytes[start as usize..(start + len) as usize]
     }
 }
 
 impl KvIter for MemIter {
     fn valid(&self) -> bool {
-        self.pos < self.batch.len()
+        self.pos < self.entries.len()
     }
 
     fn key(&self) -> &[u8] {
-        &self.batch[self.pos].0
+        self.slice(self.entries[self.pos].key)
     }
 
     fn value(&self) -> Option<&[u8]> {
-        self.batch[self.pos].1.as_deref()
+        self.entries[self.pos].value.map(|v| self.slice(v))
     }
 
     fn next(&mut self) {
         self.pos += 1;
-        if self.pos >= self.batch.len() && !self.exhausted {
-            let (last, _) = self.batch.pop().expect("a full batch is not empty");
+        if self.pos >= self.entries.len() && !self.exhausted {
+            let last = self.entries.last().expect("a full batch is not empty").key;
+            let last = self.slice(last).to_vec();
             self.batch_size = (self.batch_size * 2).min(MAX_BATCH);
             self.fill(Bound::Excluded(&last));
         }

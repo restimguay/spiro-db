@@ -11,16 +11,18 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::ops::Bound;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::block::{Block, BlockBuilder, BlockIter};
 use crate::bloom::{self, BloomBuilder};
 use crate::cache::BlockCache;
-use crate::coding::{Reader, put_varint, u32_at, u64_at};
+use crate::coding::{Reader, key_lt, put_varint, u32_at, u64_at};
 use crate::crc32c::crc32c;
 use crate::error::{Error, Result, corruption};
-use crate::iter::KvIter;
+use crate::iter::{KvIter, Visit};
+use crate::manifest::sync_file;
 use crate::options::Options;
 
 const MAGIC: u64 = 0x5453_534f_5249_5053; // "SPIROSST"
@@ -46,6 +48,8 @@ pub struct TableBuilder {
     entries: u64,
     smallest: Vec<u8>,
     last_key: Vec<u8>,
+    /// Sync fully on finishing, rather than just in order (`Options::sync`).
+    full_sync: bool,
 }
 
 impl TableBuilder {
@@ -61,6 +65,7 @@ impl TableBuilder {
             entries: 0,
             smallest: Vec::new(),
             last_key: Vec::new(),
+            full_sync: opts.sync,
         })
     }
 
@@ -117,7 +122,7 @@ impl TableBuilder {
         }
         self.offset += FOOTER_LEN as u64;
         self.file.flush()?;
-        self.file.get_ref().sync_all()?;
+        sync_file(self.file.get_ref(), self.full_sync)?;
         Ok(TableMeta { number: self.number, size: self.offset, smallest: self.smallest, largest: self.last_key })
     }
 }
@@ -130,6 +135,8 @@ pub struct Table {
     index: Arc<Block>,
     filter: Vec<u8>,
     cache: Arc<BlockCache>,
+    /// Every data block's last key, read from the index when first needed.
+    boundaries: OnceLock<Vec<Vec<u8>>>,
 }
 
 impl Table {
@@ -146,7 +153,7 @@ impl Table {
         }
         let filter = read_block(&file, size, u64_at(&footer, 0), u64_at(&footer, 8))?;
         let index = Block::new(read_block(&file, size, u64_at(&footer, 16), u64_at(&footer, 24))?)?;
-        Ok(Table { meta, file, index: Arc::new(index), filter, cache })
+        Ok(Table { meta, file, index: Arc::new(index), filter, cache, boundaries: OnceLock::new() })
     }
 
     /// Whether `key` falls inside this table's key range.
@@ -168,6 +175,30 @@ impl Table {
         let mut it = BlockIter::new(&*block);
         it.seek(key);
         Ok((it.valid() && it.key() == key).then(|| it.value().map(<[u8]>::to_vec)))
+    }
+
+    /// The keys that end this table's data blocks, inside `(start, end)`:
+    /// places to split a scan of the table.
+    pub fn block_boundaries(&self, start: &Bound<Vec<u8>>, end: &Bound<Vec<u8>>) -> &[Vec<u8>] {
+        let all = self.boundaries.get_or_init(|| {
+            let mut index = BlockIter::new(&*self.index);
+            let mut keys = Vec::new();
+            index.seek_to_first();
+            while index.valid() {
+                keys.push(index.key().to_vec());
+                index.advance();
+            }
+            keys
+        });
+        let from = match start {
+            Bound::Included(k) | Bound::Excluded(k) => all.partition_point(|key| key <= k),
+            Bound::Unbounded => 0,
+        };
+        let to = match end {
+            Bound::Included(k) | Bound::Excluded(k) => all.partition_point(|key| key < k),
+            Bound::Unbounded => all.len(),
+        };
+        &all[from..to.max(from)]
     }
 
     /// `fill_cache: false` keeps large one-off reads (compactions) from
@@ -295,6 +326,25 @@ impl KvIter for TableIter {
 
     fn status(&self) -> Result<()> {
         self.err.clone().map_or(Ok(()), Err)
+    }
+
+    fn run(&mut self, limit: Option<&[u8]>, f: Visit) -> bool {
+        while self.valid() {
+            // The index holds each block's last key: when that is below the
+            // limit, the rest of the block needs no comparisons at all.
+            let whole_block = limit.is_none_or(|limit| key_lt(self.index.key(), limit));
+            let data = self.data.as_mut().expect("iterator is valid");
+            let go = data.run(if whole_block { None } else { limit }, f);
+            let at_limit = data.valid();
+            self.skip_exhausted_blocks();
+            if !go {
+                return false;
+            }
+            if at_limit {
+                return true;
+            }
+        }
+        true
     }
 }
 

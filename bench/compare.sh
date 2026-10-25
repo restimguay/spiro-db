@@ -127,7 +127,8 @@ run_engine() {
   case "$1" in
     spirodb)
       local flags=(--num "$num" --threads "$threads" --path "$work/spirodb")
-      [[ $suite == sql ]] && flags+=(--sql)
+      # One core per query, as for every other engine here.
+      [[ $suite == sql ]] && flags+=(--sql --scan-threads 1)
       "$root/target/release/spiro-bench" "${flags[@]}"
       rm -rf "$work/spirodb"
       ;;

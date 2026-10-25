@@ -17,6 +17,155 @@ pub fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Decodes a varint from the front of `buf`, returning it and its encoded length.
+/// Compares byte strings eight bytes at a time. Keys are short, so this
+/// beats a call to `memcmp` in the loops that compare every entry.
+#[inline]
+pub fn key_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let common = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= common {
+        let x = u64::from_be_bytes(a[i..i + 8].try_into().unwrap());
+        let y = u64::from_be_bytes(b[i..i + 8].try_into().unwrap());
+        if x != y {
+            return x.cmp(&y);
+        }
+        i += 8;
+    }
+    if i < common {
+        if common >= 8 {
+            // The last eight bytes in common. Those before `i` are already
+            // known equal, so the first difference still decides.
+            let x = u64::from_be_bytes(a[common - 8..common].try_into().unwrap());
+            let y = u64::from_be_bytes(b[common - 8..common].try_into().unwrap());
+            if x != y {
+                return x.cmp(&y);
+            }
+        } else if let Some(j) = (i..common).find(|&j| a[j] != b[j]) {
+            return a[j].cmp(&b[j]);
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// `a < b`, compared as [`key_cmp`] does.
+#[inline]
+pub fn key_lt(a: &[u8], b: &[u8]) -> bool {
+    key_cmp(a, b).is_lt()
+}
+
+/// Keys this long or shorter are stored inside a [`Key`], not on the heap.
+const INLINE: usize = 30;
+
+/// A key in an in-memory sorted map, ordered like the bytes but compared
+/// with [`key_cmp`]. Look-ups can still use plain `&[u8]`.
+///
+/// Short keys (most of them: a row key is about 15 bytes) are stored in
+/// place. A tree search then compares bytes sitting in the tree's own nodes
+/// instead of following a pointer per comparison, and storing a key costs
+/// no allocation.
+#[derive(Clone)]
+pub struct Key(Repr);
+
+#[derive(Clone)]
+enum Repr {
+    Inline { len: u8, bytes: [u8; INLINE] },
+    Heap(Box<[u8]>),
+}
+
+impl Key {
+    pub fn new(key: &[u8]) -> Key {
+        if key.len() <= INLINE {
+            let mut bytes = [0; INLINE];
+            bytes[..key.len()].copy_from_slice(key);
+            Key(Repr::Inline { len: key.len() as u8, bytes })
+        } else {
+            Key(Repr::Heap(key.into()))
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.0 {
+            Repr::Inline { len, bytes } => &bytes[..*len as usize],
+            Repr::Heap(bytes) => bytes,
+        }
+    }
+}
+
+impl From<Vec<u8>> for Key {
+    fn from(key: Vec<u8>) -> Key {
+        if key.len() <= INLINE { Key::new(&key) } else { Key(Repr::Heap(key.into_boxed_slice())) }
+    }
+}
+
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Key {}
+
+impl Ord for Key {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        key_cmp(self.as_slice(), other.as_slice())
+    }
+}
+
+impl PartialOrd for Key {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for Key {
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+/// A borrowed [`Key`], so look-ups compare the way the map's keys do rather
+/// than through `memcmp`.
+#[repr(transparent)]
+#[derive(PartialEq, Eq)]
+pub struct KeyRef([u8]);
+
+impl KeyRef {
+    pub fn new(bytes: &[u8]) -> &KeyRef {
+        // SAFETY: `KeyRef` is a `repr(transparent)` wrapper around `[u8]`,
+        // so the two reference types have the same layout and metadata.
+        unsafe { &*(bytes as *const [u8] as *const KeyRef) }
+    }
+}
+
+impl Ord for KeyRef {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        key_cmp(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for KeyRef {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::borrow::Borrow<KeyRef> for Key {
+    fn borrow(&self) -> &KeyRef {
+        KeyRef::new(self.as_slice())
+    }
+}
+
 pub fn get_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut v = 0u64;
     for (i, &b) in buf.iter().take(10).enumerate() {
@@ -105,5 +254,34 @@ mod tests {
         assert_eq!(r.len_prefixed().unwrap(), b"");
         assert!(r.is_empty());
         assert!(r.len_prefixed().is_err());
+    }
+}
+
+#[cfg(test)]
+mod key_order_tests {
+    use super::*;
+
+    #[test]
+    fn key_cmp_matches_byte_order() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for _ in 0..200_000 {
+            // Few distinct byte values and shared prefixes, so ties and
+            // prefix relationships come up often.
+            let prefix: Vec<u8> = (0..rand(20)).map(|_| rand(3) as u8 * 127).collect();
+            let mut a = prefix.clone();
+            let mut b = prefix;
+            a.extend((0..rand(12)).map(|_| rand(3) as u8 * 127));
+            b.extend((0..rand(12)).map(|_| rand(3) as u8 * 127));
+            assert_eq!(key_cmp(&a, &b), a.cmp(&b), "{a:?} {b:?}");
+            assert_eq!(Key::new(&a).cmp(&Key::from(b.clone())), a.cmp(&b));
+            assert_eq!(Key::new(&a).as_slice(), a.as_slice());
+            assert_eq!(KeyRef::new(&a).cmp(KeyRef::new(&b)), a.cmp(&b));
+        }
     }
 }

@@ -5,8 +5,8 @@
 //! engine's sorted storage doubles as a primary-key index and secondary
 //! indexes. Row contents use a compact encoding that needn't preserve order.
 
-use crate::coding::{Reader, put_bytes, put_varint};
-use crate::error::{Result, corruption};
+use crate::coding::{Reader, get_varint, put_bytes, put_varint};
+use crate::error::{Error, Result, corruption};
 
 use super::value::Value;
 
@@ -158,9 +158,7 @@ pub fn decode_value(r: &mut Reader) -> Result<Value> {
             Value::Integer((z >> 1) as i64 ^ -((z & 1) as i64))
         }
         ROW_REAL => Value::Real(f64::from_le_bytes(r.bytes(8)?.try_into().unwrap())),
-        ROW_TEXT => {
-            Value::Text(String::from_utf8(r.len_prefixed()?.to_vec()).map_err(|_| corruption("text is not UTF-8"))?)
-        }
+        ROW_TEXT => Value::Text(utf8(r.len_prefixed()?)?.to_owned()),
         tag => return Err(corruption(format!("unknown value tag {tag}"))),
     })
 }
@@ -189,41 +187,173 @@ pub fn decode_row_into(data: &[u8], width: usize, needed: Option<&[bool]>, out: 
         out.clear();
         out.resize(width, Value::Null);
     }
-    let mut r = Reader::new(data);
     // Nothing past the last needed column has to be read at all.
     let stop = needed.map_or(width, |needed| needed.iter().rposition(|&n| n).map_or(0, |last| last + 1));
-    let stored = r.varint()? as usize;
+    let mut pos = 0;
+    let Some(stored) = fast_varint(data, &mut pos) else { return Err(malformed()) };
     for (i, slot) in out.iter_mut().enumerate().take(stop) {
         let wanted = needed.is_none_or(|needed| needed[i]);
-        if i >= stored {
+        if i as u64 >= stored {
             // Written before this column existed.
             if wanted {
                 *slot = Value::Null;
             }
-        } else if wanted {
-            *slot = decode_value(&mut r)?;
-        } else {
-            skip_value(&mut r)?;
+            continue;
+        }
+        let Some(&tag) = data.get(pos) else { return Err(malformed()) };
+        pos += 1;
+        match tag {
+            ROW_INTEGER => {
+                let Some(z) = fast_varint(data, &mut pos) else { return Err(malformed()) };
+                if wanted {
+                    *slot = Value::Integer((z >> 1) as i64 ^ -((z & 1) as i64));
+                }
+            }
+            ROW_TEXT => {
+                let Some(len) = fast_varint(data, &mut pos) else { return Err(malformed()) };
+                let Some(bytes) = usize::try_from(len).ok().and_then(|len| data.get(pos..pos.checked_add(len)?)) else {
+                    return Err(malformed());
+                };
+                pos += bytes.len();
+                if wanted {
+                    // Into the string already in the slot, if there is one.
+                    let text = utf8(bytes)?;
+                    match slot {
+                        Value::Text(s) => {
+                            s.clear();
+                            s.push_str(text);
+                        }
+                        slot => *slot = Value::Text(text.to_owned()),
+                    }
+                }
+            }
+            ROW_NULL | ROW_FALSE | ROW_TRUE => {
+                if wanted {
+                    *slot = match tag {
+                        ROW_NULL => Value::Null,
+                        _ => Value::Boolean(tag == ROW_TRUE),
+                    };
+                }
+            }
+            ROW_REAL => {
+                let Some(bytes) = data.get(pos..pos + 8) else { return Err(malformed()) };
+                pos += 8;
+                if wanted {
+                    *slot = Value::Real(f64::from_le_bytes(bytes.try_into().unwrap()));
+                }
+            }
+            tag => return Err(corruption(format!("unknown value tag {tag}"))),
         }
     }
     Ok(())
 }
 
-fn skip_value(r: &mut Reader) -> Result<()> {
-    match r.u8()? {
-        ROW_NULL | ROW_FALSE | ROW_TRUE => {}
-        ROW_INTEGER => {
-            r.varint()?;
+/// Stored text as a string. Short ASCII strings, the common case, skip the
+/// general UTF-8 check.
+fn utf8(bytes: &[u8]) -> Result<&str> {
+    if bytes.is_ascii() {
+        // SAFETY: ASCII bytes are valid UTF-8.
+        return Ok(unsafe { std::str::from_utf8_unchecked(bytes) });
+    }
+    std::str::from_utf8(bytes).map_err(|_| corruption("text is not UTF-8"))
+}
+
+/// A stored value, borrowed from the row's bytes rather than decoded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RawValue<'a> {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Real(f64),
+    /// Not yet checked to be UTF-8.
+    Text(&'a [u8]),
+}
+
+impl RawValue<'_> {
+    pub fn to_value(self) -> Result<Value> {
+        Ok(match self {
+            RawValue::Null => Value::Null,
+            RawValue::Boolean(b) => Value::Boolean(b),
+            RawValue::Integer(i) => Value::Integer(i),
+            RawValue::Real(r) => Value::Real(r),
+            RawValue::Text(t) => Value::Text(utf8(t)?.to_owned()),
+        })
+    }
+}
+
+/// Calls `f` with each column of a stored row that `needed` marks, in order,
+/// without decoding the rest. Columns added after the row was written read
+/// as NULL. For scans that only look at values, this skips building a row.
+pub fn visit_row<'a>(data: &'a [u8], needed: &[bool], mut f: impl FnMut(usize, RawValue<'a>)) -> Result<()> {
+    let mut pos = 0;
+    let Some(stored) = fast_varint(data, &mut pos) else { return Err(malformed()) };
+    let stop = needed.iter().rposition(|&n| n).map_or(0, |last| last + 1);
+    for (i, &wanted) in needed[..stop].iter().enumerate() {
+        if i as u64 >= stored {
+            if wanted {
+                f(i, RawValue::Null);
+            }
+            continue;
         }
-        ROW_REAL => {
-            r.bytes(8)?;
+        let Some(&tag) = data.get(pos) else { return Err(malformed()) };
+        pos += 1;
+        let value = match tag {
+            ROW_INTEGER => {
+                let Some(z) = fast_varint(data, &mut pos) else { return Err(malformed()) };
+                RawValue::Integer((z >> 1) as i64 ^ -((z & 1) as i64))
+            }
+            ROW_TEXT => {
+                let Some(len) = fast_varint(data, &mut pos) else { return Err(malformed()) };
+                let Some(text) = usize::try_from(len).ok().and_then(|len| data.get(pos..pos.checked_add(len)?)) else {
+                    return Err(malformed());
+                };
+                pos += text.len();
+                RawValue::Text(text)
+            }
+            ROW_NULL => RawValue::Null,
+            ROW_FALSE => RawValue::Boolean(false),
+            ROW_TRUE => RawValue::Boolean(true),
+            ROW_REAL => {
+                let Some(bytes) = data.get(pos..pos + 8) else { return Err(malformed()) };
+                pos += 8;
+                RawValue::Real(f64::from_le_bytes(bytes.try_into().unwrap()))
+            }
+            tag => return Err(corruption(format!("unknown value tag {tag}"))),
+        };
+        if wanted {
+            f(i, value);
         }
-        ROW_TEXT => {
-            r.len_prefixed()?;
-        }
-        tag => return Err(corruption(format!("unknown value tag {tag}"))),
     }
     Ok(())
+}
+
+#[cold]
+fn malformed() -> Error {
+    corruption("row is truncated or malformed")
+}
+
+/// Reads a varint, with the short lengths (most values) unrolled.
+#[inline(always)]
+fn fast_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let p = *pos;
+    let b0 = u64::from(*data.get(p)?);
+    if b0 < 0x80 {
+        *pos = p + 1;
+        return Some(b0);
+    }
+    let b1 = u64::from(*data.get(p + 1)?);
+    if b1 < 0x80 {
+        *pos = p + 2;
+        return Some((b0 & 0x7f) | b1 << 7);
+    }
+    let b2 = u64::from(*data.get(p + 2)?);
+    if b2 < 0x80 {
+        *pos = p + 3;
+        return Some((b0 & 0x7f) | (b1 & 0x7f) << 7 | b2 << 14);
+    }
+    let (v, n) = get_varint(&data[p..])?;
+    *pos = p + n;
+    Some(v)
 }
 
 /// The smallest key greater than every key starting with `prefix`, or `None`

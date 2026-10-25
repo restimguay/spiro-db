@@ -19,6 +19,7 @@ use super::plan::{
 };
 use super::txn::Txn;
 use super::value::{Value, sql_error};
+use super::vector;
 use super::{QueryResult, Rows};
 
 /// A prepared statement's plan, reused across executions while the schema
@@ -149,10 +150,10 @@ fn explain(txn: &Txn, statement: &Statement, binder: &Binder) -> Result<QueryRes
 /// Receives each row read, with its key. Both are lent for the duration of
 /// the call; the row may be modified (its values moved out). Returning
 /// `false` stops the read.
-type Sink<'a> = &'a mut dyn FnMut(&[u8], &mut [Value]) -> Result<bool>;
+pub(super) type Sink<'a> = &'a mut dyn FnMut(&[u8], &mut [Value]) -> Result<bool>;
 
 /// Where a read looks and what it decodes.
-struct ReadSpec<'a> {
+pub(super) struct ReadSpec<'a> {
     table: &'a TableSchema,
     access: &'a Access,
     /// Only these columns are decoded (the rest read as NULL), and an index
@@ -160,18 +161,18 @@ struct ReadSpec<'a> {
     needed: Option<&'a [bool]>,
     /// Set by the read when the access path narrowed it, rather than falling
     /// back to a full scan; the conditions the path enforces then hold.
-    narrowed: Cell<bool>,
+    pub(super) narrowed: Cell<bool>,
 }
 
 impl<'a> ReadSpec<'a> {
-    fn new(table: &'a TableSchema, access: &'a Access, needed: Option<&'a [bool]>) -> Self {
+    pub(super) fn new(table: &'a TableSchema, access: &'a Access, needed: Option<&'a [bool]>) -> Self {
         ReadSpec { table, access, needed, narrowed: Cell::new(false) }
     }
 }
 
 /// Reads the rows `spec` selects. `outer` is the row that key expressions
 /// are evaluated against.
-fn read(txn: &Txn, spec: &ReadSpec, outer: &[Value], params: &[Value], sink: Sink) -> Result<()> {
+pub(super) fn read(txn: &Txn, spec: &ReadSpec, outer: &[Value], params: &[Value], sink: Sink) -> Result<()> {
     let (table, access, needed) = (spec.table, spec.access, spec.needed);
     // Key values are converted to their column's type. A value that can't be
     // (NULL, or a type that could never compare equal) falls back to a full
@@ -368,7 +369,7 @@ fn count(e: &Option<BExpr>, params: &[Value], clause: &str) -> Result<Option<usi
     }
 }
 
-pub fn run_select(txn: &Txn, plan: &SelectPlan, params: &[Value]) -> Result<Rows> {
+pub fn run_select(txn: &Txn, plan: &Arc<SelectPlan>, params: &[Value]) -> Result<Rows> {
     let limit = count(&plan.limit, params, "LIMIT")?;
     let offset = count(&plan.offset, params, "OFFSET")?.unwrap_or(0);
     // Without aggregation, DISTINCT or a sort, rows can be emitted as they are
@@ -384,8 +385,10 @@ pub fn run_select(txn: &Txn, plan: &SelectPlan, params: &[Value]) -> Result<Rows
     let mut single = plan.grouping.as_ref().filter(|g| g.keys.is_empty()).map(new_accumulators);
     let mut groups: BTreeMap<Vec<u8>, (Vec<Value>, Vec<Accumulator>)> = BTreeMap::new();
     let (mut key_values, mut key_bytes) = (Vec::new(), Vec::new());
+    // Aggregating one table runs in batches, and may be split across threads.
+    let batched = vector::applies(plan);
 
-    for_each_row(txn, plan, params, &mut |row| {
+    let mut visit = |row: &mut [Value]| {
         if let Some(filter) = &plan.filter
             && !filter.matches(row, params)?
         {
@@ -415,11 +418,18 @@ pub fn run_select(txn: &Txn, plan: &SelectPlan, params: &[Value]) -> Result<Rows
             acc.add(aggregate, row, params)?;
         }
         Ok(true)
-    })?;
+    };
+    if !batched {
+        for_each_row(txn, plan, params, &mut visit)?;
+    }
 
     if plan.grouping.is_some() {
-        // Without GROUP BY there is exactly one group, even with no input rows.
-        let finished = single.map(|accumulators| (Vec::new(), accumulators)).into_iter().chain(groups.into_values());
+        let finished: Vec<(Vec<Value>, Vec<Accumulator>)> = if batched {
+            vector::aggregate(txn, plan, params)?
+        } else {
+            // Without GROUP BY there is exactly one group, even with no input rows.
+            single.map(|accumulators| (Vec::new(), accumulators)).into_iter().chain(groups.into_values()).collect()
+        };
         for (mut row, accumulators) in finished {
             row.extend(accumulators.into_iter().map(Accumulator::finish));
             if let Some(having) = &plan.having
@@ -455,6 +465,67 @@ pub fn run_select(txn: &Txn, plan: &SelectPlan, params: &[Value]) -> Result<Rows
     }
     let rows = out.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).map(|(row, _)| row).collect();
     Ok(Rows { columns: plan.columns.clone(), rows })
+}
+
+/// Runs a SELECT, handing each result row to `f`, which returns `false` to
+/// stop. Rows that can be produced as they are read (no grouping, DISTINCT
+/// or sort) go through one reused buffer, so nothing is allocated per row;
+/// the rest are collected first.
+pub fn stream(
+    txn: &Txn,
+    statement: &Statement,
+    params: &[Value],
+    plans: &PlanCache,
+    f: &mut dyn FnMut(&[Value]) -> Result<bool>,
+) -> Result<()> {
+    let Statement::Select(select) = statement else {
+        return Err(sql_error("only a SELECT can be streamed"));
+    };
+    let binder = Binder { params };
+    let plan = plans.plan(txn, Planned::select, Planned::Select, || plan_select(txn, select, &binder))?;
+    let streaming = plan.grouping.is_none() && !plan.distinct && (plan.order_by.is_empty() || plan.presorted);
+    if !streaming {
+        for row in &run_select(txn, &plan, params)?.rows {
+            if !f(row)? {
+                break;
+            }
+        }
+        return Ok(());
+    }
+    let limit = count(&plan.limit, params, "LIMIT")?;
+    let mut skip = count(&plan.offset, params, "OFFSET")?.unwrap_or(0);
+    if limit == Some(0) {
+        return Ok(());
+    }
+    let (mut out, mut emitted) = (vec![Value::Null; plan.projection.len()], 0);
+    // `SELECT *`, or the first columns in order: the row itself is the result.
+    let prefix = plan.projection.iter().enumerate().all(|(i, e)| matches!(e, BExpr::Column(c) if *c == i));
+    for_each_row(txn, &plan, params, &mut |row| {
+        if let Some(filter) = &plan.filter
+            && !filter.matches(row, params)?
+        {
+            return Ok(true);
+        }
+        if skip > 0 {
+            skip -= 1;
+            return Ok(true);
+        }
+        emitted += 1;
+        if prefix {
+            return Ok(f(&row[..out.len()])? && limit.is_none_or(|limit| emitted < limit));
+        }
+        for (slot, e) in out.iter_mut().zip(&plan.projection) {
+            match (e, &row) {
+                // Copied into the string already in the slot, not a new one.
+                (BExpr::Column(c), row) => match (&mut *slot, &row[*c]) {
+                    (Value::Text(to), Value::Text(from)) => to.clone_from(from),
+                    (slot, value) => *slot = value.clone(),
+                },
+                (e, row) => *slot = e.eval(row, params)?,
+            }
+        }
+        Ok(f(&out)? && limit.is_none_or(|limit| emitted < limit))
+    })
 }
 
 /// Computes an output row and its ORDER BY values. Columns marked movable
@@ -743,13 +814,16 @@ fn next_row_id(txn: &mut Txn, table: &TableSchema) -> Result<i64> {
     Ok(id)
 }
 
-/// Keeps future row ids clear of one chosen explicitly.
-fn observe_row_id(txn: &mut Txn, table: &TableSchema, id: i64) -> Result<()> {
+/// Keeps future row ids clear of one chosen explicitly. Returns whether the
+/// id is new: at or past the counter, which every row id ever written has
+/// moved beyond, so no row can have it.
+fn observe_row_id(txn: &mut Txn, table: &TableSchema, id: i64) -> Result<bool> {
     let next = txn.sequence(&table.sequence_key(), stored_counter)?;
-    if id >= *next {
+    let fresh = id >= *next;
+    if fresh {
         *next = id.saturating_add(1);
     }
-    Ok(())
+    Ok(fresh)
 }
 
 /// Validates `row` and writes it, with its index entries. `key` is the row's
@@ -774,10 +848,16 @@ fn write_row(
             ))
         })?;
     }
+    // A row id the counter hasn't reached yet can't be taken, so the row
+    // needs no uniqueness check: as SQLite knows for its rowid tables.
+    let mut fresh = false;
     if let Some(c) = table.auto_increment_column() {
         match row[c] {
-            Value::Null if inserting => row[c] = Value::Integer(next_row_id(txn, table)?),
-            Value::Integer(id) => observe_row_id(txn, table, id)?,
+            Value::Null if inserting => {
+                row[c] = Value::Integer(next_row_id(txn, table)?);
+                fresh = true;
+            }
+            Value::Integer(id) => fresh = observe_row_id(txn, table, id)?,
             _ => {}
         }
     }
@@ -789,12 +869,13 @@ fn write_row(
     let key = match key {
         Some(key) => key,
         None if table.primary_key.is_empty() => {
+            fresh = true;
             let id = next_row_id(txn, table)?;
             table.row_key(&row, Some(id))
         }
         None => table.row_key(&row, None),
     };
-    if txn.get(&key)?.is_some() {
+    if !fresh && txn.get(&key)?.is_some() {
         return Err(unique_violation(table, &table.primary_key));
     }
     for index in indexes {
@@ -857,7 +938,7 @@ fn insert_rows(txn: &mut Txn, insert: &Insert, binder: &Binder, plans: &PlanCach
             rows.len()
         }
         InsertSource::Select(select) => {
-            let rows = run_select(txn, &plan_select(txn, select, binder)?, binder.params)?.rows;
+            let rows = run_select(txn, &Arc::new(plan_select(txn, select, binder)?), binder.params)?.rows;
             for row in &rows {
                 insert_one(txn, &mut row.iter().cloned().map(Ok), row.len())?;
             }

@@ -226,7 +226,7 @@ pub(crate) fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
-fn cmp_f64(a: f64, b: f64) -> Ordering {
+pub(crate) fn cmp_f64(a: f64, b: f64) -> Ordering {
     // NaN sorts above every other number.
     a.partial_cmp(&b).unwrap_or_else(|| a.is_nan().cmp(&b.is_nan()))
 }

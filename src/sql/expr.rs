@@ -620,14 +620,57 @@ impl Accumulator {
     }
 
     pub fn add(&mut self, aggregate: &Aggregate, row: &[Value], params: &[Value]) -> Result<()> {
-        let Some(arg) = &aggregate.arg else {
-            if let State::Count(n) = &mut self.state {
+        match &aggregate.arg {
+            None => {
+                self.add_row();
+                Ok(())
+            }
+            // Borrowed: most values are only counted or summed, never kept.
+            Some(arg) => self.add_value(operand(arg, row, params)?),
+        }
+    }
+
+    /// Counts a row, for `count(*)`.
+    pub fn add_row(&mut self) {
+        if let State::Count(n) = &mut self.state {
+            *n += 1;
+        }
+    }
+
+    /// Adds a non-NULL integer argument: `add_value` without the boxing.
+    pub fn add_integer(&mut self, x: i64) -> Result<()> {
+        match &mut self.state {
+            _ if self.seen.is_some() => return self.add_value(Cow::Owned(Value::Integer(x))),
+            State::Count(n) => *n += 1,
+            State::Sum(Value::Integer(sum)) => {
+                *sum = sum.checked_add(x).ok_or_else(|| sql_error("integer overflow"))?
+            }
+            State::Avg(sum, n) => {
+                *sum += x as f64;
                 *n += 1;
             }
-            return Ok(());
-        };
-        // Borrowed: most values are only counted or summed, never kept.
-        let value = operand(arg, row, params)?;
+            _ => return self.add_value(Cow::Owned(Value::Integer(x))),
+        }
+        Ok(())
+    }
+
+    /// Adds a non-NULL real argument: `add_value` without the boxing.
+    pub fn add_real(&mut self, x: f64) -> Result<()> {
+        match &mut self.state {
+            _ if self.seen.is_some() => return self.add_value(Cow::Owned(Value::Real(x))),
+            State::Count(n) => *n += 1,
+            State::Sum(Value::Real(sum)) => *sum += x,
+            State::Avg(sum, n) => {
+                *sum += x;
+                *n += 1;
+            }
+            _ => return self.add_value(Cow::Owned(Value::Real(x))),
+        }
+        Ok(())
+    }
+
+    /// Adds the aggregate's argument as evaluated for one row.
+    pub fn add_value(&mut self, value: Cow<Value>) -> Result<()> {
         if value.is_null() {
             return Ok(()); // aggregates skip NULLs
         }
@@ -663,6 +706,30 @@ impl Accumulator {
                     *max = value.into_owned();
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Folds in another accumulator for the same aggregate, which saw other
+    /// rows. Not for DISTINCT aggregates: their values seen can't be merged.
+    pub fn merge(&mut self, other: Accumulator) -> Result<()> {
+        debug_assert!(self.seen.is_none() && other.seen.is_none());
+        match (&mut self.state, other.state) {
+            (State::Count(a), State::Count(b)) => *a += b,
+            (State::Sum(a), State::Sum(b)) if !b.is_null() => {
+                *a = if a.is_null() { b } else { arithmetic(BinaryOp::Add, a, &b)? };
+            }
+            (State::Avg(sum, n), State::Avg(other_sum, other_n)) => {
+                *sum += other_sum;
+                *n += other_n;
+            }
+            (State::Min(a), State::Min(b)) if !b.is_null() && (a.is_null() || b.total_cmp(a) == Ordering::Less) => {
+                *a = b;
+            }
+            (State::Max(a), State::Max(b)) if !b.is_null() && (a.is_null() || b.total_cmp(a) == Ordering::Greater) => {
+                *a = b;
+            }
+            _ => {}
         }
         Ok(())
     }

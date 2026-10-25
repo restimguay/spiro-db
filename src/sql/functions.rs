@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::ast::BinaryOp;
+use super::decimal::Decimal;
 use super::expr::arithmetic;
 use super::value::{Value, sql_error};
 use crate::error::Result;
@@ -232,9 +233,18 @@ impl Scalar {
                 }
                 Value::Text(out)
             }
-            Hex => Value::Text(text(0).bytes().map(|b| format!("{b:02X}")).collect()),
+            Hex => {
+                let bytes = match &args[0] {
+                    Value::Blob(b) => b.clone(),
+                    v => v.to_string().into_bytes(),
+                };
+                Value::Text(bytes.iter().map(|b| format!("{b:02X}")).collect())
+            }
             ToHex => Value::Text(format!("{:x}", int(0)?)),
-            OctetLength => Value::Integer(text(0).len() as i64),
+            OctetLength => match &args[0] {
+                Value::Blob(b) => Value::Integer(b.len() as i64),
+                v => Value::Integer(v.to_string().len() as i64),
+            },
             SplitPart => {
                 let (s, delimiter, n) = (text(0), text(1), int(2)?);
                 let parts: Vec<&str> =
@@ -266,6 +276,7 @@ impl Scalar {
             }
             Sign => match &args[0] {
                 Value::Integer(n) => Value::Integer(n.signum()),
+                Value::Decimal(d) => Value::Integer(d.signum().into()),
                 _ => {
                     let x = real(0)?;
                     Value::Real(if x == 0.0 { 0.0 } else { x.signum() })
@@ -273,12 +284,26 @@ impl Scalar {
             },
             Ceil | Floor => match &args[0] {
                 Value::Integer(n) => Value::Integer(*n),
+                Value::Decimal(d) => {
+                    let whole = d.trunc(0);
+                    let up = self == Ceil && d.signum() > 0 && whole != *d;
+                    let down = self == Floor && d.signum() < 0 && whole != *d;
+                    let step = Decimal::from_i64(if up {
+                        1
+                    } else if down {
+                        -1
+                    } else {
+                        0
+                    });
+                    Value::Decimal(whole.checked_add(step)?)
+                }
                 _ => Value::Real(if self == Ceil { real(0)?.ceil() } else { real(0)?.floor() }),
             },
             Trunc => {
                 let digits = if args.len() > 1 { int(1)? } else { 0 };
                 match &args[0] {
                     Value::Integer(n) if digits >= 0 => Value::Integer(*n),
+                    Value::Decimal(d) if digits >= 0 => Value::Decimal(d.trunc(digits.min(38) as i32)),
                     _ => {
                         let scale = 10f64.powi(digits.clamp(-300, 300) as i32);
                         Value::Real((real(0)? * scale).trunc() / scale)

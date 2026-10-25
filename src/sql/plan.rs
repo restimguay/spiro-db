@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::ast::{BinaryOp, Expr};
 use super::ast::{
-    Cte, Frame, FrameBound, JoinKind, OrderBy, Select, SelectItem, SetOp, Sort, TableRef, WindowSpec, With,
+    Cte, Frame, FrameBound, From, JoinKind, OrderBy, Select, SelectItem, SetOp, Sort, TableRef, WindowSpec, With,
     is_aggregate,
 };
 use super::catalog::{self, Column, IndexSchema, TableSchema, ViewSchema};
 use super::expr::{Aggregate, BExpr, Binder, Grouping, Scope, ScopeColumn};
+use super::system;
 use super::txn::Txn;
 use super::value::{DataType, Value, sql_error};
 use crate::error::Result;
@@ -226,6 +227,8 @@ pub enum Derived {
     /// A recursive query's reference to itself in its recursive part: the
     /// rows of the previous round, numbered as the `Recursive`.
     Work(usize),
+    /// Rows fixed when the query was planned: a catalog table's.
+    Rows(Arc<Vec<Vec<Value>>>),
 }
 
 /// `anchor UNION [ALL] step`, where `step` reads the rows the previous
@@ -261,6 +264,7 @@ impl TablePlan {
             Some(Derived::Query(_)) => return format!("SCAN SUBQUERY AS {}", self.binding),
             Some(Derived::Recursive(_)) => return format!("SCAN RECURSIVE QUERY AS {}", self.binding),
             Some(Derived::Work(_)) => return format!("SCAN PREVIOUS ROUND OF {}", self.binding),
+            Some(Derived::Rows(_)) => return format!("SCAN CATALOG TABLE {}", self.binding),
             None => {}
         }
         let mut text = self.access.describe(&self.schema, &self.binding);
@@ -522,7 +526,12 @@ impl SelectPlan {
             lines.push("  FILTER".into());
         }
         for join in &self.joins {
-            let kind = if join.kind == JoinKind::Left { "LEFT JOIN" } else { "JOIN" };
+            let kind = match join.kind {
+                JoinKind::Inner => "JOIN",
+                JoinKind::Left => "LEFT JOIN",
+                JoinKind::Right => "RIGHT JOIN",
+                JoinKind::Full => "FULL JOIN",
+            };
             lines.push(format!("{kind} {}", join.table.describe()));
         }
         if self.filter.is_some() {
@@ -575,7 +584,9 @@ fn table_plan(
             Some((columns, derived)) => Some((columns.to_vec(), derived.clone())),
             None if catalog::get_table(txn, &table.name)?.is_none() => match catalog::get_view(txn, &table.name)? {
                 Some(view) => Some(plan_view(txn, &view, binder)?),
-                None => None,
+                None => {
+                    system::table(txn, &table.name)?.map(|(columns, rows)| (columns, Derived::Rows(Arc::new(rows))))
+                }
             },
             None => None,
         },
@@ -657,6 +668,35 @@ fn plan_compound(txn: &Txn, select: &Select, binder: &Binder) -> Result<SelectPl
         compound: Some(Box::new(Compound { first: Arc::new(first), parts })),
         windows: Vec::new(),
     })
+}
+
+/// Plans `SELECT * FROM from`, for UPDATE ... FROM and DELETE ... USING,
+/// with the scope its rows have.
+pub fn plan_from(txn: &Txn, from: &From, binder: &Binder) -> Result<(Arc<SelectPlan>, Scope)> {
+    if from.joins.iter().any(|j| j.natural || !j.using.is_empty()) {
+        return Err(sql_error("USING and NATURAL joins aren't supported in UPDATE ... FROM or DELETE ... USING"));
+    }
+    let select = Select {
+        distinct: false,
+        items: vec![SelectItem::Wildcard],
+        from: Some(from.clone()),
+        filter: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        compound: Vec::new(),
+        with: None,
+        windows: Vec::new(),
+    };
+    let plan = plan_select(txn, &select, binder)?;
+    let mut scope = Scope::default();
+    for table in std::iter::once(&from.base).chain(from.joins.iter().map(|j| &j.table)) {
+        let (plan, _) = table_plan(txn, table, binder, scope.columns.len())?;
+        scope.add_table(&plan.schema, &plan.binding);
+    }
+    Ok((Arc::new(plan), scope))
 }
 
 /// The most views a query may reach through other views.
@@ -773,11 +813,46 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
             if scope.has_table(binding) {
                 return Err(sql_error(format!("table name {binding} is used more than once; give it an alias")));
             }
-            let (plan, indexes) = table_plan(txn, &join.table, binder, scope.columns.len())?;
+            let start = scope.columns.len();
+            let (plan, indexes) = table_plan(txn, &join.table, binder, start)?;
+            // NATURAL joins on every column name the two sides share.
+            let using: Vec<String> = if join.natural {
+                let left = &scope.columns;
+                let shared = |name: &String| left.iter().any(|c| !c.merged && c.name == *name);
+                plan.schema.columns.iter().map(|c| c.name.clone()).filter(shared).collect()
+            } else {
+                join.using.clone()
+            };
             scope.add_table(&plan.schema, &plan.binding);
-            joined.push((join, plan, indexes));
+            let mut on = join.on.clone();
+            for name in &using {
+                // USING (c) means left.c = right.c, with c then naming one column.
+                let mut left = scope.columns[..start].iter().enumerate().filter(|(_, c)| !c.merged && c.name == *name);
+                let (Some((l, left_column)), None) = (left.next(), left.next()) else {
+                    return Err(sql_error(format!("USING column {name} must be in exactly one table to the left")));
+                };
+                let r = plan
+                    .schema
+                    .column_index(name)
+                    .ok_or_else(|| sql_error(format!("no such column: {binding}.{name}")))?;
+                let column =
+                    |table: &str| Box::new(Expr::Column { table: Some(table.to_string()), name: name.clone() });
+                let condition =
+                    Expr::Binary { op: BinaryOp::Eq, left: column(&left_column.table), right: column(binding) };
+                on = Some(match on {
+                    Some(on) => Expr::Binary { op: BinaryOp::And, left: Box::new(on), right: Box::new(condition) },
+                    None => condition,
+                });
+                // A RIGHT join keeps every right row, so the name means the right column there.
+                let hidden = if join.kind == JoinKind::Right { l } else { start + r };
+                scope.columns[hidden].merged = true;
+            }
+            joined.push((join.kind, on, plan, indexes));
         }
     }
+    // Rows a RIGHT or FULL join adds have NULL for the tables before it, so
+    // WHERE must see them after the joins, not as the base table is read.
+    let outer_right = joined.iter().any(|(kind, ..)| matches!(kind, JoinKind::Right | JoinKind::Full));
 
     // WHERE: conditions on the base table alone are checked (and used to
     // narrow the read) as it is scanned; the rest wait until after the joins.
@@ -785,7 +860,7 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
     let (mut base_conditions, mut rest) = (Vec::new(), Vec::new());
     if let Some(filter) = &select.filter {
         for condition in binder.bind(filter, &scope, "WHERE")?.into_conjuncts() {
-            if condition.max_column().is_none_or(|m| m < base_width) {
+            if !outer_right && condition.max_column().is_none_or(|m| m < base_width) {
                 base_conditions.push(condition);
             } else {
                 rest.push(condition);
@@ -802,12 +877,15 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
     );
 
     let mut joins = Vec::new();
-    for (join, mut plan, indexes) in joined {
+    for (kind, on, mut plan, indexes) in joined {
         let prefix = Scope { columns: scope.columns[..plan.offset + plan.schema.columns.len()].to_vec() };
-        let on = join.on.as_ref().map(|on| binder.bind(on, &prefix, "ON")).transpose()?;
+        let on = on.as_ref().map(|on| binder.bind(on, &prefix, "ON")).transpose()?;
         let conditions = on.clone().map(BExpr::into_conjuncts).unwrap_or_default();
-        plan.access = choose_access(&plan.schema, &indexes, plan.offset, &conditions);
-        joins.push(JoinPlan { kind: join.kind, table: plan, on });
+        // RIGHT and FULL joins must see every row of their table, matched or not.
+        if !matches!(kind, JoinKind::Right | JoinKind::Full) {
+            plan.access = choose_access(&plan.schema, &indexes, plan.offset, &conditions);
+        }
+        joins.push(JoinPlan { kind, table: plan, on });
     }
 
     // Expand wildcards into column references, so they bind like any column.
@@ -825,7 +903,7 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
                 if select.from.is_none() {
                     return Err(sql_error("SELECT * needs a FROM clause"));
                 }
-                for c in scope.columns.iter().filter(|c| wanted.is_none_or(|t| c.table == *t)) {
+                for c in scope.columns.iter().filter(|c| wanted.map_or(!c.merged, |t| c.table == *t)) {
                     items.push((Expr::Column { table: Some(c.table.clone()), name: c.name.clone() }, None));
                 }
             }
@@ -916,9 +994,11 @@ pub fn plan_select(txn: &Txn, select: &Select, binder: &Binder) -> Result<Select
         having = None;
         // Window values follow the row's columns.
         let mut output_scope = scope.clone();
-        output_scope
-            .columns
-            .extend((0..window_exprs.len()).map(|k| ScopeColumn { table: WINDOW_TABLE.into(), name: k.to_string() }));
+        output_scope.columns.extend((0..window_exprs.len()).map(|k| ScopeColumn {
+            table: WINDOW_TABLE.into(),
+            name: k.to_string(),
+            merged: false,
+        }));
         projection =
             items.iter().map(|(e, _)| binder.bind(e, &output_scope, "the select list")).collect::<Result<Vec<_>>>()?;
         order_by = ordering

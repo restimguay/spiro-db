@@ -279,6 +279,8 @@ impl ColumnWriter {
             RawValue::Real(_) => REAL,
             RawValue::Boolean(_) => BOOLEAN,
             RawValue::Text(_) => TEXT,
+            // Kept in the row encoding.
+            RawValue::Blob(_) | RawValue::Decimal(_) => MIXED,
         }
     }
 
@@ -743,6 +745,8 @@ const MEM_BATCH: usize = 4096;
 /// the needed columns decoded), so the merge treats them like any file's.
 struct MemRows<'a> {
     mem: &'a Arc<MemTable>,
+    /// The snapshot read at, if any.
+    seq: Option<u64>,
     needed: &'a [bool],
     upper: &'a Bound<Vec<u8>>,
     /// Where the next batch starts.
@@ -767,7 +771,7 @@ impl MemRows<'_> {
             Bound::Unbounded => Bound::Unbounded,
         };
         let upper = self.upper;
-        self.mem.visit_range(from, |key, value| {
+        self.mem.visit_range(from, self.seq, |key, value| {
             if !before_end(key, upper) {
                 return false;
             }
@@ -1082,7 +1086,7 @@ pub fn scan(
                     Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
                     Bound::Unbounded => Bound::Unbounded,
                 };
-                mem.with_range(start, |entries| {
+                mem.with_range(start, view.seq(), |entries| {
                     // Live rows collected under the lock, handed over together.
                     let mut rows: Vec<&[u8]> = Vec::with_capacity(MEM_BATCH);
                     for (key, value) in entries {
@@ -1147,6 +1151,7 @@ pub fn scan(
     for mem in view.memtables() {
         sources.push(Source::Mem(MemRows {
             mem,
+            seq: view.seq(),
             needed,
             upper,
             from: lower.clone(),

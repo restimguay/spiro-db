@@ -313,6 +313,7 @@ const COMMANDS: &[&str] = &[
     "CREATE TABLE",
     "ALTER TABLE",
     "DROP TABLE",
+    "TRUNCATE TABLE",
     "CREATE INDEX",
     "DROP INDEX",
     "CREATE VIEW",

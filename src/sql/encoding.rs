@@ -8,6 +8,7 @@
 use crate::coding::{Reader, fast_varint, put_bytes, put_varint};
 use crate::error::{Error, Result, corruption};
 
+use super::decimal::Decimal;
 use super::value::Value;
 
 const KEY_NULL: u8 = 0x00;
@@ -15,7 +16,9 @@ const KEY_FALSE: u8 = 0x10;
 const KEY_TRUE: u8 = 0x11;
 pub(crate) const KEY_INTEGER: u8 = 0x20;
 const KEY_REAL: u8 = 0x30;
+const KEY_DECIMAL: u8 = 0x38;
 const KEY_TEXT: u8 = 0x40;
+const KEY_BLOB: u8 = 0x50;
 
 /// Appends `value` in the order-preserving key encoding. NULL sorts first.
 pub fn encode_key(buf: &mut Vec<u8>, value: &Value) {
@@ -36,18 +39,30 @@ pub fn encode_key(buf: &mut Vec<u8>, value: &Value) {
             buf.extend_from_slice(&bits.to_be_bytes());
         }
         Value::Text(s) => {
-            // Escape 0x00 as 00 FF and terminate with 00 00, so a string sorts
-            // before any longer string it is a prefix of.
             buf.push(KEY_TEXT);
-            for &b in s.as_bytes() {
-                buf.push(b);
-                if b == 0 {
-                    buf.push(0xff);
-                }
-            }
-            buf.extend_from_slice(&[0, 0]);
+            escaped(buf, s.as_bytes());
+        }
+        Value::Blob(b) => {
+            buf.push(KEY_BLOB);
+            escaped(buf, b);
+        }
+        Value::Decimal(d) => {
+            buf.push(KEY_DECIMAL);
+            d.encode_key(buf);
         }
     }
+}
+
+/// Escapes 0x00 as 00 FF and terminates with 00 00, so bytes sort before
+/// any longer run of bytes they are a prefix of.
+fn escaped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    for &b in bytes {
+        buf.push(b);
+        if b == 0 {
+            buf.push(0xff);
+        }
+    }
+    buf.extend_from_slice(&[0, 0]);
 }
 
 pub fn encode_keys(buf: &mut Vec<u8>, values: &[Value]) {
@@ -72,7 +87,7 @@ pub fn decode_key(input: &mut &[u8]) -> Result<Value> {
             let bits = fixed8(input)?;
             Value::Real(f64::from_bits(if bits >> 63 == 1 { bits ^ (1 << 63) } else { !bits }))
         }
-        KEY_TEXT => {
+        KEY_TEXT | KEY_BLOB => {
             let mut bytes = Vec::new();
             loop {
                 let data: &[u8] = input;
@@ -92,8 +107,12 @@ pub fn decode_key(input: &mut &[u8]) -> Result<Value> {
                     _ => return Err(corruption("bad text in key")),
                 }
             }
+            if tag == KEY_BLOB {
+                return Ok(Value::Blob(bytes));
+            }
             Value::Text(String::from_utf8(bytes).map_err(|_| corruption("key text is not UTF-8"))?)
         }
+        KEY_DECIMAL => Value::Decimal(Decimal::decode_key(input).ok_or_else(|| corruption("bad decimal in key"))?),
         tag => return Err(corruption(format!("unknown key tag {tag:#x}"))),
     })
 }
@@ -105,7 +124,12 @@ pub fn skip_key(input: &mut &[u8]) -> Result<()> {
     *input = match tag {
         KEY_NULL | KEY_FALSE | KEY_TRUE => rest,
         KEY_INTEGER | KEY_REAL => rest.get(8..).ok_or_else(truncated)?,
-        KEY_TEXT => {
+        KEY_DECIMAL => {
+            let mut rest = rest;
+            Decimal::decode_key(&mut rest).ok_or_else(truncated)?;
+            rest
+        }
+        KEY_TEXT | KEY_BLOB => {
             // Find the 00 00 terminator, stepping over escaped 00 FF pairs.
             let mut pos = 0;
             loop {
@@ -128,6 +152,8 @@ const ROW_TRUE: u8 = 2;
 const ROW_INTEGER: u8 = 3;
 const ROW_REAL: u8 = 4;
 const ROW_TEXT: u8 = 5;
+const ROW_DECIMAL: u8 = 6;
+const ROW_BLOB: u8 = 7;
 
 pub fn encode_value(buf: &mut Vec<u8>, value: &Value) {
     match value {
@@ -145,6 +171,14 @@ pub fn encode_value(buf: &mut Vec<u8>, value: &Value) {
             buf.push(ROW_TEXT);
             put_bytes(buf, s.as_bytes());
         }
+        Value::Blob(b) => {
+            buf.push(ROW_BLOB);
+            put_bytes(buf, b);
+        }
+        Value::Decimal(d) => {
+            buf.push(ROW_DECIMAL);
+            buf.extend_from_slice(&d.to_bytes());
+        }
     }
 }
 
@@ -159,6 +193,8 @@ pub fn decode_value(r: &mut Reader) -> Result<Value> {
         }
         ROW_REAL => Value::Real(f64::from_le_bytes(r.bytes(8)?.try_into().unwrap())),
         ROW_TEXT => Value::Text(utf8(r.len_prefixed()?)?.to_owned()),
+        ROW_BLOB => Value::Blob(r.len_prefixed()?.to_vec()),
+        ROW_DECIMAL => Value::Decimal(Decimal::from_bytes(r.bytes(17)?.try_into().unwrap())),
         tag => return Err(corruption(format!("unknown value tag {tag}"))),
     })
 }
@@ -241,6 +277,23 @@ pub fn decode_row_into(data: &[u8], width: usize, needed: Option<&[bool]>, out: 
                     *slot = Value::Real(f64::from_le_bytes(bytes.try_into().unwrap()));
                 }
             }
+            ROW_BLOB => {
+                let Some(len) = fast_varint(data, &mut pos) else { return Err(malformed()) };
+                let Some(bytes) = usize::try_from(len).ok().and_then(|len| data.get(pos..pos.checked_add(len)?)) else {
+                    return Err(malformed());
+                };
+                pos += bytes.len();
+                if wanted {
+                    *slot = Value::Blob(bytes.to_vec());
+                }
+            }
+            ROW_DECIMAL => {
+                let Some(bytes) = data.get(pos..pos + 17) else { return Err(malformed()) };
+                pos += 17;
+                if wanted {
+                    *slot = Value::Decimal(Decimal::from_bytes(bytes.try_into().unwrap()));
+                }
+            }
             tag => return Err(corruption(format!("unknown value tag {tag}"))),
         }
     }
@@ -266,6 +319,8 @@ pub enum RawValue<'a> {
     Real(f64),
     /// Not yet checked to be UTF-8.
     Text(&'a [u8]),
+    Blob(&'a [u8]),
+    Decimal(Decimal),
 }
 
 impl RawValue<'_> {
@@ -276,6 +331,8 @@ impl RawValue<'_> {
             RawValue::Integer(i) => Value::Integer(i),
             RawValue::Real(r) => Value::Real(r),
             RawValue::Text(t) => Value::Text(utf8(t)?.to_owned()),
+            RawValue::Blob(b) => Value::Blob(b.to_vec()),
+            RawValue::Decimal(d) => Value::Decimal(d),
         })
     }
 }
@@ -335,6 +392,19 @@ fn visit_values<'a>(
                 let Some(bytes) = data.get(pos..pos + 8) else { return Err(malformed()) };
                 pos += 8;
                 RawValue::Real(f64::from_le_bytes(bytes.try_into().unwrap()))
+            }
+            ROW_BLOB => {
+                let Some(len) = fast_varint(data, &mut pos) else { return Err(malformed()) };
+                let Some(bytes) = usize::try_from(len).ok().and_then(|len| data.get(pos..pos.checked_add(len)?)) else {
+                    return Err(malformed());
+                };
+                pos += bytes.len();
+                RawValue::Blob(bytes)
+            }
+            ROW_DECIMAL => {
+                let Some(bytes) = data.get(pos..pos + 17) else { return Err(malformed()) };
+                pos += 17;
+                RawValue::Decimal(Decimal::from_bytes(bytes.try_into().unwrap()))
             }
             tag => return Err(corruption(format!("unknown value tag {tag}"))),
         };

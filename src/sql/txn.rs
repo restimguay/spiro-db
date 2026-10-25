@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::batch::WriteBatch;
 use crate::coding::{Key, KeyRef, put_varint};
-use crate::db::{Db, ReadView};
+use crate::db::{Db, ReadView, Snapshot};
 use crate::error::{Error, Result};
 
 use super::catalog::SchemaCache;
@@ -93,6 +93,14 @@ pub struct Txn {
     scan_threads: usize,
     /// Open savepoints, oldest first.
     savepoints: Vec<Savepoint>,
+    /// For a transaction that only reads: the point in time it reads at, so
+    /// every read sees the same committed state, never part of a commit.
+    /// A writer holds the write lock, so the newest state is its own.
+    snapshot: Option<Snapshot>,
+    /// The schema cache's version when the snapshot was taken: once a
+    /// schema change commits, cached definitions are newer than the
+    /// snapshot's, and are read from it instead.
+    snapshot_schemas: u64,
 }
 
 /// The transaction's state when `SAVEPOINT name` ran, to go back to.
@@ -106,8 +114,13 @@ struct Savepoint {
 }
 
 impl Txn {
-    /// A transaction that may only write if it holds the write lock.
+    /// A transaction that may only write if it holds the write lock. One
+    /// without it reads a snapshot taken now.
     pub fn new(kv: Arc<Db>, schemas: Arc<SchemaCache>, repl: Arc<Replication>, guard: Option<WriteGuard>) -> Self {
+        // The version first: a schema change committed after it shows as a
+        // newer version, whether or not the snapshot includes it.
+        let snapshot_schemas = schemas.version();
+        let snapshot = guard.is_none().then(|| kv.snapshot());
         Txn {
             kv,
             writes: BTreeMap::new(),
@@ -121,7 +134,14 @@ impl Txn {
             schema_changed: false,
             scan_threads: 0,
             savepoints: Vec::new(),
+            snapshot,
+            snapshot_schemas,
         }
+    }
+
+    /// Whether this transaction only reads: it doesn't hold the write lock.
+    pub fn is_read_only(&self) -> bool {
+        self.guard.is_none()
     }
 
     /// Remembers the transaction's state as savepoint `name`, along with
@@ -205,7 +225,8 @@ impl Txn {
 
     /// The shared schema cache, unless this transaction has changed the schema.
     pub fn schema_cache(&self) -> Option<&SchemaCache> {
-        (!self.schema_changed).then_some(&*self.schemas)
+        let current = self.snapshot.is_none() || self.schemas.version() == self.snapshot_schemas;
+        (!self.schema_changed && current).then_some(&*self.schemas)
     }
 
     /// Identifies the schema this transaction sees, for caching query plans:
@@ -222,7 +243,10 @@ impl Txn {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.writes.get(KeyRef::new(key)) {
             Some(buffered) => Ok(buffered.value.clone()),
-            None => self.kv.get(key),
+            None => match &self.snapshot {
+                Some(snapshot) => snapshot.view().get(key),
+                None => self.kv.get(key),
+            },
         }
     }
 
@@ -285,7 +309,15 @@ impl Txn {
         if is_empty(lower, upper) || self.writes.range::<[u8], _>((borrowed(lower), borrowed(upper))).next().is_some() {
             return None;
         }
-        Some(self.kv.read_view())
+        Some(self.read_view())
+    }
+
+    /// What this transaction reads committed data from.
+    fn read_view(&self) -> ReadView {
+        match &self.snapshot {
+            Some(snapshot) => snapshot.view().clone(),
+            None => self.kv.read_view(),
+        }
     }
 
     pub fn scan(&self, lower: Bound<Vec<u8>>, upper: Bound<Vec<u8>>, f: Visitor) -> Result<()> {
@@ -297,7 +329,10 @@ impl Txn {
             Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
             Bound::Unbounded => Bound::Unbounded,
         };
-        let mut store = self.kv.raw_range(start, upper.clone());
+        let mut store = match &self.snapshot {
+            Some(snapshot) => snapshot.view().raw_range(start, upper.clone()),
+            None => self.kv.raw_range(start, upper.clone()),
+        };
         let mut overlay = self.writes.range::<[u8], _>((borrowed(&lower), borrowed(&upper))).peekable();
         if overlay.peek().is_none() {
             // Nothing of ours to merge in: let the store run on its own.

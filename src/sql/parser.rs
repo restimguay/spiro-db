@@ -43,6 +43,7 @@ const RESERVED: &[&str] = &[
     "LEFT",
     "LIKE",
     "LIMIT",
+    "NATURAL",
     "NOT",
     "NULL",
     "OFFSET",
@@ -65,6 +66,35 @@ const RESERVED: &[&str] = &[
     "WINDOW",
     "WITH",
 ];
+
+fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
+    Expr::Binary { op, left: Box::new(left), right: Box::new(right) }
+}
+
+/// `(a, b) op (c, d)` in terms of the values: `=` and `<>` value by value,
+/// the orderings in dictionary order. `None` if the rows' lengths differ
+/// or `op` doesn't compare.
+fn compare_rows(op: BinaryOp, left: Vec<Expr>, right: Vec<Expr>) -> Option<Expr> {
+    if left.len() != right.len() || left.is_empty() {
+        return None;
+    }
+    let pairs = left.into_iter().zip(right);
+    match op {
+        BinaryOp::Eq => pairs.map(|(a, b)| binary(BinaryOp::Eq, a, b)).reduce(|x, y| binary(BinaryOp::And, x, y)),
+        BinaryOp::NotEq => pairs.map(|(a, b)| binary(BinaryOp::NotEq, a, b)).reduce(|x, y| binary(BinaryOp::Or, x, y)),
+        BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
+            let strict = if matches!(op, BinaryOp::Lt | BinaryOp::LtEq) { BinaryOp::Lt } else { BinaryOp::Gt };
+            let mut pairs: Vec<(Expr, Expr)> = pairs.collect();
+            let (a, b) = pairs.pop()?;
+            // a1 < b1 OR (a1 = b1 AND (a2 < b2 OR ...)), with op itself last.
+            Some(pairs.into_iter().rev().fold(binary(op, a, b), |rest, (a, b)| {
+                let tie = binary(BinaryOp::And, binary(BinaryOp::Eq, a.clone(), b.clone()), rest);
+                binary(BinaryOp::Or, binary(strict, a, b), tie)
+            }))
+        }
+        _ => None,
+    }
+}
 
 /// Whether `e` is an `INTERVAL '...'` literal.
 fn is_interval(e: &Expr) -> bool {
@@ -242,15 +272,23 @@ impl Parser<'_> {
             "CREATE" => self.create(),
             "ALTER" => self.alter(),
             "DROP" => self.drop(),
-            "BEGIN" => {
+            "BEGIN" | "START" => {
+                let start = self.is_kw("START");
                 self.advance();
-                self.eat_kw("TRANSACTION");
-                Ok(Statement::Begin)
-            }
-            "START" => {
-                self.advance();
-                self.expect_kw("TRANSACTION")?;
-                Ok(Statement::Begin)
+                if start {
+                    self.expect_kw("TRANSACTION")?;
+                } else if !self.eat_kw("TRANSACTION") {
+                    self.eat_kw("WORK");
+                }
+                let mut read_only = false;
+                if self.eat_kw("READ") {
+                    if self.eat_kw("ONLY") {
+                        read_only = true;
+                    } else {
+                        self.expect_kw("WRITE")?;
+                    }
+                }
+                Ok(Statement::Begin { read_only })
             }
             "COMMIT" | "END" => {
                 self.advance();
@@ -267,6 +305,24 @@ impl Parser<'_> {
                     return Ok(Statement::RollbackTo(self.ident()?));
                 }
                 Ok(Statement::Rollback)
+            }
+            "TRUNCATE" => {
+                self.advance();
+                self.eat_kw("TABLE");
+                let mut tables = vec![self.table_name()?];
+                while self.eat(&Token::Comma) {
+                    tables.push(self.table_name()?);
+                }
+                let restart = if self.eat_kw("RESTART") {
+                    self.expect_kw("IDENTITY")?;
+                    true
+                } else {
+                    if self.eat_kw("CONTINUE") {
+                        self.expect_kw("IDENTITY")?;
+                    }
+                    false
+                };
+                Ok(Statement::Truncate { tables, restart })
             }
             "SAVEPOINT" => {
                 self.advance();
@@ -465,6 +521,16 @@ impl Parser<'_> {
         }
     }
 
+    /// A table's name, which may be written `main.name` or `public.name`.
+    fn table_name(&mut self) -> Result<String> {
+        let name = self.ident()?;
+        if *self.peek() == Token::Dot && (name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("public")) {
+            self.advance();
+            return self.ident();
+        }
+        Ok(name)
+    }
+
     fn table_ref(&mut self) -> Result<TableRef> {
         if self.eat(&Token::LParen) {
             // `(SELECT ...) AS name`: a query read like a table.
@@ -475,8 +541,19 @@ impl Parser<'_> {
                 if alias.is_some() && *self.peek() == Token::LParen { self.ident_list()? } else { Vec::new() };
             return Ok(TableRef { name: "subquery".into(), alias, columns, subquery: Some(Box::new(query)) });
         }
-        let name = self.ident()?;
-        let alias = self.alias()?;
+        let mut name = self.ident()?;
+        let mut default_alias = None;
+        // schema.table: main and public are where every table is.
+        if self.eat(&Token::Dot) {
+            let table = self.ident()?;
+            if name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("public") {
+                name = table;
+            } else {
+                name = format!("{}.{table}", name.to_ascii_lowercase());
+                default_alias = Some(table);
+            }
+        }
+        let alias = self.alias()?.or(default_alias);
         Ok(TableRef { name, alias, columns: Vec::new(), subquery: None })
     }
 
@@ -484,33 +561,46 @@ impl Parser<'_> {
         let base = self.table_ref()?;
         let mut joins = Vec::new();
         loop {
+            let cross = |table| Join { kind: JoinKind::Inner, table, on: None, using: Vec::new(), natural: false };
             if self.eat(&Token::Comma) {
-                joins.push(Join { kind: JoinKind::Inner, table: self.table_ref()?, on: None });
+                joins.push(cross(self.table_ref()?));
                 continue;
             }
             if self.is_kw("CROSS") {
                 self.advance();
                 self.expect_kw("JOIN")?;
-                joins.push(Join { kind: JoinKind::Inner, table: self.table_ref()?, on: None });
+                joins.push(cross(self.table_ref()?));
                 continue;
             }
+            let natural = self.eat_kw("NATURAL");
             let kind = if self.eat_kw("JOIN") {
                 JoinKind::Inner
             } else if self.eat_kw("INNER") {
                 self.expect_kw("JOIN")?;
                 JoinKind::Inner
-            } else if self.eat_kw("LEFT") {
+            } else if let Some(kind) = [("LEFT", JoinKind::Left), ("RIGHT", JoinKind::Right), ("FULL", JoinKind::Full)]
+                .into_iter()
+                .find_map(|(kw, kind)| self.eat_kw(kw).then_some(kind))
+            {
                 self.eat_kw("OUTER");
                 self.expect_kw("JOIN")?;
-                JoinKind::Left
-            } else if self.is_kw("RIGHT") || self.is_kw("FULL") {
-                return Err(self.error("RIGHT and FULL joins are not supported yet"));
+                kind
+            } else if natural {
+                return Err(self.unexpected("JOIN"));
             } else {
                 break;
             };
             let table = self.table_ref()?;
-            self.expect_kw("ON")?;
-            joins.push(Join { kind, table, on: Some(self.expr()?) });
+            let mut join = Join { kind, table, on: None, using: Vec::new(), natural };
+            if !natural {
+                if self.eat_kw("USING") {
+                    join.using = self.ident_list()?;
+                } else {
+                    self.expect_kw("ON")?;
+                    join.on = Some(self.expr()?);
+                }
+            }
+            joins.push(join);
         }
         Ok(From { base, joins })
     }
@@ -523,7 +613,7 @@ impl Parser<'_> {
             self.expect_kw("IGNORE")?;
         }
         self.expect_kw("INTO")?;
-        let table = self.ident()?;
+        let table = self.table_name()?;
         let columns = if *self.peek() == Token::LParen { Some(self.ident_list()?) } else { None };
         let source = if self.eat_kw("VALUES") {
             let mut rows = Vec::new();
@@ -608,21 +698,23 @@ impl Parser<'_> {
 
     fn update(&mut self) -> Result<Statement> {
         self.expect_kw("UPDATE")?;
-        let table = self.ident()?;
+        let table = self.table_name()?;
         self.expect_kw("SET")?;
         let assignments = self.assignments()?;
+        let from = if self.eat_kw("FROM") { Some(self.from()?) } else { None };
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
         let returning = self.returning()?;
-        Ok(Statement::Update(Update { table, assignments, filter, returning }))
+        Ok(Statement::Update(Update { table, assignments, from, filter, returning }))
     }
 
     fn delete(&mut self) -> Result<Statement> {
         self.expect_kw("DELETE")?;
         self.expect_kw("FROM")?;
-        let table = self.ident()?;
+        let table = self.table_name()?;
+        let using = if self.eat_kw("USING") { Some(self.from()?) } else { None };
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
         let returning = self.returning()?;
-        Ok(Statement::Delete(Delete { table, filter, returning }))
+        Ok(Statement::Delete(Delete { table, using, filter, returning }))
     }
 
     fn if_not_exists(&mut self) -> Result<bool> {
@@ -673,14 +765,46 @@ impl Parser<'_> {
         let if_not_exists = self.if_not_exists()?;
         let name = self.ident()?;
         self.expect_kw("ON")?;
-        let table = self.ident()?;
+        let table = self.table_name()?;
         let columns = self.ident_list()?;
         Ok(Statement::CreateIndex(CreateIndex { name, table, columns, unique, if_not_exists }))
     }
 
     fn create_table(&mut self) -> Result<Statement> {
         let if_not_exists = self.if_not_exists()?;
-        let name = self.ident()?;
+        let name = self.table_name()?;
+        // CREATE TABLE name [(column, ...)] AS query
+        let names_only = *self.peek() == Token::LParen
+            && matches!(self.peek_nth(1), Token::Word(_) | Token::QuotedIdent(_))
+            && matches!(self.peek_nth(2), Token::Comma | Token::RParen);
+        if self.is_kw("AS") || names_only {
+            let names = if names_only { self.ident_list()? } else { Vec::new() };
+            self.expect_kw("AS")?;
+            let query = Some(Box::new(self.query()?));
+            let columns = names
+                .into_iter()
+                .map(|name| ColumnDef {
+                    name,
+                    ty: DataType::Text,
+                    primary_key: false,
+                    not_null: false,
+                    unique: false,
+                    default: None,
+                    checks: Vec::new(),
+                    references: None,
+                })
+                .collect();
+            return Ok(Statement::CreateTable(CreateTable {
+                name,
+                if_not_exists,
+                columns,
+                primary_key: Vec::new(),
+                unique: Vec::new(),
+                checks: Vec::new(),
+                foreign_keys: Vec::new(),
+                query,
+            }));
+        }
         self.expect(Token::LParen)?;
         let (mut columns, mut primary_key, mut unique) = (Vec::new(), Vec::new(), Vec::new());
         let (mut checks, mut foreign_keys) = (Vec::new(), Vec::new());
@@ -723,13 +847,14 @@ impl Parser<'_> {
             unique,
             checks,
             foreign_keys,
+            query: None,
         }))
     }
 
     fn alter(&mut self) -> Result<Statement> {
         self.expect_kw("ALTER")?;
         self.expect_kw("TABLE")?;
-        let table = self.ident()?;
+        let table = self.table_name()?;
         let action = if self.eat_kw("ADD") {
             self.eat_kw("COLUMN");
             AlterAction::AddColumn(self.column_def()?)
@@ -808,7 +933,7 @@ impl Parser<'_> {
     /// `REFERENCES table [(columns)] [ON DELETE action] [ON UPDATE action]`
     fn references(&mut self, name: Option<String>, columns: Vec<String>) -> Result<ForeignKeyDef> {
         self.expect_kw("REFERENCES")?;
-        let table = self.ident()?;
+        let table = self.table_name()?;
         let references = if *self.peek() == Token::LParen { self.ident_list()? } else { Vec::new() };
         let mut fk = ForeignKeyDef {
             name,
@@ -857,8 +982,10 @@ impl Parser<'_> {
         let ty = match word.to_ascii_uppercase().as_str() {
             "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" | "INT2" | "INT4" | "INT8" | "SERIAL"
             | "BIGSERIAL" => DataType::Integer,
-            "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "NUMERIC" | "DECIMAL" => DataType::Real,
-            "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "STRING" | "CLOB" => DataType::Text,
+            "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" => DataType::Real,
+            "NUMERIC" | "DECIMAL" | "DEC" => DataType::Decimal(None),
+            "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => DataType::Blob,
+            "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "STRING" | "CLOB" | "JSON" | "JSONB" => DataType::Text,
             "BOOLEAN" | "BOOL" => DataType::Boolean,
             "DATE" => DataType::Date,
             "TIME" => DataType::Time,
@@ -874,11 +1001,13 @@ impl Parser<'_> {
         }
         self.eat_kw("PRECISION"); // DOUBLE PRECISION
         self.eat_kw("VARYING"); // CHARACTER VARYING
-        // Length and precision modifiers, as in VARCHAR(255), are accepted and ignored.
+        // Length and precision modifiers, as in VARCHAR(255), are accepted and
+        // ignored, except DECIMAL(precision, scale)'s.
+        let mut modifiers = Vec::new();
         if self.eat(&Token::LParen) {
             loop {
                 match self.advance() {
-                    Token::Number(_) => {}
+                    Token::Number(n) => modifiers.push(n.parse::<u32>().unwrap_or(u32::MAX)),
                     _ => return Err(self.unexpected("a number")),
                 }
                 if !self.eat(&Token::Comma) {
@@ -887,6 +1016,13 @@ impl Parser<'_> {
             }
             self.expect(Token::RParen)?;
         }
+        if let (DataType::Decimal(_), [precision, scale @ ..]) = (ty, modifiers.as_slice()) {
+            let scale = scale.first().copied().unwrap_or(0);
+            if !(1..=38).contains(precision) || scale > *precision {
+                return Err(self.error("DECIMAL(precision, scale) needs 1 <= precision <= 38 and scale <= precision"));
+            }
+            return Ok(DataType::Decimal(Some((*precision as u8, scale as u8))));
+        }
         Ok(ty)
     }
 
@@ -894,7 +1030,7 @@ impl Parser<'_> {
         self.expect_kw("DROP")?;
         if self.eat_kw("TABLE") {
             let if_exists = self.if_exists()?;
-            Ok(Statement::DropTable { if_exists, name: self.ident()? })
+            Ok(Statement::DropTable { if_exists, name: self.table_name()? })
         } else if self.eat_kw("INDEX") {
             let if_exists = self.if_exists()?;
             Ok(Statement::DropIndex { if_exists, name: self.ident()? })
@@ -951,7 +1087,26 @@ impl Parser<'_> {
                     }
                     let list = self.expr_list()?;
                     self.expect(Token::RParen)?;
-                    Expr::InList { expr, list, negated }
+                    match *expr {
+                        // (a, b) IN ((1, 2), ...) is a row equality for each.
+                        Expr::Row(row) => {
+                            let mut any = None;
+                            for item in list {
+                                let Expr::Row(other) = item else {
+                                    return Err(self.error("IN with a row needs a list of rows"));
+                                };
+                                let equal = compare_rows(BinaryOp::Eq, row.clone(), other)
+                                    .ok_or_else(|| self.error("rows compared must have the same number of values"))?;
+                                any = Some(match any {
+                                    None => equal,
+                                    Some(e) => binary(BinaryOp::Or, e, equal),
+                                });
+                            }
+                            let any = any.ok_or_else(|| self.unexpected("a row"))?;
+                            if negated { Expr::Unary { op: UnaryOp::Not, expr: Box::new(any) } } else { any }
+                        }
+                        expr => Expr::InList { expr: Box::new(expr), list, negated },
+                    }
                 } else if self.eat_kw("BETWEEN") {
                     let low = Box::new(self.expr_bp(P_CMP + 1)?);
                     self.expect_kw("AND")?;
@@ -964,6 +1119,19 @@ impl Parser<'_> {
                     }
                     let pattern = Box::new(self.expr_bp(P_CMP + 1)?);
                     Expr::Like { expr, pattern, negated, case_insensitive }
+                };
+                continue;
+            }
+            // json -> key and json ->> key, binding as tightly as * and /.
+            if matches!(self.peek(), Token::Arrow | Token::LongArrow) && P_MUL >= min {
+                let name = if self.advance() == Token::Arrow { "json_get" } else { "json_get_value" };
+                let key = self.expr_bp(P_MUL + 1)?;
+                lhs = Expr::Function {
+                    name: name.into(),
+                    args: vec![lhs, key],
+                    distinct: false,
+                    star: false,
+                    filter: None,
                 };
                 continue;
             }
@@ -1003,6 +1171,9 @@ impl Parser<'_> {
                         filter: None,
                     }
                 }
+                (op, Expr::Row(left), Expr::Row(right)) => compare_rows(op, left, right).ok_or_else(|| {
+                    self.error("rows compared must have the same number of values, with =, <>, <, <=, > or >=")
+                })?,
                 (op, lhs, rhs) => Expr::Binary { op, left: Box::new(lhs), right: Box::new(rhs) },
             };
         }
@@ -1018,6 +1189,10 @@ impl Parser<'_> {
             Token::String(s) => {
                 self.advance();
                 Ok(Expr::Literal(Value::Text(s)))
+            }
+            Token::Blob(b) => {
+                self.advance();
+                Ok(Expr::Literal(Value::Blob(b)))
             }
             Token::Param(number) => {
                 self.advance();
@@ -1052,6 +1227,12 @@ impl Parser<'_> {
                     return Ok(Expr::Subquery(Box::new(select)));
                 }
                 let expr = self.expr()?;
+                if self.eat(&Token::Comma) {
+                    let mut items = vec![expr];
+                    items.extend(self.expr_list()?);
+                    self.expect(Token::RParen)?;
+                    return Ok(Expr::Row(items));
+                }
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
@@ -1086,7 +1267,9 @@ impl Parser<'_> {
                     Ok(Expr::Exists { select, negated: false })
                 }
                 // Typed literals: DATE '2024-03-15', TIMESTAMP '...', TIME '...'.
-                "DATE" | "TIME" | "TIMESTAMP" if matches!(self.peek_nth(1), Token::String(_)) => {
+                "DATE" | "TIME" | "TIMESTAMP" | "DECIMAL" | "NUMERIC"
+                    if matches!(self.peek_nth(1), Token::String(_)) =>
+                {
                     let ty = self.data_type()?;
                     let Token::String(s) = self.advance() else { unreachable!() };
                     Ok(Expr::Cast { expr: Box::new(Expr::Literal(Value::Text(s))), ty })

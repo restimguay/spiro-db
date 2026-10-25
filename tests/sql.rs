@@ -1726,3 +1726,405 @@ fn more_functions() {
     assert!(error(&db, "SELECT sqrt(-1)").contains("negative"));
     assert!(error(&db, "SELECT nosuch(1)").contains("no such function"));
 }
+
+#[test]
+fn outer_and_using_joins() {
+    let (_dir, db) = open("joins");
+    shop(&db);
+    run(&db, "INSERT INTO orders VALUES (7, 9, 50.0)");
+    // RIGHT JOIN keeps every order; FULL JOIN every user and every order.
+    assert_eq!(
+        query(&db, "SELECT u.name, o.id FROM users u RIGHT JOIN orders o ON o.user_id = u.id ORDER BY o.id"),
+        rows![["Ada", 1], ["Ada", 2], ["Grace", 3], ["Grace", 4], ["Grace", 5], [NULL, 6], [NULL, 7]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT u.name, o.id FROM users u FULL OUTER JOIN orders o ON o.user_id = u.id ORDER BY u.id NULLS LAST, o.id"
+        ),
+        rows![
+            ["Ada", 1],
+            ["Ada", 2],
+            ["Alan", NULL],
+            ["Grace", 3],
+            ["Grace", 4],
+            ["Grace", 5],
+            ["Edsger", NULL],
+            [NULL, 6],
+            [NULL, 7]
+        ]
+    );
+    // WHERE applies after the join, to the rows it adds too.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT o.id FROM users u RIGHT JOIN orders o ON o.user_id = u.id WHERE u.city = 'London' ORDER BY o.id"
+        ),
+        rows![[1], [2]]
+    );
+    assert_eq!(
+        query(&db, "SELECT o.id FROM users u RIGHT JOIN orders o ON o.user_id = u.id WHERE u.id IS NULL ORDER BY o.id"),
+        rows![[6], [7]]
+    );
+    // A RIGHT JOIN in the middle of a chain, with a table that has no rows to its left.
+    run(&db, "CREATE TABLE empty (id INTEGER PRIMARY KEY); CREATE TABLE cities (name TEXT PRIMARY KEY, country TEXT)");
+    run(&db, "INSERT INTO cities VALUES ('London', 'UK'), ('NYC', 'US'), ('Paris', 'FR')");
+    assert_eq!(query(&db, "SELECT count(*) FROM empty e RIGHT JOIN orders o ON o.id = e.id"), rows![[7]]);
+    assert_eq!(
+        query(
+            &db,
+            "SELECT c.name, count(u.id) FROM users u RIGHT JOIN cities c ON c.name = u.city
+             LEFT JOIN orders o ON o.user_id = u.id AND o.total > 50 GROUP BY c.name ORDER BY c.name"
+        ),
+        rows![["London", 2], ["NYC", 1], ["Paris", 0]]
+    );
+
+    // USING and NATURAL: the shared column appears once, and a bare name means it.
+    run(
+        &db,
+        "CREATE TABLE a (k INTEGER, x TEXT); CREATE TABLE b (k INTEGER, y TEXT);
+         INSERT INTO a VALUES (1, 'a1'), (2, 'a2'); INSERT INTO b VALUES (2, 'b2'), (3, 'b3')",
+    );
+    let using = db.query("SELECT * FROM a JOIN b USING (k)", &[]).unwrap();
+    assert_eq!(using.columns, vec!["k", "x", "y"]);
+    assert_eq!(using.rows, rows![[2, "a2", "b2"]]);
+    assert_eq!(query(&db, "SELECT k, x, y FROM a NATURAL JOIN b"), rows![[2, "a2", "b2"]]);
+    assert_eq!(query(&db, "SELECT k, x FROM a LEFT JOIN b USING (k) ORDER BY k"), rows![[1, "a1"], [2, "a2"]]);
+    assert_eq!(query(&db, "SELECT k, y FROM a RIGHT JOIN b USING (k) ORDER BY k"), rows![[2, "b2"], [3, "b3"]]);
+    assert_eq!(
+        query(&db, "SELECT a.k, b.k FROM a FULL JOIN b USING (k) ORDER BY a.k NULLS LAST"),
+        rows![[1, NULL], [2, 2], [NULL, 3]]
+    );
+    assert!(error(&db, "SELECT * FROM a JOIN b USING (z)").contains("USING column z"));
+    let explain = query(&db, "EXPLAIN SELECT * FROM a FULL JOIN b ON a.k = b.k");
+    assert!(format!("{explain:?}").contains("FULL JOIN"), "{explain:?}");
+}
+
+#[test]
+fn decimals() {
+    let (dir, db) = open("decimals");
+    run(
+        &db,
+        "CREATE TABLE prices (id INTEGER PRIMARY KEY, amount DECIMAL(10, 2), rate NUMERIC, note TEXT);
+         CREATE INDEX prices_amount ON prices (amount)",
+    );
+    run(
+        &db,
+        "INSERT INTO prices (amount, rate) VALUES (19.99, 0.1), (0.1, 0.2), (5, '1.000000000000000000001'), (2.005, 3)",
+    );
+    // Stored exactly, at the column's scale (rounding half away from zero).
+    assert_eq!(
+        query(&db, "SELECT amount, rate FROM prices ORDER BY id"),
+        vec![
+            vec![Value::Decimal("19.99".parse().unwrap()), Value::Decimal("0.1".parse().unwrap())],
+            vec![Value::Decimal("0.10".parse().unwrap()), Value::Decimal("0.2".parse().unwrap())],
+            vec![Value::Decimal("5.00".parse().unwrap()), Value::Decimal("1.000000000000000000001".parse().unwrap())],
+            vec![Value::Decimal("2.01".parse().unwrap()), Value::Decimal("3".parse().unwrap())],
+        ]
+    );
+    let shown: Vec<String> =
+        query(&db, "SELECT amount FROM prices ORDER BY amount").iter().map(|r| r[0].to_string()).collect();
+    assert_eq!(shown, vec!["0.10", "2.01", "5.00", "19.99"]);
+    // Arithmetic is exact: 0.1 + 0.2 is 0.3, unlike REAL.
+    assert_eq!(
+        query(&db, "SELECT (SELECT rate FROM prices WHERE id = 1) + (SELECT rate FROM prices WHERE id = 2) = 0.3"),
+        rows![[true]]
+    );
+    assert_eq!(query(&db, "SELECT CAST(0.1 AS REAL) + 0.2 = 0.3"), rows![[false]]);
+    let total = query(&db, "SELECT sum(amount), avg(amount), sum(amount) * 3, max(amount) - min(amount) FROM prices");
+    assert_eq!(
+        total[0].iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["27.10", "6.77500000", "81.30", "19.89"]
+    );
+    assert_eq!(
+        query(&db, "SELECT round(amount, 1), trunc(amount), ceil(amount), floor(-amount) FROM prices WHERE id = 1")[0]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["20.0", "19", "20", "-20"]
+    );
+    // Index lookups and comparisons with integers and reals.
+    assert_eq!(query(&db, "SELECT id FROM prices WHERE amount = 5"), rows![[3]]);
+    assert_eq!(query(&db, "SELECT id FROM prices WHERE amount = 19.99"), rows![[1]]);
+    assert_eq!(query(&db, "SELECT id FROM prices WHERE amount BETWEEN 1 AND 6 ORDER BY id"), rows![[3], [4]]);
+    let explain = query(&db, "EXPLAIN SELECT id FROM prices WHERE amount = 5");
+    assert!(format!("{explain:?}").contains("prices_amount"), "{explain:?}");
+    assert!(error(&db, "INSERT INTO prices (amount) VALUES (123456789.5)").contains("cannot store"));
+    assert!(error(&db, "SELECT CAST('abc' AS DECIMAL)").contains("cannot cast"));
+    assert_eq!(
+        query(&db, "SELECT DECIMAL '1.50' * 2, CAST(7 AS DECIMAL(5, 1)), typeof(DECIMAL '1')")[0]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["3.00", "7.0", "decimal"]
+    );
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    assert!(db.schema("prices").unwrap().unwrap().contains("amount DECIMAL(10, 2), rate DECIMAL"));
+    assert_eq!(query(&db, "SELECT count(*) FROM prices WHERE amount > 2"), rows![[3]]);
+}
+
+#[test]
+fn blobs() {
+    let (_dir, db) = open("blobs");
+    run(&db, "CREATE TABLE files (name TEXT PRIMARY KEY, data BLOB, digest BYTEA UNIQUE)");
+    run(&db, "INSERT INTO files VALUES ('a', X'00FF10', x'aa'), ('b', CAST('hi' AS BLOB), X'bb'), ('c', X'', NULL)");
+    let mut session = db.session();
+    let insert = db.prepare("INSERT INTO files VALUES (?, ?, ?)").unwrap();
+    session.execute_prepared(&insert, &["d".into(), vec![1u8, 2, 3].into(), Value::Null]).unwrap();
+    assert_eq!(
+        query(&db, "SELECT name, data, length(data), hex(data) FROM files ORDER BY name"),
+        vec![
+            vec!["a".into(), Value::Blob(vec![0, 255, 16]), 3.into(), "00FF10".into()],
+            vec!["b".into(), Value::Blob(b"hi".to_vec()), 2.into(), "6869".into()],
+            vec!["c".into(), Value::Blob(vec![]), 0.into(), "".into()],
+            vec!["d".into(), Value::Blob(vec![1, 2, 3]), 3.into(), "010203".into()],
+        ]
+    );
+    assert_eq!(query(&db, "SELECT name FROM files WHERE digest = X'BB'"), rows![["b"]]);
+    assert_eq!(query(&db, "SELECT name FROM files ORDER BY data DESC LIMIT 1"), rows![["b"]]);
+    assert_eq!(
+        query(&db, "SELECT CAST(data AS TEXT), data || X'21' FROM files WHERE name = 'b'"),
+        vec![vec![Value::from("hi"), Value::Blob(b"hi!".to_vec())]]
+    );
+    assert_eq!(query(&db, "SELECT data FROM files WHERE name = 'a'")[0][0].to_string(), "\\x00ff10");
+    assert!(error(&db, "INSERT INTO files VALUES ('e', X'AA', X'aa')").contains("UNIQUE"));
+    assert!(error(&db, "INSERT INTO files VALUES ('e', 'text', NULL)").contains("cannot store"));
+    assert!(error(&db, "SELECT X'ABC'").contains("hex digits"));
+}
+
+#[test]
+fn table_utilities_and_row_values() {
+    let (_dir, db) = open("utilities");
+    shop(&db);
+    // CREATE TABLE AS: columns typed by their values.
+    run(
+        &db,
+        "CREATE TABLE totals AS SELECT u.name, sum(o.total) AS spent, count(*) AS orders FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.name",
+    );
+    assert!(db.schema("totals").unwrap().unwrap().contains("name TEXT, spent REAL, orders INTEGER"));
+    assert_eq!(query(&db, "SELECT name, orders FROM totals ORDER BY name"), rows![["Ada", 2], ["Grace", 3]]);
+    run(&db, "CREATE TABLE copy (who, n) AS SELECT name, 1 FROM users WHERE id < 3");
+    assert_eq!(query(&db, "SELECT who, n FROM copy ORDER BY who"), rows![["Ada", 1], ["Alan", 1]]);
+    run(&db, "CREATE TABLE IF NOT EXISTS copy AS SELECT 1");
+    assert!(error(&db, "CREATE TABLE dup AS SELECT 1 AS a, 2 AS a").contains("duplicate column"));
+
+    // UPDATE ... FROM and DELETE ... USING.
+    run(&db, "ALTER TABLE users ADD COLUMN spent REAL DEFAULT 0");
+    run(&db, "UPDATE users SET spent = t.spent FROM totals t WHERE t.name = users.name");
+    assert_eq!(
+        query(&db, "SELECT name, spent FROM users ORDER BY id"),
+        rows![["Ada", 35.5], ["Alan", 0.0], ["Grace", 108.25], ["Edsger", 0.0]]
+    );
+    run(
+        &db,
+        "UPDATE orders SET total = total * 2 FROM users u WHERE u.id = orders.user_id AND u.city = 'NYC' RETURNING id",
+    );
+    assert_eq!(query(&db, "SELECT sum(total) FROM orders WHERE user_id = 3"), rows![[216.5]]);
+    run(&db, "DELETE FROM orders USING users WHERE users.id = orders.user_id AND users.name = 'Ada'");
+    assert_eq!(query(&db, "SELECT count(*) FROM orders WHERE user_id = 1"), rows![[0]]);
+
+    // TRUNCATE, keeping or restarting ids, and refusing while referenced.
+    run(&db, "TRUNCATE copy; INSERT INTO totals VALUES ('x', 1, 1)");
+    assert_eq!(query(&db, "SELECT count(*) FROM copy"), rows![[0]]);
+    run(&db, "CREATE TABLE seq (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO seq (v) VALUES ('a'), ('b')");
+    run(&db, "TRUNCATE TABLE seq; INSERT INTO seq (v) VALUES ('c')");
+    assert_eq!(query(&db, "SELECT id FROM seq"), rows![[3]]);
+    run(&db, "TRUNCATE seq RESTART IDENTITY; INSERT INTO seq (v) VALUES ('d')");
+    assert_eq!(query(&db, "SELECT id FROM seq"), rows![[1]]);
+    run(&db, "CREATE TABLE child (seq_id INTEGER REFERENCES seq)");
+    assert!(error(&db, "TRUNCATE seq").contains("truncate them together"));
+    run(&db, "TRUNCATE seq, child");
+
+    // Row values.
+    assert_eq!(
+        query(&db, "SELECT (1, 2) = (1, 2), (1, 2) < (1, 3), (2, 0) > (1, 9), (1, NULL) = (1, 2), (1, NULL) = (2, 2)"),
+        rows![[true, true, true, NULL, false]]
+    );
+    assert_eq!(query(&db, "SELECT name FROM users WHERE (city, id) = ('London', 2)"), rows![["Alan"]]);
+    assert_eq!(
+        query(&db, "SELECT id FROM users WHERE (id, city) IN ((1, 'London'), (3, 'NYC'), (4, 'x')) ORDER BY id"),
+        rows![[1], [3]]
+    );
+    assert_eq!(
+        query(&db, "SELECT id FROM users WHERE (id, city) NOT IN ((1, 'London')) ORDER BY id"),
+        rows![[2], [3], [4]]
+    );
+    assert_eq!(
+        query(&db, "SELECT name FROM users WHERE (name, spent) IN (SELECT name, spent FROM totals) ORDER BY name"),
+        rows![["Ada"], ["Grace"]]
+    );
+    assert_eq!(query(&db, "SELECT id FROM users WHERE (id, name) > (2, 'A') ORDER BY id"), rows![[2], [3], [4]]);
+    assert!(error(&db, "SELECT (1, 2) = (1, 2, 3)").contains("same number"));
+    assert!(error(&db, "SELECT (1, 2)").contains("row value"));
+    assert!(error(&db, "SELECT 1 WHERE (1, 2) IN (SELECT 1)").contains("2 columns"));
+}
+
+#[test]
+fn json_functions() {
+    let (_dir, db) = open("json");
+    run(
+        &db,
+        r#"CREATE TABLE docs (id INTEGER PRIMARY KEY, body JSON);
+           INSERT INTO docs (body) VALUES
+               ('{"name": "ann", "age": 31, "tags": ["a", "b"], "address": {"city": "Oslo"}}'),
+               ('{"name": "bob", "age": 25, "tags": [], "address": {"city": "Rome"}}'),
+               ('{"name": "cat", "tags": ["c"]}')"#,
+    );
+    // Extraction: paths, and PostgreSQL's -> and ->> operators.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT json_extract(body, '$.name'), body->>'age', body->'address'->>'city', body->'tags'->>-1 FROM docs ORDER BY id"
+        ),
+        rows![["ann", 31, "Oslo", "b"], ["bob", 25, "Rome", NULL], ["cat", NULL, NULL, "c"]]
+    );
+    assert_eq!(query(&db, "SELECT body->'address' FROM docs WHERE id = 1"), rows![[r#"{"city":"Oslo"}"#]]);
+    assert_eq!(query(&db, "SELECT id FROM docs WHERE body->>'age' > 30"), rows![[1]]);
+    assert_eq!(
+        query(
+            &db,
+            "SELECT json_type(body, '$.tags'), json_array_length(body, '$.tags'), json_valid(body), json_valid('{') FROM docs WHERE id = 1"
+        ),
+        rows![["array", 2, true, false]]
+    );
+    // Building and editing.
+    assert_eq!(
+        query(&db, "SELECT json_object('id', 1, 'tags', json_array('x', 2, NULL, true), 'raw', '[1]')"),
+        rows![[r#"{"id":1,"tags":["x",2,null,true],"raw":"[1]"}"#]]
+    );
+    run(&db, r#"UPDATE docs SET body = json_set(body, '$.age', 32, '$.tags[#]', 'new') WHERE id = 1"#);
+    assert_eq!(
+        query(&db, "SELECT body->>'age', body->'tags' FROM docs WHERE id = 1"),
+        rows![[32, r#"["a","b","new"]"#]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            r#"SELECT json_remove('{"a":1,"b":2}', '$.a'), json_insert('{"a":1}', '$.a', 5, '$.b', 6), json_replace('{"a":1}', '$.a', 5, '$.b', 6)"#
+        ),
+        rows![[r#"{"b":2}"#, r#"{"a":1,"b":6}"#, r#"{"a":5}"#]]
+    );
+    // Aggregates.
+    assert_eq!(
+        query(&db, "SELECT json_group_array(body->>'name'), json_object_agg(body->>'name', body->>'age') FROM docs"),
+        rows![[r#"["ann","bob","cat"]"#, r#"{"ann":32,"bob":25,"cat":null}"#]]
+    );
+    assert_eq!(
+        query(&db, "SELECT json_agg(json_object('n', id)) FROM docs WHERE id < 3"),
+        rows![[r#"[{"n":1},{"n":2}]"#]]
+    );
+    assert!(error(&db, "SELECT json_extract('{nope', '$')").contains("malformed JSON"));
+    assert!(error(&db, "SELECT json_extract('{}', 'a')").contains("bad JSON path"));
+}
+
+#[test]
+fn catalog_tables() {
+    let (_dir, db) = open("catalog");
+    run(
+        &db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, joined TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+         CREATE VIEW emails AS SELECT email FROM users",
+    );
+    assert_eq!(
+        query(&db, "SELECT table_name, table_type FROM information_schema.tables ORDER BY table_name"),
+        rows![["emails", "VIEW"], ["users", "BASE TABLE"]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT column_name, ordinal_position, data_type, is_nullable, column_default, is_primary_key
+             FROM information_schema.columns WHERE table_name = 'users' ORDER BY ordinal_position"
+        ),
+        rows![
+            ["id", 1, "INTEGER", "NO", NULL, true],
+            ["email", 2, "TEXT", "NO", NULL, false],
+            ["joined", 3, "TIMESTAMP", "YES", "CURRENT_TIMESTAMP", false],
+        ]
+    );
+    assert_eq!(query(&db, "SELECT view_definition FROM information_schema.views"), rows![["SELECT email FROM users"]]);
+    assert_eq!(
+        query(&db, "SELECT type, name FROM sqlite_master ORDER BY type, name"),
+        rows![["index", "users_email_key"], ["table", "users"], ["view", "emails"]]
+    );
+    // Schema-qualified names, and joins with real tables.
+    run(&db, "INSERT INTO main.users (email) VALUES ('a@x')");
+    assert_eq!(query(&db, "SELECT count(*) FROM public.users"), rows![[1]]);
+    assert_eq!(
+        query(
+            &db,
+            "SELECT c.column_name FROM information_schema.tables t JOIN information_schema.columns c ON c.table_name = t.table_name WHERE t.table_type = 'BASE TABLE' AND c.is_primary_key"
+        ),
+        rows![["id"]]
+    );
+}
+
+#[test]
+fn read_only_transactions_read_a_snapshot() {
+    let (_dir, db) = open("mvcc");
+    run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO t VALUES (1, 10), (2, 20)");
+    let mut reader = db.session();
+    reader.execute("BEGIN READ ONLY").unwrap();
+    assert_eq!(reader.query("SELECT sum(v) FROM t", &[]).unwrap().rows, rows![[30]]);
+    // Writers aren't blocked by it, and it doesn't see their commits.
+    run(&db, "UPDATE t SET v = v + 1; INSERT INTO t VALUES (3, 30); DELETE FROM t WHERE id = 1");
+    db.kv().flush().unwrap();
+    assert_eq!(reader.query("SELECT id, v FROM t ORDER BY id", &[]).unwrap().rows, rows![[1, 10], [2, 20]]);
+    assert_eq!(reader.query("SELECT v FROM t WHERE id = 1", &[]).unwrap().rows, rows![[10]]);
+    let err = reader.execute("INSERT INTO t VALUES (9, 9)").unwrap_err().to_string();
+    assert!(err.contains("READ ONLY"), "{err}");
+    // A schema change committed meanwhile doesn't show either.
+    run(&db, "ALTER TABLE t ADD COLUMN w INTEGER DEFAULT 7");
+    assert_eq!(reader.query("SELECT * FROM t WHERE id = 2", &[]).unwrap().rows, rows![[2, 20]]);
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(reader.query("SELECT id, v, w FROM t ORDER BY id", &[]).unwrap().rows, rows![[2, 21, 7], [3, 30, 7]]);
+    // START TRANSACTION READ WRITE is an ordinary transaction.
+    reader.execute("START TRANSACTION READ WRITE").unwrap();
+    reader.execute("INSERT INTO t (id, v) VALUES (4, 40)").unwrap();
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(query(&db, "SELECT count(*) FROM t"), rows![[3]]);
+}
+
+#[test]
+fn scans_never_see_part_of_a_commit() {
+    let (_dir, db) = open("mvcc-scan");
+    run(&db, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)");
+    let mut session = db.session();
+    session.execute("BEGIN").unwrap();
+    for id in 0..2000 {
+        session.execute(&format!("INSERT INTO accounts VALUES ({id}, 100)")).unwrap();
+    }
+    session.execute("COMMIT").unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Transfers between accounts, each one commit touching rows far apart.
+    let writer = {
+        let (db, stop) = (db.clone(), stop.clone());
+        thread::spawn(move || {
+            let mut session = db.session();
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let (from, to) = (i * 7919 % 2000, (i * 104_729 + 1000) % 2000);
+                if from != to {
+                    session.execute("BEGIN").unwrap();
+                    session.execute(&format!("UPDATE accounts SET balance = balance - 5 WHERE id = {from}")).unwrap();
+                    session.execute(&format!("UPDATE accounts SET balance = balance + 5 WHERE id = {to}")).unwrap();
+                    session.execute("COMMIT").unwrap();
+                }
+                i += 1;
+            }
+            i
+        })
+    };
+    let started = std::time::Instant::now();
+    let mut scans = 0;
+    while started.elapsed() < Duration::from_millis(1500) {
+        // Row by row and batched (with every core): both read one snapshot.
+        assert_eq!(query(&db, "SELECT sum(balance) FROM accounts"), rows![[200_000]]);
+        assert_eq!(query(&db, "SELECT sum(balance + 0), count(*) FROM accounts WHERE id >= 0"), rows![[200_000, 2000]]);
+        scans += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let transfers = writer.join().unwrap();
+    assert!(scans > 10 && transfers > 10, "{scans} scans, {transfers} transfers");
+    assert_eq!(query(&db, "SELECT sum(balance) FROM accounts"), rows![[200_000]]);
+}

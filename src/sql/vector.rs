@@ -33,7 +33,7 @@ use super::catalog::TableSchema;
 use super::columnar::{self, Chunk, ColumnView, Kind};
 use super::encoding::{RawValue, encode_key, visit_row};
 use super::exec::{ReadSpec, read};
-use super::expr::{Accumulator, Aggregate, BExpr, Env};
+use super::expr::{Accumulator, AggFunc, Aggregate, BExpr, Env};
 use super::plan::{Access, GroupPlan, SelectPlan};
 use super::txn::Txn;
 use super::value::{DataType, Value, cmp_f64};
@@ -69,7 +69,10 @@ pub fn applies(plan: &SelectPlan) -> bool {
     // FILTER clauses are checked row by row, which the batches don't do.
     plan.base.is_some()
         && plan.joins.is_empty()
-        && plan.grouping.as_ref().is_some_and(|g| g.aggregates.iter().all(|a| a.filter.is_none()))
+        && plan.grouping.as_ref().is_some_and(|g| {
+            // json_group_array keeps the NULLs batches pass over.
+            g.aggregates.iter().all(|a| a.filter.is_none() && a.func != AggFunc::JsonArray)
+        })
         && plan.is_simple()
 }
 

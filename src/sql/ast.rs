@@ -39,7 +39,10 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
-    Begin,
+    /// `BEGIN [READ ONLY | READ WRITE]`
+    Begin {
+        read_only: bool,
+    },
     Commit,
     Rollback,
     Savepoint(String),
@@ -48,6 +51,11 @@ pub enum Statement {
     /// `ROLLBACK TO [SAVEPOINT] name`
     RollbackTo(String),
     Explain(Box<Statement>),
+    /// `TRUNCATE [TABLE] name, ... [RESTART IDENTITY]`
+    Truncate {
+        tables: Vec<String>,
+        restart: bool,
+    },
     /// `LISTEN channel`
     Listen(String),
     /// `UNLISTEN channel`, or `UNLISTEN *` (`None`)
@@ -79,6 +87,9 @@ pub struct CreateTable {
     pub checks: Vec<CheckDef>,
     /// `FOREIGN KEY (a) REFERENCES t (b)`, the column-level ones included.
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// `CREATE TABLE name [(columns)] AS query`: the query whose rows fill
+    /// it. `columns` then only name the query's columns.
+    pub query: Option<Box<Select>>,
 }
 
 /// `[CONSTRAINT name] CHECK (expr)`: rows for which `expr` is false are refused.
@@ -194,6 +205,8 @@ pub enum InsertSource {
 pub struct Update {
     pub table: String,
     pub assignments: Vec<(String, Expr)>,
+    /// `FROM ...`: other tables the assignments and WHERE may read.
+    pub from: Option<From>,
     pub filter: Option<Expr>,
     pub returning: Vec<SelectItem>,
 }
@@ -201,6 +214,8 @@ pub struct Update {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Delete {
     pub table: String,
+    /// `USING ...`: other tables WHERE may read.
+    pub using: Option<From>,
     pub filter: Option<Expr>,
     pub returning: Vec<SelectItem>,
 }
@@ -416,12 +431,18 @@ pub struct Join {
     pub kind: JoinKind,
     pub table: TableRef,
     pub on: Option<Expr>,
+    /// `USING (columns)`
+    pub using: Vec<String>,
+    /// `NATURAL`: USING every column name both sides have.
+    pub natural: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinKind {
     Inner,
     Left,
+    Right,
+    Full,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -538,6 +559,8 @@ pub enum Expr {
     },
     /// `(SELECT ...)` as a value.
     Subquery(Box<Select>),
+    /// `(a, b, ...)`: a row value, which may be compared or tested with IN.
+    Row(Vec<Expr>),
     /// `[NOT] EXISTS (SELECT ...)`
     Exists {
         select: Box<Select>,
@@ -579,6 +602,7 @@ impl Expr {
                 expr.walk(f);
                 pattern.walk(f);
             }
+            Expr::Row(items) => items.iter().for_each(|e| e.walk(f)),
             Expr::Function { args, filter, .. } => {
                 args.iter().for_each(|e| e.walk(f));
                 filter.iter().for_each(|e| e.walk(f));
@@ -631,6 +655,7 @@ impl Expr {
                 f(expr);
                 f(pattern);
             }
+            Expr::Row(items) => items.iter_mut().for_each(&mut *f),
             Expr::Function { args, filter, .. } => {
                 args.iter_mut().for_each(&mut *f);
                 filter.iter_mut().for_each(|e| f(e));
@@ -679,6 +704,10 @@ pub fn is_aggregate(name: &str) -> bool {
             | "stddev"
             | "stddev_samp"
             | "stddev_pop"
+            | "json_group_array"
+            | "json_agg"
+            | "json_group_object"
+            | "json_object_agg"
     )
 }
 
@@ -802,6 +831,10 @@ impl fmt::Display for Expr {
                 write!(f, "{name}({}{}){filter}", if *distinct { "DISTINCT " } else { "" }, args.join(", "))
             }
             Expr::Cast { expr, ty } => write!(f, "CAST({expr} AS {ty})"),
+            Expr::Row(items) => {
+                let items: Vec<String> = items.iter().map(ToString::to_string).collect();
+                write!(f, "({})", items.join(", "))
+            }
             Expr::Case { operand: op, branches, otherwise } => {
                 f.write_str("CASE")?;
                 if let Some(op) = op {

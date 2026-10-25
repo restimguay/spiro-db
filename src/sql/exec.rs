@@ -12,7 +12,7 @@ use crate::error::{Error, Result, corruption};
 
 use super::ast::{
     AlterAction, CheckDef, ColumnDef, ConflictAction, CreateIndex, CreateTable, Delete, Expr, FkAction, ForeignKeyDef,
-    Insert, InsertSource, JoinKind, Select, SelectItem, SetOp, Statement, Update,
+    From, Insert, InsertSource, JoinKind, Select, SelectItem, SetOp, Statement, Update,
 };
 use super::catalog::{self, Column, IndexSchema, ROW_PREFIX_LEN, TableSchema, ViewSchema};
 use super::datetime::{Kind, Moment};
@@ -24,7 +24,7 @@ use super::integrity::{self, Child, ParentKey, Rules};
 use super::notify::MAX_PAYLOAD;
 use super::plan::{
     Access, Compound, Derived, GroupPlan, JoinPlan, KeyBound, Recursive, SelectPlan, SortKey, TablePlan, choose_access,
-    index_covers, plan_select,
+    index_covers, plan_from, plan_select,
 };
 use super::txn::Txn;
 use super::value::{DataType, Value, sql_error};
@@ -108,9 +108,11 @@ pub fn execute(txn: &mut Txn, statement: &Statement, params: &[Value], plans: &P
         }
         Statement::Explain(inner) => explain(txn, inner, &Binder::new(params, txn)),
         // Subqueries can't appear in DEFAULT: no transaction to run them in.
-        Statement::CreateTable(create) => {
-            create_table(txn, create, &Binder { params, txn: None, outer: None, ctes: None })
-        }
+        Statement::CreateTable(create) => match &create.query {
+            Some(query) => create_table_as(txn, create, query, params),
+            None => create_table(txn, create, &Binder { params, txn: None, outer: None, ctes: None }),
+        },
+        Statement::Truncate { tables, restart } => truncate(txn, tables, *restart),
         Statement::DropTable { name, if_exists } => drop_table(txn, name, *if_exists),
         Statement::CreateIndex(create) => create_index(txn, create),
         Statement::AlterTable { table, action } => alter_table(txn, table, action, params),
@@ -143,7 +145,7 @@ pub fn execute(txn: &mut Txn, statement: &Statement, params: &[Value], plans: &P
             catalog::delete_view(txn, name);
             Ok(QueryResult::Done("DROP VIEW"))
         }
-        Statement::Begin
+        Statement::Begin { .. }
         | Statement::Commit
         | Statement::Rollback
         | Statement::Savepoint(_)
@@ -221,6 +223,14 @@ pub(super) fn read(txn: &Txn, spec: &ReadSpec, outer: &[Value], env: &Env, sink:
             return Ok(());
         }
         Some(Derived::Recursive(query)) => return recursive_rows(txn, query, env.params, sink),
+        Some(Derived::Rows(rows)) => {
+            for row in rows.iter() {
+                if !sink(&[], &mut row.clone())? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
         Some(Derived::Work(id)) => {
             let Some((_, rows)) = env.work.as_ref().filter(|(work, _)| work == id) else {
                 return Err(sql_error(format!(
@@ -776,9 +786,9 @@ fn for_each_row(
         }
         return Ok(());
     };
-    // Joined tables read in full are read once and kept here.
-    let mut cache: Vec<Option<Vec<Vec<Value>>>> = vec![None; plan.joins.len()];
+    let mut states: Vec<JoinState> = plan.joins.iter().map(|_| JoinState::default()).collect();
     let spec = ReadSpec::of(base);
+    let mut stopped = false;
     read(txn, &spec, &[], env, &mut |_, row| {
         // Conditions the access path enforces needn't be checked again,
         // unless the read fell back to a full scan.
@@ -788,50 +798,87 @@ fn for_each_row(
         {
             return Ok(true);
         }
-        if plan.joins.is_empty() {
-            return emit(row);
+        let more =
+            if plan.joins.is_empty() { emit(row)? } else { join(txn, &plan.joins, &mut states, row, env, emit)? };
+        stopped = !more;
+        Ok(more)
+    })?;
+    // RIGHT and FULL joins then add their rows that nothing matched, with
+    // NULL for every table before them, and join them with the tables after.
+    for (j, join_plan) in plan.joins.iter().enumerate() {
+        if stopped || !matches!(join_plan.kind, JoinKind::Right | JoinKind::Full) {
+            continue;
         }
-        join(txn, &plan.joins, &mut cache, row, env, emit)
-    })
+        let (state, later) = states[j..].split_first_mut().expect("a state per join");
+        let rows = match &state.rows {
+            Some(rows) => rows,
+            None => state.rows.insert(read_all(txn, &join_plan.table, &Access::Scan, &[], env)?),
+        };
+        state.matched.resize(rows.len(), false);
+        for (right, _) in rows.iter().zip(&state.matched).filter(|(_, matched)| !**matched) {
+            let mut row = vec![Value::Null; join_plan.table.offset];
+            row.extend_from_slice(right);
+            if !join(txn, &plan.joins[j + 1..], later, &mut row, env, emit)? {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A joined table's rows, when it is read in full (and so only once), and
+/// for a RIGHT or FULL join which of them have been matched.
+#[derive(Default)]
+struct JoinState {
+    rows: Option<Vec<Vec<Value>>>,
+    matched: Vec<bool>,
+}
+
+/// Every row `access` reads from a joined table. `outer` is the row so far,
+/// which key lookups read.
+fn read_all(txn: &Txn, table: &TablePlan, access: &Access, outer: &[Value], env: &Env) -> Result<Vec<Vec<Value>>> {
+    let mut rows = Vec::new();
+    let spec =
+        ReadSpec { derived: table.derived.as_ref(), ..ReadSpec::new(&table.schema, access, Some(&table.needed)) };
+    read(txn, &spec, outer, env, &mut |_, r| {
+        rows.push(r.to_vec());
+        Ok(true)
+    })?;
+    Ok(rows)
 }
 
 /// Nested-loop join of `row` with the remaining `joins`.
 fn join(
     txn: &Txn,
     joins: &[JoinPlan],
-    cache: &mut [Option<Vec<Vec<Value>>>],
+    states: &mut [JoinState],
     row: &mut [Value],
     env: &Env,
     emit: &mut dyn FnMut(&mut [Value]) -> Result<bool>,
 ) -> Result<bool> {
-    let (Some((j, rest)), Some((cached, rest_cache))) = (joins.split_first(), cache.split_first_mut()) else {
+    let (Some((j, rest)), Some((state, rest_states))) = (joins.split_first(), states.split_first_mut()) else {
         return emit(row);
     };
     let table = &j.table;
-    let collect = |access: &Access, outer: &[Value]| -> Result<Vec<Vec<Value>>> {
-        let mut rows = Vec::new();
-        let spec =
-            ReadSpec { derived: table.derived.as_ref(), ..ReadSpec::new(&table.schema, access, Some(&table.needed)) };
-        read(txn, &spec, outer, env, &mut |_, r| {
-            rows.push(r.to_vec());
-            Ok(true)
-        })?;
-        Ok(rows)
-    };
     let looked_up;
+    let JoinState { rows, matched: right_matched } = state;
     let candidates: &[Vec<Value>] = if matches!(table.access, Access::Scan) {
-        if cached.is_none() {
-            *cached = Some(collect(&Access::Scan, &[])?);
+        if rows.is_none() {
+            *rows = Some(read_all(txn, table, &Access::Scan, &[], env)?);
         }
-        cached.as_deref().unwrap()
+        rows.as_deref().unwrap()
     } else {
-        looked_up = collect(&table.access, row)?;
+        looked_up = read_all(txn, table, &table.access, row, env)?;
         &looked_up
     };
+    let track = matches!(j.kind, JoinKind::Right | JoinKind::Full);
+    if track {
+        right_matched.resize(candidates.len(), false);
+    }
 
     let mut matched = false;
     let mut combined = Vec::with_capacity(row.len() + table.schema.columns.len());
-    for right in candidates {
+    for (i, right) in candidates.iter().enumerate() {
         combined.clear();
         combined.extend_from_slice(row);
         combined.extend_from_slice(right);
@@ -841,15 +888,18 @@ fn join(
             continue;
         }
         matched = true;
-        if !join(txn, rest, rest_cache, &mut combined, env, emit)? {
+        if track {
+            right_matched[i] = true;
+        }
+        if !join(txn, rest, rest_states, &mut combined, env, emit)? {
             return Ok(false);
         }
     }
-    if !matched && j.kind == JoinKind::Left {
+    if !matched && matches!(j.kind, JoinKind::Left | JoinKind::Full) {
         combined.clear();
         combined.extend_from_slice(row);
         combined.resize(row.len() + table.schema.columns.len(), Value::Null);
-        return join(txn, rest, rest_cache, &mut combined, env, emit);
+        return join(txn, rest, rest_states, &mut combined, env, emit);
     }
     Ok(true)
 }
@@ -959,6 +1009,90 @@ fn column_default(def: &ColumnDef, binder: &Binder) -> Result<(Option<Value>, bo
         sql_error(format!("default for column {} is {}, which is not {}", def.name, v.literal(), def.ty))
     })?;
     Ok((Some(value), clock))
+}
+
+/// `CREATE TABLE name AS query`: a table with the query's columns, typed
+/// by the values they hold, filled with its rows.
+fn create_table_as(txn: &mut Txn, create: &CreateTable, query: &Select, params: &[Value]) -> Result<QueryResult> {
+    if catalog::get_view(txn, &create.name)?.is_some() {
+        return Err(sql_error(format!("a view named {} already exists", create.name)));
+    }
+    if catalog::get_table(txn, &create.name)?.is_some() {
+        if create.if_not_exists {
+            return Ok(QueryResult::Done("CREATE TABLE"));
+        }
+        return Err(sql_error(format!("table {} already exists", create.name)));
+    }
+    let plan = Arc::new(plan_select(txn, query, &Binder::new(params, txn))?);
+    let rows = run_select(txn, &plan, params)?.rows;
+    let names: Vec<String> = if create.columns.is_empty() {
+        plan.columns.clone()
+    } else if create.columns.len() == plan.columns.len() {
+        create.columns.iter().map(|c| c.name.clone()).collect()
+    } else {
+        return Err(sql_error(format!(
+            "the query has {} columns, but {} names are given",
+            plan.columns.len(),
+            create.columns.len()
+        )));
+    };
+    let mut columns: Vec<Column> = Vec::new();
+    for (i, name) in names.into_iter().enumerate() {
+        if columns.iter().any(|c| c.name == name) {
+            return Err(sql_error(format!("duplicate column name: {name}; name the columns with AS")));
+        }
+        // The type its values have; numbers of several kinds widen, and
+        // anything else mixed (or nothing but NULLs) is TEXT.
+        let mut ty = None;
+        for value in rows.iter().map(|r| &r[i]).filter(|v| !v.is_null()) {
+            let this = value.data_type().unwrap_or(DataType::Text);
+            ty = Some(match (ty, this) {
+                (None, this) => this,
+                (Some(seen), this) if seen == this => seen,
+                (Some(DataType::Real), DataType::Integer | DataType::Decimal(_))
+                | (Some(DataType::Integer | DataType::Decimal(_)), DataType::Real) => DataType::Real,
+                (Some(DataType::Decimal(_)), DataType::Integer) | (Some(DataType::Integer), DataType::Decimal(_)) => {
+                    DataType::Decimal(None)
+                }
+                _ => DataType::Text,
+            });
+        }
+        columns.push(Column::new(name, ty.unwrap_or(DataType::Text)));
+    }
+    let table = Arc::new(TableSchema::new(catalog::next_id(txn)?, create.name.clone(), columns));
+    catalog::put_table(txn, &table);
+    let target = Target::new(txn, table.clone(), Arc::new([]))?;
+    let mut deferred = Deferred::default();
+    for row in rows {
+        let row = row.iter().zip(&table.columns).map(|(v, c)| v.cast(c.ty)).collect::<Result<Vec<_>>>()?;
+        write_row(txn, &target, row, None, true, &mut deferred)?;
+    }
+    Ok(QueryResult::Done("CREATE TABLE"))
+}
+
+/// `TRUNCATE`: removes every row of the tables at once.
+fn truncate(txn: &mut Txn, tables: &[String], restart: bool) -> Result<QueryResult> {
+    let mut schemas = Vec::new();
+    for name in tables {
+        let table = catalog::require_table(txn, name)?;
+        if let Some(child) = catalog::children_of(txn, name)?.iter().find(|c| !tables.contains(&c.name)) {
+            return Err(sql_error(format!(
+                "table {name} is referenced by a foreign key of {}; truncate them together",
+                child.name
+            )));
+        }
+        schemas.push(table);
+    }
+    for table in schemas {
+        for index in catalog::indexes_of(txn, &table.name)?.iter() {
+            delete_range(txn, catalog::index_range(index))?;
+        }
+        delete_range(txn, table.rows_range())?;
+        if restart {
+            txn.forget_sequence(&table.sequence_key());
+        }
+    }
+    Ok(QueryResult::Done("TRUNCATE TABLE"))
 }
 
 fn create_view(txn: &mut Txn, statement: &Statement) -> Result<QueryResult> {
@@ -1926,22 +2060,71 @@ fn insert_rows(txn: &mut Txn, insert: &Insert, params: &[Value], plans: &PlanCac
     written(txn, "INSERT", table, &insert.returning, params, count, returned)
 }
 
+/// A row an UPDATE or DELETE targets: its key and stored values, and with
+/// FROM or USING, those values followed by the other tables' row it met.
+type Targeted = (Vec<u8>, Vec<Value>, Option<Vec<Value>>);
+
+/// The rows of `target` that WHERE accepts, with the scope WHERE (and SET)
+/// see: the table's columns, then those of any FROM or USING tables. A row
+/// that meets several rows of those tables comes once, with the first.
+fn targeted_rows(
+    txn: &Txn,
+    target: &Target,
+    from: Option<&From>,
+    filter: Option<&Expr>,
+    binder: &Binder,
+) -> Result<(Scope, Vec<Targeted>)> {
+    let (table, indexes) = (&target.table, &target.indexes);
+    let mut scope = Scope::of_table(table, &table.name);
+    let env = Env::new(binder.params, Some(txn));
+    let Some(from) = from else {
+        let (access, filter) = write_target(table, indexes, filter, &scope, binder)?;
+        let rows = matching_rows(txn, table, &access, filter.as_ref(), &env)?;
+        return Ok((scope, rows.into_iter().map(|(key, row)| (key, row, None)).collect()));
+    };
+    let (plan, others) = plan_from(txn, from, binder)?;
+    if others.has_table(&table.name) {
+        return Err(sql_error(format!("table {} is named twice; give the other an alias", table.name)));
+    }
+    scope.columns.extend(others.columns);
+    // Conditions on the table alone narrow which of its rows are read.
+    let width = table.columns.len();
+    let conditions = filter.map(|f| binder.bind(f, &scope, "WHERE")).transpose()?.map(BExpr::into_conjuncts);
+    let (own, joint): (Vec<_>, Vec<_>) =
+        conditions.unwrap_or_default().into_iter().partition(|c| c.max_column().is_none_or(|m| m < width));
+    let access = choose_access(table, indexes, 0, &own);
+    let (own, joint) = (BExpr::conjoin(own), BExpr::conjoin(joint));
+    let others = run_select(txn, &plan, binder.params)?.rows;
+    let mut targeted = Vec::new();
+    for (key, row) in matching_rows(txn, table, &access, own.as_ref(), &env)? {
+        let mut combined = row.clone();
+        for other in &others {
+            combined.truncate(width);
+            combined.extend_from_slice(other);
+            if joint.as_ref().map_or(Ok(true), |j| j.matches(&combined, &env))? {
+                targeted.push((key, row, Some(combined)));
+                break;
+            }
+        }
+    }
+    Ok((scope, targeted))
+}
+
 fn update_rows(txn: &mut Txn, update: &Update, params: &[Value]) -> Result<QueryResult> {
     let binder = &Binder::new(params, txn);
     let target = Target::of(txn, &update.table)?;
-    let (table, indexes) = (&target.table, &target.indexes);
-    let scope = Scope::of_table(table, &table.name);
+    let table = &target.table;
+    let (scope, matched) = targeted_rows(txn, &target, update.from.as_ref(), update.filter.as_ref(), binder)?;
     let assignments = bind_assignments(table, &update.assignments, &scope, binder)?;
-    let (access, filter) = write_target(table, indexes, update.filter.as_ref(), &scope, binder)?;
     let env = Env::new(params, Some(txn));
-    let matched = matching_rows(txn, table, &access, filter.as_ref(), &env)?;
 
     // Every SET expression sees the row as it was before the statement.
     let mut updated = Vec::with_capacity(matched.len());
-    for (key, old) in matched {
+    for (key, old, combined) in matched {
         let mut new = old.clone();
+        let seen = combined.as_deref().unwrap_or(&old);
         for (c, e) in &assignments {
-            new[*c] = e.eval(&old, &env)?;
+            new[*c] = e.eval(seen, &env)?;
         }
         updated.push((key, old, new));
     }
@@ -1955,10 +2138,10 @@ fn update_rows(txn: &mut Txn, update: &Update, params: &[Value]) -> Result<Query
 
 fn delete_rows(txn: &mut Txn, delete: &Delete, params: &[Value]) -> Result<QueryResult> {
     let target = Target::of(txn, &delete.table)?;
-    let (table, indexes) = (&target.table, &target.indexes);
-    let scope = Scope::of_table(table, &table.name);
-    let (access, filter) = write_target(table, indexes, delete.filter.as_ref(), &scope, &Binder::new(params, txn))?;
-    let matched = matching_rows(txn, table, &access, filter.as_ref(), &Env::new(params, Some(txn)))?;
+    let table = &target.table;
+    let binder = &Binder::new(params, txn);
+    let (_, matched) = targeted_rows(txn, &target, delete.using.as_ref(), delete.filter.as_ref(), binder)?;
+    let matched: Vec<_> = matched.into_iter().map(|(key, row, _)| (key, row)).collect();
     let count = matched.len();
     let mut deferred = Deferred::default();
     let returned = delete_found(txn, &target, matched, &mut deferred, 0)?;

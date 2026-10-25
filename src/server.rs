@@ -240,6 +240,9 @@ pub(crate) fn value_to_json(v: &Value) -> Json {
         Value::Real(r) => Json::Float(*r),
         Value::Text(s) => Json::Str(s.clone()),
         Value::Boolean(b) => Json::Bool(*b),
+        // As text, so no digit is lost to a float, as PostgreSQL drivers do.
+        Value::Decimal(d) => Json::Str(d.to_string()),
+        Value::Blob(_) => Json::Str(v.to_string()),
     }
 }
 

@@ -20,15 +20,15 @@ println!("{}", rows.to_json()); // [{"name":"Alan"}]
 
 **Statements**
 
-- `CREATE TABLE` (with `IF NOT EXISTS`) and `DROP TABLE` (with `IF EXISTS`)
+- `CREATE TABLE` (with `IF NOT EXISTS`), `CREATE TABLE name [(columns)] AS query`, `DROP TABLE` (with `IF EXISTS`) and `TRUNCATE [TABLE] name, ... [RESTART IDENTITY]`
 - `CREATE [UNIQUE] INDEX` and `DROP INDEX`, on one or more columns
 - `CREATE [OR REPLACE] VIEW name [(columns)] AS query` and `DROP VIEW`
 - `ALTER TABLE ... ADD [COLUMN]`, `DROP [COLUMN]`, `RENAME [COLUMN] ... TO ...` and `RENAME TO`
 - `INSERT ... VALUES` (many rows at once) and `INSERT ... SELECT`
 - Upserts: `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`, plus SQLite's `INSERT OR IGNORE` and MySQL's `ON DUPLICATE KEY UPDATE`
-- `UPDATE` and `DELETE`
+- `UPDATE` (with `FROM other tables`) and `DELETE` (with `USING other tables`), as in PostgreSQL
 - `RETURNING` on `INSERT`, `UPDATE` and `DELETE`
-- `SELECT` with `WHERE`, `[INNER | LEFT] JOIN ... ON`, `CROSS JOIN`, `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY` and `LIMIT`/`OFFSET`
+- `SELECT` with `WHERE`, `[INNER | LEFT | RIGHT | FULL] [OUTER] JOIN ... ON | USING (columns)`, `NATURAL JOIN`, `CROSS JOIN`, `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY` and `LIMIT`/`OFFSET`
 - `UNION [ALL]`, `INTERSECT [ALL]` and `EXCEPT [ALL]`, with `INTERSECT` binding first as in standard SQL; `ORDER BY` and `LIMIT` after them apply to the whole result
 - Subqueries: `(SELECT ...)` as a value, `[NOT] IN (SELECT ...)`, `[NOT] EXISTS (SELECT ...)`, and `FROM (SELECT ...) AS name [(columns)]`
 - `WITH name [(columns)] AS (query), ...` and `WITH RECURSIVE`
@@ -37,7 +37,7 @@ println!("{}", rows.to_json()); // [{"name":"Alan"}]
 
 **Types and constraints**
 
-- Types are `INTEGER`, `REAL`, `TEXT`, `BOOLEAN`, `DATE`, `TIME` and `TIMESTAMP`, plus the common aliases (`INT`, `BIGINT`, `VARCHAR(n)`, `DOUBLE PRECISION`, `DATETIME`, `TIMESTAMPTZ`, ...).
+- Types are `INTEGER`, `REAL`, `DECIMAL(p, s)`, `TEXT`, `BLOB`, `BOOLEAN`, `DATE`, `TIME` and `TIMESTAMP`, plus the common aliases (`INT`, `BIGINT`, `NUMERIC`, `VARCHAR(n)`, `DOUBLE PRECISION`, `BYTEA`, `DATETIME`, `TIMESTAMPTZ`, ...).
 - Constraints are `PRIMARY KEY` (including composite keys), `NOT NULL`, `UNIQUE`, `CHECK`, `FOREIGN KEY`/`REFERENCES` and `DEFAULT`, including `DEFAULT CURRENT_TIMESTAMP` (or `CURRENT_DATE`, `CURRENT_TIME`). Table constraints may be named with `CONSTRAINT name`.
 - An `INTEGER PRIMARY KEY` is assigned automatically when omitted.
 
@@ -45,6 +45,7 @@ println!("{}", rows.to_json()); // [{"name":"Alan"}]
 
 - Arithmetic, comparisons and `||`, with SQL's three-valued `NULL` logic
 - `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN`, `[NOT] BETWEEN`, and `[NOT] LIKE`/`ILIKE`
+- Row values: `(a, b) = (1, 2)`, `(a, b) < (x, y)` in dictionary order, `(a, b) IN ((1, 2), ...)` and `(a, b) IN (SELECT x, y ...)`
 - `CASE`, `CAST`
 - Aggregates: `count(*)`, `count`, `sum`, `avg`, `min`, `max`, `total`, `group_concat`/`string_agg(x, sep)`, `bool_and`/`every`, `bool_or`, `variance`/`var_samp`, `var_pop`, `stddev`/`stddev_samp` and `stddev_pop`, each optionally with `DISTINCT` and `FILTER (WHERE ...)`
 - Window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, and the aggregates, with `OVER (PARTITION BY ... ORDER BY ... [ROWS | RANGE frame])` and named windows (`WINDOW w AS (...)`)
@@ -52,7 +53,7 @@ println!("{}", rows.to_json()); // [{"name":"Alan"}]
 - Numeric functions: `abs`, `round`, `trunc`, `ceil`, `floor`, `sign`, `mod`, `sqrt`, `power`, `exp`, `ln`, `log`, `log10`, `log2`, `pi`, `random`, `degrees`, `radians` and the trigonometric functions
 - Other functions: `coalesce`/`ifnull`, `nullif`, `iif`, `greatest` and `least` (which pass over NULLs, as in PostgreSQL), and `typeof`
 - `ORDER BY ... [ASC | DESC] [NULLS FIRST | NULLS LAST]`, in queries and windows. By default NULLs sort below every value, as in SQLite.
-- Dates and times: see below
+- Dates and times, and JSON: see below
 
 **Subqueries** may refer to the columns of the query around them (*correlated* subqueries), one level out:
 
@@ -75,9 +76,27 @@ WITH RECURSIVE chain AS (
 SELECT name, depth FROM chain ORDER BY depth;
 ```
 
+**Joins** run as nested loops: each row of the tables so far is matched against the next table, through an index or primary key when `ON` allows it. A table read in full is read once per query. `RIGHT` and `FULL` joins remember which rows of their table found a match, and add the others with NULLs at the end. `USING (c)` and `NATURAL` joins show the shared column once, and a bare `c` names it. In a `FULL` join that is the left table's column, so write `coalesce(a.c, b.c)` for the value from either side.
+
 **Window functions** see the rows left after `WHERE`, `GROUP BY` and `HAVING`, so they can rank groups too (`rank() OVER (ORDER BY sum(total) DESC)`). Without a frame, an ordered window runs from the start of the partition to the current row and the rows that tie with it, as in standard SQL; an unordered one covers the whole partition. Frames are `ROWS` with offsets (`ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`) or `RANGE` with `UNBOUNDED`/`CURRENT ROW` bounds. Aggregates whose frames only grow are computed as running totals. To filter on a window value, wrap the query: `SELECT * FROM (SELECT ..., row_number() OVER (...) AS n FROM t) AS ranked WHERE n = 1`.
 
 **Views** are stored queries that read like tables, in joins, subqueries and `WITH` queries alike. They are planned afresh each time they are used, so they see the tables' current columns and data; they can't be written to, and can't refer to themselves, even through other views. `.schema` in the shell shows them as written.
+
+**Exact decimals.** `DECIMAL` (or `NUMERIC`) values are exact, with up to 38 significant digits, so `0.1 + 0.2 = 0.3`. A `DECIMAL(10, 2)` column rounds what it stores to 2 places, half away from zero, and refuses values with more than 8 digits before the point. Arithmetic between decimals and integers stays exact. Division keeps 6 more places than its operands, and `sum` and `avg` of decimals are exact too. Any `REAL` in the mix makes the result a `REAL`. Write exact constants as `DECIMAL '19.99'` or let a column convert them. Decimals sort and index by value, and reach JSON clients as strings so no digit is lost.
+
+**Blobs.** `BLOB` (or `BYTEA`) columns hold bytes, written as `X'00ff'`, passed as `Vec<u8>` parameters, or cast from text. `length`, `hex`, `||` and comparisons work on them. They print and travel over JSON as `\x00ff`, as PostgreSQL shows `bytea`.
+
+**JSON** is kept as text (`JSON` and `JSONB` columns are `TEXT`), with SQLite's functions and PostgreSQL's operators:
+
+- `body->'key'` and `body->0` give a member or element as JSON; `body->>'key'` gives it as a value (`31`, `'Oslo'`), as in SQLite
+- `json_extract(body, '$.address.city')`, with paths such as `$.a[2]`, `$."odd key"` and `$[#-1]` (the last element)
+- `json`, `json_valid`, `json_type`, `json_array_length`
+- Building and editing: `json_array`, `json_object`, `json_set`, `json_insert`, `json_replace` and `json_remove` (`$[#]` appends to an array)
+- Aggregates: `json_group_array`/`json_agg` and `json_group_object`/`json_object_agg`
+
+A value made by a JSON function nests as JSON inside another (`json_object('tags', json_array(1, 2))`); other text becomes a JSON string.
+
+**Catalog tables** describe the database for tools and ORMs: `information_schema.tables`, `information_schema.columns` (with `data_type`, `is_nullable`, `column_default` and `is_primary_key`) and `information_schema.views`, and SQLite's `sqlite_master` (or `sqlite_schema`) with each table's, index's and view's `CREATE` statement. Tables can also be named as `main.name` or `public.name`.
 
 **Dates and times.** `DATE`, `TIME` and `TIMESTAMP` values are checked when stored and kept as ISO 8601 text in UTC: `2024-03-15`, `09:30:00`, `2024-03-15 09:30:00.25`. Input may use `T` instead of the space and end in `Z` or an offset such as `+02:00`, which is converted to UTC. These forms sort as text in time order, so comparisons, `ORDER BY`, `BETWEEN` and indexes need nothing special. Compare against literals in the same form (`at >= '2024-03-01'`).
 
@@ -112,7 +131,9 @@ RETURNING views;
 
 **Parameters.** Use `?` or `$1` placeholders with `execute_with` and `query`, or `prepare` a statement once and run it many times. Parameters are always values, never SQL, so they are safe from injection.
 
-**Transactions.** Every statement is atomic: if it fails partway, none of its changes remain. A session can group statements with `BEGIN` ... `COMMIT`. Inside one, `SAVEPOINT name` marks a point that `ROLLBACK TO name` returns to, undoing only the changes since; the savepoint stays open, and `RELEASE name` forgets it. Uncommitted changes are visible only to their own session, and a failing statement inside a transaction is undone without aborting the rest. `BEGIN` takes the database's write lock, like SQLite's `BEGIN IMMEDIATE`. Writers therefore take turns and transactions are serializable. Reads outside a transaction never wait and see the latest committed data.
+**Transactions.** Every statement is atomic: if it fails partway, none of its changes remain. A session can group statements with `BEGIN` ... `COMMIT`. Inside one, `SAVEPOINT name` marks a point that `ROLLBACK TO name` returns to, undoing only the changes since; the savepoint stays open, and `RELEASE name` forgets it. Uncommitted changes are visible only to their own session, and a failing statement inside a transaction is undone without aborting the rest. `BEGIN` takes the database's write lock, like SQLite's `BEGIN IMMEDIATE`. Writers therefore take turns and transactions are serializable.
+
+**Snapshots (MVCC).** Reads never wait for writers, and never see part of a commit. Every statement outside a transaction reads a snapshot: the database as of the last commit when it started, however long it runs. `BEGIN READ ONLY` (or `START TRANSACTION READ ONLY`) holds one snapshot for the whole transaction, so all its queries agree with each other while other sessions keep committing. It doesn't take the write lock, so it never blocks a writer, and it refuses to write. Every commit has a sequence number, and so does each entry in the memtable. When a write replaces a value that an open snapshot may still need, the memtable keeps the old version until the memtable is dropped. Files on disk never change, so a snapshot simply keeps reading the ones it started with. A snapshot costs about 30 ns to take, and writes pay for old versions only while snapshots are open.
 
 **Notifications.** `LISTEN`, `UNLISTEN` and `NOTIFY` work as in PostgreSQL:
 
@@ -135,7 +156,6 @@ The shell prints notifications after each statement, as `psql` does. The Node cl
 
 Embedded, notifications travel between the sessions of one process, because only one process can open a database directory. Through [`spiro-server`](#server-and-replication) they reach any client, and replicas deliver them too.
 
-**Not supported yet:** `RIGHT`/`FULL` joins, which the parser reports with a clear error.
 
 ### How SQL maps onto the storage engine
 
@@ -482,8 +502,8 @@ bench/compare.sh                             # side by side with SQLite and Post
 
 ## Roadmap
 
-- **SQL:** `RIGHT` and `FULL` joins, and a cost-based join order.
-- **Concurrency:** snapshots and MVCC through sequence numbers, so transactions read a consistent point in time and readers never see a half-applied scan.
+- **SQL:** a cost-based join order, and hash joins for large unindexed joins.
+- **Concurrency:** writers that run side by side, with conflict detection on top of the snapshots (today writers take turns).
 - **Storage:** leveled compaction across L1–L6 with 10× size ratios (today's two levels re-merge all of level 1 as data grows), and group commit so concurrent writers share one log write and one fsync.
 - **Speed:** keys and values of the memtable in one contiguous arena (recent writes interleaved with older data are now the slowest part of a full scan), batched execution for joins and plain scans as well as aggregates, and block compression implemented from scratch.
 - **Replication:** automatic failover by consensus (Raft) among the servers, TLS and authentication on the server, and replicas fed from other replicas to fan out further.

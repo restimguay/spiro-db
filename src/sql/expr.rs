@@ -16,9 +16,11 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use super::ast::{BinaryOp, Expr, Select, UnaryOp, is_aggregate};
 use super::catalog::TableSchema;
 use super::datetime::{self, Kind, Moment};
+use super::decimal::Decimal;
 use super::encoding::{encode_key, encode_keys};
 use super::exec;
 use super::functions::{self, Scalar};
+use super::json_functions::{self, JsonFn};
 use super::plan::{CteScope, SelectPlan, WINDOW_BASE, WINDOW_TABLE, plan_select};
 use super::txn::Txn;
 use super::value::{DataType, Value, sql_error};
@@ -76,7 +78,8 @@ pub enum SubqueryKind {
     /// `EXISTS (SELECT ...)`
     Exists,
     /// `expr IN (SELECT x ...)`
-    In(Box<BExpr>),
+    /// `expr IN (SELECT x ...)`, or `(a, b) IN (SELECT x, y ...)`.
+    In(Vec<BExpr>),
 }
 
 impl fmt::Debug for Subquery {
@@ -109,6 +112,11 @@ fn set_key(value: &Value) -> Vec<u8> {
         Value::Real(r) if r.fract() == 0.0 && *r >= i64::MIN as f64 && *r < i64::MAX as f64 => {
             encode_key(&mut key, &Value::Integer(*r as i64))
         }
+        // Decimals meet integers and reals on equal terms.
+        Value::Decimal(d) => match d.to_i64() {
+            Some(i) => encode_key(&mut key, &Value::Integer(i)),
+            None => return set_key(&Value::Real(d.to_f64())),
+        },
         v => encode_key(&mut key, v),
     }
     key
@@ -156,11 +164,11 @@ impl Subquery {
             SubqueryKind::In(_) => {
                 let (mut keys, mut null) = (HashSet::new(), false);
                 exec::stream_plan(txn, &self.plan, &params, &mut |row| {
-                    match &row[0] {
-                        Value::Null => null = true,
-                        v => {
-                            keys.insert(set_key(v));
-                        }
+                    // A row with a NULL might equal anything: the answer can then be unknown.
+                    if row.iter().any(Value::is_null) {
+                        null = true;
+                    } else {
+                        keys.insert(row.iter().flat_map(set_key).collect::<Vec<u8>>());
                     }
                     Ok(true)
                 })?;
@@ -184,10 +192,10 @@ impl Subquery {
                 if keys.is_empty() && !null {
                     return Ok(Value::Boolean(false));
                 }
-                let v = e.eval(row, env)?;
-                if v.is_null() {
+                let values = e.iter().map(|e| e.eval(row, env)).collect::<Result<Vec<_>>>()?;
+                if values.iter().any(Value::is_null) {
                     Value::Null
-                } else if keys.contains(&set_key(&v)) {
+                } else if keys.contains(&values.iter().flat_map(set_key).collect::<Vec<u8>>()) {
                     Value::Boolean(true)
                 } else if *null {
                     Value::Null
@@ -209,6 +217,9 @@ pub struct ScopeColumn {
     /// The name the column's table goes by in the query (its alias, if any).
     pub table: String,
     pub name: String,
+    /// A column joined with USING, which the column it equals stands for:
+    /// unqualified names and `SELECT *` pass over it.
+    pub merged: bool,
 }
 
 /// The columns of the rows that expressions are evaluated against, in order.
@@ -225,7 +236,11 @@ impl Scope {
     }
 
     pub fn add_table(&mut self, table: &TableSchema, binding: &str) {
-        let columns = table.columns.iter().map(|c| ScopeColumn { table: binding.to_string(), name: c.name.clone() });
+        let columns = table.columns.iter().map(|c| ScopeColumn {
+            table: binding.to_string(),
+            name: c.name.clone(),
+            merged: false,
+        });
         self.columns.extend(columns);
     }
 
@@ -236,7 +251,7 @@ impl Scope {
     pub fn resolve(&self, table: Option<&str>, name: &str) -> Result<usize> {
         let mut found = None;
         for (i, c) in self.columns.iter().enumerate() {
-            if c.name == name && table.is_none_or(|t| c.table == t) {
+            if c.name == name && table.map_or(!c.merged, |t| c.table == t) {
                 if found.is_some() {
                     return Err(sql_error(format!("ambiguous column name: {name}")));
                 }
@@ -320,7 +335,7 @@ impl BExpr {
             BExpr::Subquery(s) => {
                 s.outer.iter_mut().for_each(&mut each);
                 if let SubqueryKind::In(e) = &mut s.kind {
-                    each(e);
+                    e.iter_mut().for_each(&mut each);
                 }
             }
             BExpr::Case(operand, branches, otherwise) => {
@@ -356,7 +371,7 @@ impl BExpr {
             BExpr::Subquery(s) => {
                 s.outer.iter().for_each(|x| x.visit(f));
                 if let SubqueryKind::In(e) = &s.kind {
-                    e.visit(f);
+                    e.iter().for_each(|e| e.visit(f));
                 }
             }
             BExpr::Case(operand, branches, otherwise) => {
@@ -409,6 +424,7 @@ impl BExpr {
                 Value::Null => Value::Null,
                 Value::Integer(i) => Value::Integer(i.checked_neg().ok_or_else(|| sql_error("integer overflow"))?),
                 Value::Real(r) => Value::Real(-r),
+                Value::Decimal(d) => Value::Decimal(d.negate()),
                 v => return Err(sql_error(format!("cannot negate {}", v.type_name()))),
             },
             BExpr::Not(e) => operand(e, row, env)?.truth()?.map_or(Value::Null, |b| Value::Boolean(!b)),
@@ -526,6 +542,7 @@ fn binary(op: BinaryOp, a: &BExpr, b: &BExpr, row: &[Value], env: &Env) -> Resul
         }
         BinaryOp::Concat => match (&*operand(a, row, env)?, &*operand(b, row, env)?) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Blob(x), Value::Blob(y)) => Ok(Value::Blob([x.as_slice(), y].concat())),
             (x, y) => Ok(Value::Text(format!("{x}{y}"))),
         },
         op => arithmetic(op, &*operand(a, row, env)?, &*operand(b, row, env)?),
@@ -546,9 +563,26 @@ pub fn arithmetic(op: BinaryOp, a: &Value, b: &Value) -> Result<Value> {
             };
             return result.map(Value::Integer).ok_or_else(|| sql_error("integer overflow"));
         }
-        (Value::Integer(_) | Value::Real(_), Value::Integer(_) | Value::Real(_)) => {
-            (a.as_f64().unwrap(), b.as_f64().unwrap())
+        // Exact when no REAL is involved.
+        (Value::Integer(_) | Value::Decimal(_), Value::Integer(_) | Value::Decimal(_)) => {
+            let exact = |v: &Value| match v {
+                Value::Decimal(d) => *d,
+                Value::Integer(i) => Decimal::from_i64(*i),
+                _ => unreachable!("only integers and decimals here"),
+            };
+            let (x, y) = (exact(a), exact(b));
+            return Ok(Value::Decimal(match op {
+                BinaryOp::Add => x.checked_add(y)?,
+                BinaryOp::Sub => x.checked_sub(y)?,
+                BinaryOp::Mul => x.checked_mul(y)?,
+                BinaryOp::Div => x.checked_div(y)?,
+                _ => x.checked_rem(y)?,
+            }));
         }
+        (
+            Value::Integer(_) | Value::Real(_) | Value::Decimal(_),
+            Value::Integer(_) | Value::Real(_) | Value::Decimal(_),
+        ) => (a.as_f64().unwrap(), b.as_f64().unwrap()),
         _ => return Err(sql_error(format!("cannot apply {op} to {} and {}", a.type_name(), b.type_name()))),
     };
     if matches!(op, BinaryOp::Div | BinaryOp::Rem) && y == 0.0 {
@@ -620,6 +654,7 @@ pub enum Function {
     Datediff,
     Interval,
     Scalar(Scalar),
+    Json(JsonFn),
 }
 
 impl Function {
@@ -651,9 +686,10 @@ impl Function {
             "date_sub" | "subdate" => (Function::DateSub, args == 2),
             "datediff" => (Function::Datediff, args == 2),
             "interval" => (Function::Interval, args == 1),
-            _ => match functions::resolve(name, args) {
-                Some((scalar, ok)) => (Function::Scalar(scalar), ok),
-                None => return Err(sql_error(format!("no such function: {name}"))),
+            _ => match (functions::resolve(name, args), json_functions::resolve(name, args)) {
+                (Some((scalar, ok)), _) => (Function::Scalar(scalar), ok),
+                (_, Some((json, ok))) => (Function::Json(json), ok),
+                _ => return Err(sql_error(format!("no such function: {name}"))),
             },
         };
         if !arity_ok {
@@ -667,6 +703,7 @@ impl Function {
         let takes_nulls = match self {
             Function::Coalesce | Function::Nullif | Function::Typeof => true,
             Function::Scalar(scalar) => scalar.takes_nulls(),
+            Function::Json(json) => json.takes_nulls(),
             _ => false,
         };
         if !takes_nulls && args.iter().any(Value::is_null) {
@@ -676,10 +713,14 @@ impl Function {
             Function::Abs => match &args[0] {
                 Value::Integer(i) => Value::Integer(i.checked_abs().ok_or_else(|| sql_error("integer overflow"))?),
                 Value::Real(r) => Value::Real(r.abs()),
+                Value::Decimal(d) => Value::Decimal(d.abs()),
                 v => return Err(sql_error(format!("abs() needs a number, got {}", v.type_name()))),
             },
             Function::Coalesce => args.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null),
-            Function::Length => Value::Integer(text(&args[0]).chars().count() as i64),
+            Function::Length => match &args[0] {
+                Value::Blob(b) => Value::Integer(b.len() as i64),
+                v => Value::Integer(text(v).chars().count() as i64),
+            },
             Function::Lower => Value::Text(text(&args[0]).to_lowercase()),
             Function::Upper => Value::Text(text(&args[0]).to_uppercase()),
             Function::Trim => Value::Text(text(&args[0]).trim().to_string()),
@@ -699,6 +740,7 @@ impl Function {
                 };
                 match &args[0] {
                     Value::Integer(i) => Value::Integer(*i),
+                    Value::Decimal(d) => Value::Decimal(d.round(digits)?),
                     Value::Real(r) => {
                         let scale = 10f64.powi(digits);
                         Value::Real((r * scale).round() / scale)
@@ -743,6 +785,7 @@ impl Function {
             Function::Datediff => datetime::datediff(&args[0], &args[1])?,
             Function::Interval => datetime::interval(&args[0])?,
             Function::Scalar(scalar) => scalar.call(args)?,
+            Function::Json(json) => json.call(args)?,
         })
     }
 
@@ -776,6 +819,10 @@ pub enum AggFunc {
     VarPop,
     StddevSamp,
     StddevPop,
+    /// `json_group_array` and `json_agg`.
+    JsonArray,
+    /// `json_group_object` and `json_object_agg`.
+    JsonObject,
 }
 
 impl AggFunc {
@@ -794,6 +841,8 @@ impl AggFunc {
             "var_pop" => AggFunc::VarPop,
             "stddev" | "stddev_samp" => AggFunc::StddevSamp,
             "stddev_pop" => AggFunc::StddevPop,
+            "json_group_array" | "json_agg" => AggFunc::JsonArray,
+            "json_group_object" | "json_object_agg" => AggFunc::JsonObject,
             _ => return None,
         })
     }
@@ -831,7 +880,23 @@ impl Aggregate {
                 _ => Err(sql_error(format!("{name}(*) is not allowed; only count(*)"))),
             };
         }
+        // A value a JSON function made nests as JSON, not as a string.
+        let mut json = |e: &Expr| -> Result<BExpr> {
+            let bound = bind(e)?;
+            Ok(match e {
+                Expr::Function { name, .. } if json_functions::produces_json(name) => {
+                    BExpr::Call(Function::Json(JsonFn::Embed), vec![bound])
+                }
+                _ => bound,
+            })
+        };
         match (func, args) {
+            (AggFunc::JsonObject, [key, value]) => {
+                let pair = vec![json(key)?, json(value)?];
+                aggregate.arg = Some(BExpr::Call(Function::Json(JsonFn::Pair), pair));
+            }
+            (AggFunc::JsonObject, _) => return Err(sql_error(format!("{name}() takes a key and a value"))),
+            (AggFunc::JsonArray, [arg]) => aggregate.arg = Some(json(arg)?),
             (_, [arg]) => aggregate.arg = Some(bind(arg)?),
             (AggFunc::Concat, [arg, separator]) => {
                 let Expr::Literal(Value::Text(separator)) = separator else {
@@ -918,14 +983,23 @@ impl<'a> Binder<'a> {
 
     /// Plans a subquery of a query whose rows look like `scope` (`None`: the
     /// subquery may not read them).
-    fn subquery(&self, select: &Select, scope: Option<&Scope>, kind: SubqueryKind, one_column: bool) -> Result<BExpr> {
+    fn subquery(
+        &self,
+        select: &Select,
+        scope: Option<&Scope>,
+        kind: SubqueryKind,
+        columns: Option<usize>,
+    ) -> Result<BExpr> {
         let txn = self.txn.ok_or_else(|| sql_error("a subquery can't be used here"))?;
         let empty = Scope::default();
         let outer = Outer { scope: scope.unwrap_or(&empty), refs: RefCell::default() };
         let binder = Binder { txn: Some(txn), outer: Some(&outer), ..*self };
         let plan = plan_select(txn, select, &binder)?;
-        if one_column && plan.columns.len() != 1 {
-            return Err(sql_error(format!("a subquery here must return one column, not {}", plan.columns.len())));
+        if let Some(wanted) = columns
+            && plan.columns.len() != wanted
+        {
+            let wanted = if wanted == 1 { "one column".to_string() } else { format!("{wanted} columns") };
+            return Err(sql_error(format!("a subquery here must return {wanted}, not {}", plan.columns.len())));
         }
         let outer = outer.refs.into_inner().into_iter().map(BExpr::Column).collect();
         Ok(BExpr::Subquery(Box::new(Subquery {
@@ -990,14 +1064,18 @@ impl<'a> Binder<'a> {
             return Ok(bound);
         }
         match expr {
-            Expr::Subquery(select) => return self.subquery(select, scope, SubqueryKind::Scalar, true),
+            Expr::Subquery(select) => return self.subquery(select, scope, SubqueryKind::Scalar, Some(1)),
             Expr::Exists { select, negated } => {
-                let exists = self.subquery(select, scope, SubqueryKind::Exists, false)?;
+                let exists = self.subquery(select, scope, SubqueryKind::Exists, None)?;
                 return Ok(if *negated { BExpr::Not(Box::new(exists)) } else { exists });
             }
             Expr::InSubquery { expr: left, select, negated } => {
-                let left = self.tree(left, scope, leaf)?;
-                let found = self.subquery(select, scope, SubqueryKind::In(Box::new(left)), true)?;
+                let left = match &**left {
+                    Expr::Row(items) => items.iter().map(|e| self.tree(e, scope, leaf)).collect::<Result<Vec<_>>>()?,
+                    e => vec![self.tree(e, scope, leaf)?],
+                };
+                let columns = left.len();
+                let found = self.subquery(select, scope, SubqueryKind::In(left), Some(columns))?;
                 return Ok(if *negated { BExpr::Not(Box::new(found)) } else { found });
             }
             _ => {}
@@ -1031,7 +1109,19 @@ impl<'a> Binder<'a> {
                     )));
                 }
                 let function = Function::resolve(name, args.len())?;
-                BExpr::Call(function, args.iter().map(|a| sub(a).map(|b| *b)).collect::<Result<_>>()?)
+                let mut bound: Vec<BExpr> = args.iter().map(|a| sub(a).map(|b| *b)).collect::<Result<_>>()?;
+                // A value a JSON function made nests as JSON, not as a string.
+                if json_functions::builds_json(name) {
+                    for (arg, b) in args.iter().zip(&mut bound) {
+                        if let Expr::Function { name, .. } = arg
+                            && json_functions::produces_json(name)
+                        {
+                            let inner = std::mem::replace(b, BExpr::Literal(Value::Null));
+                            *b = BExpr::Call(Function::Json(JsonFn::Embed), vec![inner]);
+                        }
+                    }
+                }
+                BExpr::Call(function, bound)
             }
             Expr::Cast { expr, ty } => BExpr::Cast(sub(expr)?, *ty),
             Expr::Case { operand, branches, otherwise } => {
@@ -1040,6 +1130,7 @@ impl<'a> Binder<'a> {
                 BExpr::Case(operand, branches, otherwise.as_deref().map(&mut sub).transpose()?)
             }
             Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => unreachable!("bound above"),
+            Expr::Row(_) => return Err(sql_error("a row value can only be compared, or tested with IN")),
             Expr::Window { name, .. } => {
                 return Err(sql_error(format!(
                     "window function {name}() is allowed only in the select list and ORDER BY, and not inside another"
@@ -1070,6 +1161,8 @@ enum State {
     Count(i64),
     Sum(Value),
     Avg(f64, i64),
+    /// `avg` over decimals, kept exact.
+    AvgDecimal(Decimal, i64),
     Min(Value),
     Max(Value),
     Total(f64),
@@ -1085,6 +1178,8 @@ enum State {
         mean: f64,
         m2: f64,
     },
+    JsonArray(Vec<crate::json::Json>),
+    JsonObject(Vec<(String, crate::json::Json)>),
 }
 
 impl Accumulator {
@@ -1099,6 +1194,8 @@ impl Accumulator {
             AggFunc::Concat => State::Concat(aggregate.separator.clone(), None),
             AggFunc::BoolAnd => State::BoolAnd(None),
             AggFunc::BoolOr => State::BoolOr(None),
+            AggFunc::JsonArray => State::JsonArray(Vec::new()),
+            AggFunc::JsonObject => State::JsonObject(Vec::new()),
             func => State::Variance { func, n: 0, mean: 0.0, m2: 0.0 },
         };
         Accumulator { state, seen: aggregate.distinct.then(HashSet::new) }
@@ -1300,6 +1397,11 @@ impl Accumulator {
 
     /// Adds the aggregate's argument as evaluated for one row.
     pub fn add_value(&mut self, value: Cow<Value>) -> Result<()> {
+        // json_group_array keeps NULLs, as JSON nulls.
+        if let State::JsonArray(items) = &mut self.state {
+            items.push(json_functions::to_json(&value));
+            return Ok(());
+        }
         if value.is_null() {
             return Ok(()); // aggregates skip NULLs
         }
@@ -1311,9 +1413,21 @@ impl Accumulator {
             }
         }
         let numeric = |v: &Value, name: &str| match v {
-            Value::Integer(_) | Value::Real(_) => Ok(()),
+            Value::Integer(_) | Value::Real(_) | Value::Decimal(_) => Ok(()),
             v => Err(sql_error(format!("{name}() needs numbers, got {}", v.type_name()))),
         };
+        // An average of decimals stays exact; a REAL among them makes it approximate.
+        match (&self.state, &*value) {
+            (State::Avg(_, 0), Value::Decimal(d)) => {
+                self.state = State::AvgDecimal(*d, 1);
+                return Ok(());
+            }
+            (State::AvgDecimal(sum, n), Value::Real(r)) => {
+                self.state = State::Avg(sum.to_f64() + r, n + 1);
+                return Ok(());
+            }
+            _ => {}
+        }
         match &mut self.state {
             State::Count(n) => *n += 1,
             State::Sum(sum) => {
@@ -1323,6 +1437,15 @@ impl Accumulator {
             State::Avg(sum, n) => {
                 numeric(&value, "avg")?;
                 *sum += value.as_f64().unwrap();
+                *n += 1;
+            }
+            State::AvgDecimal(sum, n) => {
+                let x = match &*value {
+                    Value::Decimal(d) => *d,
+                    Value::Integer(i) => Decimal::from_i64(*i),
+                    v => return Err(sql_error(format!("avg() needs numbers, got {}", v.type_name()))),
+                };
+                *sum = sum.checked_add(x)?;
                 *n += 1;
             }
             State::Min(min) => {
@@ -1354,6 +1477,17 @@ impl Accumulator {
                 let b = boolean(&value, "bool_or")?;
                 *any = Some(any.unwrap_or(false) || b);
             }
+            State::JsonArray(_) => unreachable!("handled above"),
+            State::JsonObject(fields) => {
+                let pair = crate::json::Json::parse(&value.to_string()).ok();
+                match pair.as_ref().and_then(|p| p.as_array()) {
+                    Some([crate::json::Json::Str(key), value]) => fields.push((key.clone(), value.clone())),
+                    Some([crate::json::Json::Null, _]) => {
+                        return Err(sql_error("json_group_object() keys can't be NULL"));
+                    }
+                    _ => return Err(sql_error("json_group_object() keys must be text")),
+                }
+            }
             State::Variance { n, mean, m2, .. } => {
                 numeric(&value, "variance")?;
                 let x = value.as_f64().unwrap();
@@ -1379,6 +1513,18 @@ impl Accumulator {
                 *sum += other_sum;
                 *n += other_n;
             }
+            (State::AvgDecimal(sum, n), State::AvgDecimal(other_sum, other_n)) => {
+                *sum = sum.checked_add(other_sum)?;
+                *n += other_n;
+            }
+            (State::Avg(sum, n), State::AvgDecimal(other_sum, other_n)) => {
+                *sum += other_sum.to_f64();
+                *n += other_n;
+            }
+            (state @ State::AvgDecimal(..), State::Avg(other_sum, other_n)) => {
+                let State::AvgDecimal(sum, n) = *state else { unreachable!() };
+                *state = State::Avg(sum.to_f64() + other_sum, n + other_n);
+            }
             (State::Min(a), State::Min(b)) if !b.is_null() && (a.is_null() || b.total_cmp(a) == Ordering::Less) => {
                 *a = b;
             }
@@ -1386,6 +1532,8 @@ impl Accumulator {
                 *a = b;
             }
             (State::Total(a), State::Total(b)) => *a += b,
+            (State::JsonArray(a), State::JsonArray(b)) => a.extend(b),
+            (State::JsonObject(a), State::JsonObject(b)) => a.extend(b),
             (State::Concat(separator, a), State::Concat(_, Some(b))) => match a {
                 Some(a) => {
                     a.push_str(separator);
@@ -1413,8 +1561,11 @@ impl Accumulator {
             State::Count(n) => Value::Integer(n),
             State::Avg(_, 0) => Value::Null,
             State::Avg(sum, n) => Value::Real(sum / n as f64),
+            State::AvgDecimal(sum, n) => sum.checked_div(Decimal::from_i64(n)).map_or(Value::Null, Value::Decimal),
             State::Sum(v) | State::Min(v) | State::Max(v) => v,
             State::Total(sum) => Value::Real(sum),
+            State::JsonArray(items) => Value::Text(crate::json::Json::Array(items).to_string()),
+            State::JsonObject(fields) => Value::Text(crate::json::Json::Object(fields).to_string()),
             State::Concat(_, text) => text.map_or(Value::Null, Value::Text),
             State::BoolAnd(b) | State::BoolOr(b) => b.map_or(Value::Null, Value::Boolean),
             State::Variance { func, n, m2, .. } => {

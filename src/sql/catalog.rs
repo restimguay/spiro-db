@@ -181,7 +181,7 @@ impl TableSchema {
         put_varint(&mut b, self.columns.len() as u64);
         for c in &self.columns {
             put_bytes(&mut b, c.name.as_bytes());
-            b.push(type_code(c.ty));
+            put_type(&mut b, c.ty);
             b.push(u8::from(c.not_null));
             match &c.default {
                 None => b.push(if c.default_now { 2 } else { 0 }),
@@ -225,7 +225,7 @@ impl TableSchema {
         let name = string(&mut r)?;
         let mut columns = Vec::new();
         for _ in 0..r.varint()? {
-            let (name, ty, not_null) = (string(&mut r)?, type_from_code(r.u8()?)?, r.u8()? != 0);
+            let (name, ty, not_null) = (string(&mut r)?, get_type(&mut r)?, r.u8()? != 0);
             let (default, default_now) = match r.u8()? {
                 0 => (None, false),
                 1 => (Some(decode_value(&mut r)?), false),
@@ -375,8 +375,8 @@ fn string(r: &mut Reader) -> Result<String> {
     String::from_utf8(r.len_prefixed()?.to_vec()).map_err(|_| corruption("schema name is not UTF-8"))
 }
 
-fn type_code(ty: DataType) -> u8 {
-    match ty {
+fn put_type(b: &mut Vec<u8>, ty: DataType) {
+    let code = match ty {
         DataType::Integer => 1,
         DataType::Real => 2,
         DataType::Text => 3,
@@ -384,7 +384,23 @@ fn type_code(ty: DataType) -> u8 {
         DataType::Date => 5,
         DataType::Time => 6,
         DataType::Timestamp => 7,
-    }
+        DataType::Blob => 8,
+        DataType::Decimal(None) => 9,
+        DataType::Decimal(Some((precision, scale))) => {
+            b.extend_from_slice(&[10, precision]);
+            scale
+        }
+    };
+    b.push(code);
+}
+
+fn get_type(r: &mut Reader) -> Result<DataType> {
+    Ok(match r.u8()? {
+        8 => DataType::Blob,
+        9 => DataType::Decimal(None),
+        10 => DataType::Decimal(Some((r.u8()?, r.u8()?))),
+        code => type_from_code(code)?,
+    })
 }
 
 fn action_code(action: FkAction) -> u8 {

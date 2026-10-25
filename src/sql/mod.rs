@@ -27,16 +27,19 @@ mod ast;
 mod catalog;
 mod columnar;
 mod datetime;
+mod decimal;
 mod encoding;
 mod exec;
 mod expr;
 mod functions;
 mod integrity;
+mod json_functions;
 mod lexer;
 mod notify;
 mod parser;
 mod plan;
 pub(crate) mod repl;
+mod system;
 mod txn;
 mod value;
 mod vector;
@@ -53,6 +56,7 @@ use crate::error::{Error, Result};
 use crate::options::Options;
 
 use ast::Statement;
+pub use decimal::Decimal;
 use notify::{Inbox, Notifier};
 pub use notify::{Notification, NotificationReceiver};
 use repl::{EPOCH_KEY, EPOCHS_KEY, Entry, Replication, SEQ_KEY, SNAPSHOT_END_KEY, encode_u64};
@@ -501,7 +505,7 @@ pub(crate) fn route(sql: &str) -> Route {
     for (statement, _) in &statements {
         route.read_only &= statement.is_read_only();
         match statement {
-            Statement::Begin => route.in_transaction = Some(true),
+            Statement::Begin { .. } => route.in_transaction = Some(true),
             Statement::Commit | Statement::Rollback => route.in_transaction = Some(false),
             Statement::Listen(_) => route.listens = true,
             _ => {}
@@ -696,12 +700,14 @@ impl Session {
     fn run(&mut self, prepared: &Prepared, params: &[Value]) -> Result<QueryResult> {
         let statement = &prepared.statement;
         match statement {
-            Statement::Begin => {
+            Statement::Begin { read_only } => {
                 if self.txn.is_some() {
                     return Err(Error::Sql("a transaction is already open".into()));
                 }
-                // A replica's transactions can only read, so they needn't wait for the write lock.
-                let txn = if self.db.shared.repl.is_replica() { self.db.read_txn() } else { self.db.write_txn()? };
+                // A transaction that only reads (as every one on a replica
+                // does) reads a snapshot, and needn't wait for the write lock.
+                let reads = *read_only || self.db.shared.repl.is_replica();
+                let txn = if reads { self.db.read_txn() } else { self.db.write_txn()? };
                 self.txn = Some(txn.with_statement_undo());
                 Ok(QueryResult::Done("BEGIN"))
             }
@@ -751,6 +757,9 @@ impl Session {
                 Err(Error::ReadOnly("this database is a read-only replica; send writes to the primary".into()))
             }
             _ => match &mut self.txn {
+                Some(txn) if txn.is_read_only() && !statement.is_read_only() => {
+                    Err(Error::ReadOnly("this transaction is READ ONLY; it can't write".into()))
+                }
                 Some(txn) => {
                     txn.begin_statement();
                     let result = exec::execute(txn, statement, params, &prepared.plans);

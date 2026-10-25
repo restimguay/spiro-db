@@ -281,8 +281,8 @@ mod tests {
                 None => batch.delete(k),
             };
         }
-        mem.apply(&batch);
-        Box::new(mem.iter(Bound::Unbounded))
+        mem.apply(&batch, 1, 0);
+        Box::new(mem.iter(Bound::Unbounded, None))
     }
 
     #[test]
@@ -309,10 +309,10 @@ mod tests {
                     batch.put(&key, format!("s{source}").as_bytes());
                 }
             }
-            mem.apply(&batch);
+            mem.apply(&batch, 1, 0);
             // Older sources only fill in keys no newer source has.
             let map: Vec<_> = {
-                let mut it = mem.iter(Bound::Unbounded);
+                let mut it = mem.iter(Bound::Unbounded, None);
                 it.seek(b"");
                 let mut entries = Vec::new();
                 while it.valid() {
@@ -324,7 +324,7 @@ mod tests {
             for (k, v) in map {
                 model.entry(k).or_insert(v);
             }
-            sources.push(Box::new(mem.iter(Bound::Unbounded)) as Box<dyn KvIter>);
+            sources.push(Box::new(mem.iter(Bound::Unbounded, None)) as Box<dyn KvIter>);
         }
         let mut merged = MergeIter::new(sources);
         for _ in 0..50 {

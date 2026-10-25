@@ -10,6 +10,8 @@ pub enum Token {
     QuotedIdent(String),
     Number(String),
     String(String),
+    /// `X'0aff'`: bytes written in hexadecimal.
+    Blob(Vec<u8>),
     /// `?` (positional, `None`) or `$N`.
     Param(Option<usize>),
     LParen,
@@ -29,6 +31,10 @@ pub enum Token {
     Gt,
     GtEq,
     Concat,
+    /// `->`: a JSON member or element, as JSON.
+    Arrow,
+    /// `->>`: a JSON member or element, as a value.
+    LongArrow,
     Eof,
 }
 
@@ -39,6 +45,7 @@ impl Token {
             Token::QuotedIdent(w) => format!("\"{w}\""),
             Token::Number(n) => n.clone(),
             Token::String(s) => format!("'{s}'"),
+            Token::Blob(b) => format!("X'{}'", b.iter().map(|b| format!("{b:02x}")).collect::<String>()),
             Token::Param(None) => "?".into(),
             Token::Param(Some(n)) => format!("${n}"),
             Token::Eof => "end of input".into(),
@@ -65,6 +72,8 @@ impl Token {
             Token::Gt => ">",
             Token::GtEq => ">=",
             Token::Concat => "||",
+            Token::Arrow => "->",
+            Token::LongArrow => "->>",
             _ => "",
         }
     }
@@ -157,6 +166,16 @@ pub fn tokenize(sql: &str) -> Result<Vec<Located>> {
                 lx.bump();
                 continue;
             }
+            'x' | 'X' if lx.peek(1) == Some('\'') => {
+                lx.bump();
+                let hex = lx.quoted('\'').ok_or_else(|| syntax_error(line, column, "unterminated blob"))?;
+                let bad = || syntax_error(line, column, format!("X'{hex}' is not an even number of hex digits"));
+                if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(bad());
+                }
+                let bytes = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16));
+                Token::Blob(bytes.collect::<std::result::Result<_, _>>().map_err(|_| bad())?)
+            }
             c if c.is_alphabetic() || c == '_' => Token::Word(lx.take_while(|c| c.is_alphanumeric() || c == '_')),
             c if c.is_ascii_digit() || (c == '.' && lx.peek(1).is_some_and(|d| d.is_ascii_digit())) => {
                 let mut n = lx.take_while(|c| c.is_ascii_digit());
@@ -208,6 +227,15 @@ pub fn tokenize(sql: &str) -> Result<Vec<Located>> {
                     ('.', _) => Token::Dot,
                     ('*', _) => Token::Star,
                     ('+', _) => Token::Plus,
+                    ('-', Some('>')) => {
+                        lx.bump();
+                        if lx.peek(0) == Some('>') {
+                            lx.bump();
+                            Token::LongArrow
+                        } else {
+                            Token::Arrow
+                        }
+                    }
                     ('-', _) => Token::Minus,
                     ('/', _) => Token::Slash,
                     ('%', _) => Token::Percent,

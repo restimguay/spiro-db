@@ -80,16 +80,52 @@ impl SuperVersion {
     }
 }
 
-/// A fixed set of memtables and tables to read from. Writes made after it
-/// was taken may or may not show, as with any iterator.
-pub(crate) struct ReadView(Arc<SuperVersion>);
+/// A fixed set of memtables and tables to read from. Without a snapshot,
+/// writes made after it was taken may or may not show, as with any
+/// iterator; with one, exactly those up to the snapshot do.
+#[derive(Clone)]
+pub(crate) struct ReadView {
+    sv: Arc<SuperVersion>,
+    /// The last write batch this view sees, or `None` for whatever is newest.
+    seq: Option<u64>,
+}
 
 impl ReadView {
+    /// The snapshot this view reads at, if any.
+    pub(crate) fn seq(&self) -> Option<u64> {
+        self.seq
+    }
+
+    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let sv = &self.sv;
+        for mem in std::iter::once(&sv.mem).chain(&sv.imm) {
+            if let Some(found) = mem.get_at(key, self.seq) {
+                return Ok(found);
+            }
+        }
+        let version = &sv.version;
+        for table in &version.l0 {
+            if table.covers(key)
+                && let Some(found) = table.get(key)?
+            {
+                return Ok(found);
+            }
+        }
+        let i = version.l1.partition_point(|t| t.meta.largest.as_slice() < key);
+        if let Some(table) = version.l1.get(i)
+            && table.covers(key)
+            && let Some(found) = table.get(key)?
+        {
+            return Ok(found);
+        }
+        Ok(None)
+    }
+
     pub(crate) fn raw_range(&self, start: Bound<&[u8]>, end: Bound<Vec<u8>>) -> RawIter {
-        let sv = &self.0;
-        let mut sources: Vec<Box<dyn KvIter>> = vec![Box::new(sv.mem.iter(end.clone()))];
+        let sv = &self.sv;
+        let mut sources: Vec<Box<dyn KvIter>> = vec![Box::new(sv.mem.iter(end.clone(), self.seq))];
         if let Some(imm) = &sv.imm {
-            sources.push(Box::new(imm.iter(end.clone())));
+            sources.push(Box::new(imm.iter(end.clone(), self.seq)));
         }
         sources.extend(sv.version.l0.iter().map(|t| Box::new(t.iter(true)) as Box<dyn KvIter>));
         sources.push(Box::new(LevelIter::new(sv.version.l1.clone(), true)));
@@ -112,17 +148,17 @@ impl ReadView {
 
     /// The memtables, newest first.
     pub(crate) fn memtables(&self) -> impl Iterator<Item = &Arc<MemTable>> {
-        std::iter::once(&self.0.mem).chain(&self.0.imm)
+        std::iter::once(&self.sv.mem).chain(&self.sv.imm)
     }
 
     /// Level 0's tables, newest first; their key ranges may overlap.
     pub(crate) fn level0(&self) -> &[Arc<Table>] {
-        &self.0.version.l0
+        &self.sv.version.l0
     }
 
     /// Level 1's tables, sorted by key, without overlap.
     pub(crate) fn level1(&self) -> &[Arc<Table>] {
-        &self.0.version.l1
+        &self.sv.version.l1
     }
 
     /// Keys inside `(start, end)` at which to split it into parts of roughly
@@ -132,7 +168,7 @@ impl ReadView {
     /// Memtables contribute sampled keys, one per `SAMPLE_EVERY` entries,
     /// about as many as a table has blocks for the same amount of data.
     pub(crate) fn split_points(&self, start: &Bound<Vec<u8>>, end: &Bound<Vec<u8>>) -> Vec<Cow<'_, [u8]>> {
-        let sv = &self.0;
+        let sv = &self.sv;
         // Level 1's tables are sorted and don't overlap, so its boundaries
         // come in order; each other source's list is sorted too.
         let mut points: Vec<Cow<[u8]>> = sv
@@ -150,6 +186,29 @@ impl ReadView {
             points = merge_sorted(points, mem.sample_keys(start, end).into_iter().map(Cow::Owned).collect());
         }
         points
+    }
+}
+
+/// A consistent point-in-time view; see [`Db::snapshot`].
+pub(crate) struct Snapshot {
+    view: ReadView,
+    inner: Arc<Inner>,
+}
+
+impl Snapshot {
+    pub(crate) fn view(&self) -> &ReadView {
+        &self.view
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        let seq = self.view.seq.expect("a snapshot has a sequence number");
+        let mut snapshots = self.inner.snapshots.lock().unwrap();
+        if let Some(at) = snapshots.iter().rposition(|&s| s == seq) {
+            snapshots.remove(at);
+        }
+        self.inner.newest_snapshot.store(snapshots.last().copied().unwrap_or(0), Ordering::Relaxed);
     }
 }
 
@@ -215,6 +274,16 @@ struct Inner {
     next_file: AtomicU64,
     /// Serialises writers and owns the active log.
     wal: Mutex<WalWriter>,
+    /// The number of the last write batch applied; readers taking a snapshot
+    /// see everything up to it.
+    last_seq: AtomicU64,
+    /// Open snapshots, by sequence number, with how many share each. Held
+    /// by writers while they apply a batch, so a snapshot can't start
+    /// between their reading `newest_snapshot` and their write.
+    snapshots: Mutex<Vec<u64>>,
+    /// The newest open snapshot (0 if none): replaced values a snapshot up
+    /// to it may read are kept.
+    newest_snapshot: AtomicU64,
     /// Serialises MANIFEST rewrites, and holds the log number they record.
     log_number: Mutex<u64>,
     state: Mutex<State>,
@@ -312,7 +381,7 @@ impl Db {
         let recovered = MemTable::new(0);
         for &number in &logs {
             wal::replay(&log_path(&dir, number), |payload| {
-                recovered.apply(&WriteBatch::decode(payload)?);
+                recovered.apply(&WriteBatch::decode(payload)?, 1, 0);
                 Ok(())
             })?;
         }
@@ -355,6 +424,9 @@ impl Db {
             sections: OnceLock::new(),
             next_file,
             wal: Mutex::new(wal),
+            last_seq: AtomicU64::new(0),
+            snapshots: Mutex::default(),
+            newest_snapshot: AtomicU64::new(0),
             log_number: Mutex::new(wal_number),
             read_slots: (0..READ_SLOTS).map(|_| Padded(RwLock::new(SuperVersion::of(&state)))).collect(),
             state: Mutex::new(state),
@@ -405,37 +477,34 @@ impl Db {
             inner.set_bg_error(e.clone());
             return Err(e);
         }
-        mem.apply(batch);
+        // Applied and published under the snapshot lock: a snapshot starts
+        // either before the batch (and its older values are kept for it) or
+        // after (and it sees the batch whole).
+        let snapshots = inner.snapshots.lock().unwrap();
+        let seq = inner.last_seq.load(Ordering::Relaxed) + 1;
+        mem.apply(batch, seq, inner.newest_snapshot.load(Ordering::Relaxed));
+        inner.last_seq.store(seq, Ordering::Release);
+        drop(snapshots);
         Ok(())
     }
 
-    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
-        let key = key.as_ref();
+    /// A consistent view of the database as it is now: later writes don't
+    /// show in it, however long it is kept. Dropping it lets the engine
+    /// forget the old versions it needed.
+    pub(crate) fn snapshot(&self) -> Snapshot {
         let sv = self.inner.super_version();
-        if let Some(found) = sv.mem.get(key) {
-            return Ok(found);
-        }
-        if let Some(imm) = &sv.imm
-            && let Some(found) = imm.get(key)
-        {
-            return Ok(found);
-        }
-        let version = &sv.version;
-        for table in &version.l0 {
-            if table.covers(key)
-                && let Some(found) = table.get(key)?
-            {
-                return Ok(found);
-            }
-        }
-        let i = version.l1.partition_point(|t| t.meta.largest.as_slice() < key);
-        if let Some(table) = version.l1.get(i)
-            && table.covers(key)
-            && let Some(found) = table.get(key)?
-        {
-            return Ok(found);
-        }
-        Ok(None)
+        let mut snapshots = self.inner.snapshots.lock().unwrap();
+        let seq = self.inner.last_seq.load(Ordering::Acquire);
+        // Kept sorted; a snapshot is nearly always the newest, so this is a push.
+        let at = snapshots.partition_point(|&s| s <= seq);
+        snapshots.insert(at, seq);
+        self.inner.newest_snapshot.store(*snapshots.last().unwrap(), Ordering::Relaxed);
+        drop(snapshots);
+        Snapshot { view: ReadView { sv, seq: Some(seq) }, inner: self.inner.clone() }
+    }
+
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+        ReadView { sv: self.inner.super_version(), seq: None }.get(key.as_ref())
     }
 
     /// Iterates over every key/value pair in key order.
@@ -505,7 +574,7 @@ impl Db {
     /// The current memtables and tables, held fixed so several threads can
     /// each read part of a range from the same set.
     pub(crate) fn read_view(&self) -> ReadView {
-        ReadView(self.inner.super_version())
+        ReadView { sv: self.inner.super_version(), seq: None }
     }
 
     /// Writes the memtable out to a table now, rather than when it fills.
@@ -943,6 +1012,53 @@ mod tests {
 
     use super::*;
     use crate::testutil::TempDir;
+
+    #[test]
+    fn snapshots_hold_their_point_in_time() {
+        let dir = TempDir::new("snapshots");
+        let db = Db::open(dir.path()).unwrap();
+        for i in 0..100 {
+            db.put(format!("k{i:03}"), "old").unwrap();
+        }
+        let snapshot = db.snapshot();
+        let mut batch = WriteBatch::new();
+        for i in 0..100 {
+            if i % 2 == 0 {
+                batch.put(format!("k{i:03}"), "new");
+            } else {
+                batch.delete(format!("k{i:03}"));
+            }
+        }
+        batch.put("k999", "added");
+        db.write(&batch).unwrap();
+        let count = |view: &ReadView| {
+            let (mut n, mut old) = (0, 0);
+            view.raw_range(Bound::Unbounded, Bound::Unbounded)
+                .for_each(|_, v| {
+                    n += 1;
+                    old += usize::from(v == b"old");
+                    Ok(true)
+                })
+                .unwrap();
+            (n, old)
+        };
+        assert_eq!(count(snapshot.view()), (100, 100));
+        assert_eq!(count(&db.read_view()), (51, 0));
+        // A flush moves the newest versions to a table; the snapshot still
+        // reads its own memtable, and the old values in it.
+        db.flush().unwrap();
+        assert_eq!(count(snapshot.view()), (100, 100));
+        assert_eq!(snapshot.view().get(b"k001").unwrap(), Some(b"old".to_vec()));
+        assert_eq!(snapshot.view().get(b"k999").unwrap(), None);
+        assert_eq!(db.get(b"k999").unwrap(), Some(b"added".to_vec()));
+        // A snapshot taken after sees the flushed state.
+        let later = db.snapshot();
+        assert_eq!(count(later.view()), (51, 0));
+        drop(snapshot);
+        assert_eq!(db.inner.newest_snapshot.load(Ordering::Relaxed), later.view().seq().unwrap());
+        drop(later);
+        assert_eq!(db.inner.newest_snapshot.load(Ordering::Relaxed), 0);
+    }
 
     struct Rng(u64);
 

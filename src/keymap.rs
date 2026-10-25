@@ -18,7 +18,8 @@
 //!
 //! Entries are never removed (the memtable records deletions as values), so
 //! nodes only ever split. Nodes live in a vector and refer to each other by
-//! index.
+//! index. Each entry carries the sequence number of the write that stored
+//! it, for reading the memtable as of an earlier point.
 
 use std::ops::Bound;
 
@@ -29,11 +30,13 @@ const CAPACITY: usize = 64;
 const NONE: u32 = u32::MAX;
 const FINGERS: usize = 4;
 
-/// Where a value lies in its leaf's buffer; a deletion has no bytes.
+/// Where a value lies in its leaf's buffer (a deletion has no bytes), and
+/// the sequence number of the write that stored it.
 #[derive(Clone, Copy)]
 struct Span {
     start: u32,
     len: u32,
+    seq: u64,
 }
 
 const DELETED: u32 = u32::MAX;
@@ -63,14 +66,14 @@ fn value(data: &[u8], span: Span) -> Option<&[u8]> {
     (span.len != DELETED).then(|| &data[span.start as usize..span.start as usize + span.len as usize])
 }
 
-/// Appends `value` to a leaf buffer and says where it went.
-fn store(data: &mut Vec<u8>, value: Option<&[u8]>) -> Span {
+/// Appends `value`, written by write `seq`, to a leaf buffer and says where it went.
+fn store(data: &mut Vec<u8>, value: Option<&[u8]>, seq: u64) -> Span {
     match value {
-        None => Span { start: 0, len: DELETED },
+        None => Span { start: 0, len: DELETED, seq },
         Some(v) => {
             let start = data.len() as u32;
             data.extend_from_slice(v);
-            Span { start, len: v.len() as u32 }
+            Span { start, len: v.len() as u32, seq }
         }
     }
 }
@@ -79,7 +82,7 @@ fn store(data: &mut Vec<u8>, value: Option<&[u8]>) -> Span {
 fn compacted(data: &[u8], spans: &mut [Span]) -> Vec<u8> {
     let mut out = Vec::with_capacity(spans.iter().map(|s| s.len()).sum());
     for span in spans {
-        *span = store(&mut out, value(data, *span));
+        *span = store(&mut out, value(data, *span), span.seq);
     }
     out
 }
@@ -149,16 +152,18 @@ impl KeyMap {
         }
     }
 
-    /// `None` if the key isn't here; `Some(None)` if it is a deletion.
-    pub fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
+    /// `None` if the key isn't here; `Some(None)` if it is a deletion. With
+    /// the sequence number of its write.
+    pub fn get(&self, key: &[u8]) -> Option<(Option<&[u8]>, u64)> {
         let Node::Leaf { keys, spans, data, .. } = &self.nodes[self.find_leaf(key).0 as usize] else { unreachable!() };
-        search(keys, key).ok().map(|i| value(data, spans[i]))
+        search(keys, key).ok().map(|i| (value(data, spans[i]), spans[i].seq))
     }
 
-    /// Inserts or replaces a value (`None` records a deletion). Returns
-    /// `None` for a new key, or the length of the value replaced (`Some(None)`
-    /// if that was a deletion).
-    pub fn insert(&mut self, key: &[u8], new: Option<&[u8]>) -> Option<Option<usize>> {
+    /// Inserts or replaces a value (`None` records a deletion), written by
+    /// write number `seq`. Returns `None` for a new key, or what it replaced.
+    /// The replaced value's bytes are copied out only if `keep` says so,
+    /// given the replaced write's number.
+    pub fn insert(&mut self, key: &[u8], new: Option<&[u8]>, seq: u64, keep: impl Fn(u64) -> bool) -> Option<Replaced> {
         let (leaf, fingered) = self.find_leaf(key);
         if !fingered {
             self.fingers[self.next_finger] = leaf;
@@ -168,17 +173,19 @@ impl KeyMap {
         match search(keys, key) {
             Ok(i) => {
                 let old = spans[i];
+                let old_seq = old.seq;
+                let kept = keep(old_seq).then(|| value(data, old).map(<[u8]>::to_vec));
                 *garbage += old.len();
-                spans[i] = store(data, new);
+                spans[i] = store(data, new, seq);
                 if *garbage > 4096 && *garbage * 2 > data.len() {
                     *data = compacted(data, spans);
                     *garbage = 0;
                 }
-                return Some((old.len != DELETED).then(|| old.len()));
+                return Some(Replaced { len: (old.len != DELETED).then(|| old.len()), seq: old_seq, kept });
             }
             Err(i) => {
                 keys.insert(i, Key::new(key));
-                let span = store(data, new);
+                let span = store(data, new, seq);
                 spans.insert(i, span);
             }
         }
@@ -262,9 +269,19 @@ impl KeyMap {
         Iter { map: self, leaf, pos }
     }
 
+    #[cfg(test)]
     pub fn iter(&self) -> Iter<'_> {
         self.range_from(Bound::Unbounded)
     }
+}
+
+/// What an insert replaced.
+pub struct Replaced {
+    /// The replaced value's length, `None` if it was a deletion.
+    pub len: Option<usize>,
+    pub seq: u64,
+    /// A copy of the replaced value, if `insert` was asked to keep it.
+    pub kept: Option<Option<Vec<u8>>>,
 }
 
 pub struct Iter<'a> {
@@ -274,7 +291,8 @@ pub struct Iter<'a> {
 }
 
 impl<'a> Iterator for Iter<'a> {
-    type Item = (&'a [u8], Option<&'a [u8]>);
+    /// The key, the value (`None` for a deletion), and the write's number.
+    type Item = (&'a [u8], Option<&'a [u8]>, u64);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -286,7 +304,8 @@ impl<'a> Iterator for Iter<'a> {
             };
             if self.pos < keys.len() {
                 self.pos += 1;
-                return Some((keys[self.pos - 1].as_slice(), value(data, spans[self.pos - 1])));
+                let span = spans[self.pos - 1];
+                return Some((keys[self.pos - 1].as_slice(), value(data, span), span.seq));
             }
             (self.leaf, self.pos) = (*next, 0);
         }
@@ -321,17 +340,19 @@ mod tests {
                 // Values of varying sizes, and deletions.
                 let value = (rand(7) != 0).then(|| format!("{i}-{}", "v".repeat(rand(200) as usize)).into_bytes());
                 let old = model.insert(key.clone(), value.clone());
-                assert_eq!(ours.insert(&key, value.as_deref()), old.map(|v| v.map(|v| v.len())));
+                let replaced = ours.insert(&key, value.as_deref(), i, |_| true);
+                assert_eq!(replaced.as_ref().map(|r| r.len), old.as_ref().map(|v| v.as_ref().map(|v| v.len())));
+                assert_eq!(replaced.and_then(|r| r.kept), old);
             }
             assert_eq!(ours.len(), model.len());
-            let all: Vec<_> = ours.iter().map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect();
+            let all: Vec<_> = ours.iter().map(|(k, v, _)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect();
             assert_eq!(all, model.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>());
             for _ in 0..2_000 {
                 let probe = format!("{:06}", rand(21_000)).into_bytes();
-                assert_eq!(ours.get(&probe), model.get(&probe).map(|v| v.as_deref()));
+                assert_eq!(ours.get(&probe).map(|(v, _)| v), model.get(&probe).map(|v| v.as_deref()));
                 for bound in [Bound::Included(probe.as_slice()), Bound::Excluded(probe.as_slice())] {
                     let got: Vec<_> =
-                        ours.range_from(bound).take(5).map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect();
+                        ours.range_from(bound).take(5).map(|(k, v, _)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect();
                     let want: Vec<_> = model
                         .range::<[u8], _>((bound, Bound::Unbounded))
                         .take(5)

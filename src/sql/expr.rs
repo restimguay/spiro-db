@@ -5,14 +5,203 @@
 //! names are reported before a single row is read.
 
 use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use super::ast::{BinaryOp, Expr, UnaryOp, is_aggregate};
+use super::ast::{BinaryOp, Expr, Select, UnaryOp, is_aggregate};
 use super::catalog::TableSchema;
-use super::encoding::encode_key;
+use super::datetime::{self, Kind, Moment};
+use super::encoding::{encode_key, encode_keys};
+use super::exec;
+use super::plan::{CteScope, SelectPlan, WINDOW_BASE, WINDOW_TABLE, plan_select};
+use super::txn::Txn;
 use super::value::{DataType, Value, sql_error};
 use crate::error::Result;
+
+/// A subquery's id and the outer values it ran with.
+type Remembered = (usize, Vec<u8>);
+
+/// What expressions are evaluated with besides the row: the statement's
+/// parameters, and the transaction that subqueries read from.
+pub struct Env<'a> {
+    pub params: &'a [Value],
+    pub txn: Option<&'a Txn>,
+    /// While a recursive query runs its recursive part: the rows of its
+    /// last round, which its self-reference reads.
+    pub work: Option<(usize, Rc<Vec<Vec<Value>>>)>,
+    /// Subquery results already worked out, by subquery and the values of
+    /// the outer columns it reads: each runs once per distinct outer row.
+    results: RefCell<HashMap<Remembered, Rc<Answer>>>,
+    /// The statement's current time, read from the clock on first use, so
+    /// every `now()` in a statement agrees.
+    now: Cell<Option<Moment>>,
+}
+
+impl<'a> Env<'a> {
+    pub fn new(params: &'a [Value], txn: Option<&'a Txn>) -> Self {
+        Env { params, txn, work: None, results: RefCell::default(), now: Cell::new(None) }
+    }
+
+    fn now(&self) -> Moment {
+        let now = self.now.get().unwrap_or_else(Moment::now);
+        self.now.set(Some(now));
+        now
+    }
+}
+
+/// A subquery in an expression.
+#[derive(Clone)]
+pub struct Subquery {
+    /// Tells this subquery's results apart from others' in an `Env`.
+    pub id: usize,
+    pub kind: SubqueryKind,
+    pub plan: Arc<SelectPlan>,
+    /// Expressions of the enclosing query whose values the subquery reads,
+    /// as parameters numbered after the statement's own.
+    pub outer: Vec<BExpr>,
+    /// How many parameters the statement itself has.
+    pub params: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubqueryKind {
+    /// `(SELECT x ...)`: one value, or NULL if there are no rows.
+    Scalar,
+    /// `EXISTS (SELECT ...)`
+    Exists,
+    /// `expr IN (SELECT x ...)`
+    In(Box<BExpr>),
+}
+
+impl fmt::Debug for Subquery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Subquery#{}({:?}, outer {:?})", self.id, self.kind, self.outer)
+    }
+}
+
+impl PartialEq for Subquery {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+/// What a subquery found.
+enum Answer {
+    Value(Value),
+    /// For IN: the values found (by a key under which equal values meet) and
+    /// whether any was NULL.
+    Set {
+        keys: HashSet<Vec<u8>>,
+        null: bool,
+    },
+}
+
+/// A key under which values that compare equal meet: 1 and 1.0 alike.
+fn set_key(value: &Value) -> Vec<u8> {
+    let mut key = Vec::new();
+    match value {
+        Value::Real(r) if r.fract() == 0.0 && *r >= i64::MIN as f64 && *r < i64::MAX as f64 => {
+            encode_key(&mut key, &Value::Integer(*r as i64))
+        }
+        v => encode_key(&mut key, v),
+    }
+    key
+}
+
+/// Results kept per subquery for correlated ones; past this, they are not.
+const MAX_REMEMBERED: usize = 100_000;
+
+impl Subquery {
+    fn answer(&self, row: &[Value], env: &Env) -> Result<Rc<Answer>> {
+        let txn = env.txn.ok_or_else(|| sql_error("a subquery can't be used here"))?;
+        let outer = self.outer.iter().map(|e| e.eval(row, env)).collect::<Result<Vec<_>>>()?;
+        let mut key = Vec::new();
+        encode_keys(&mut key, &outer);
+        let key = (self.id, key);
+        if let Some(answer) = env.results.borrow().get(&key) {
+            return Ok(answer.clone());
+        }
+        let mut params = env.params[..self.params.min(env.params.len())].to_vec();
+        params.extend(outer);
+        let answer = match self.kind {
+            SubqueryKind::Scalar => {
+                let (mut first, mut more) = (None, false);
+                exec::stream_plan(txn, &self.plan, &params, &mut |row| {
+                    if first.is_some() {
+                        more = true;
+                        return Ok(false);
+                    }
+                    first = Some(row[0].clone());
+                    Ok(true)
+                })?;
+                if more {
+                    return Err(sql_error("a subquery used as a value returned more than one row"));
+                }
+                Answer::Value(first.unwrap_or(Value::Null))
+            }
+            SubqueryKind::Exists => {
+                let mut any = false;
+                exec::stream_plan(txn, &self.plan, &params, &mut |_| {
+                    any = true;
+                    Ok(false) // one row settles it
+                })?;
+                Answer::Value(Value::Boolean(any))
+            }
+            SubqueryKind::In(_) => {
+                let (mut keys, mut null) = (HashSet::new(), false);
+                exec::stream_plan(txn, &self.plan, &params, &mut |row| {
+                    match &row[0] {
+                        Value::Null => null = true,
+                        v => {
+                            keys.insert(set_key(v));
+                        }
+                    }
+                    Ok(true)
+                })?;
+                Answer::Set { keys, null }
+            }
+        };
+        let answer = Rc::new(answer);
+        let mut results = env.results.borrow_mut();
+        if self.outer.is_empty() || results.len() < MAX_REMEMBERED {
+            results.insert(key, answer.clone());
+        }
+        Ok(answer)
+    }
+
+    fn eval(&self, row: &[Value], env: &Env) -> Result<Value> {
+        let answer = self.answer(row, env)?;
+        Ok(match (&self.kind, &*answer) {
+            (SubqueryKind::In(e), Answer::Set { keys, null }) => {
+                // As for IN with a list: no rows is FALSE, even for NULL;
+                // otherwise NULL when unsure.
+                if keys.is_empty() && !null {
+                    return Ok(Value::Boolean(false));
+                }
+                let v = e.eval(row, env)?;
+                if v.is_null() {
+                    Value::Null
+                } else if keys.contains(&set_key(&v)) {
+                    Value::Boolean(true)
+                } else if *null {
+                    Value::Null
+                } else {
+                    Value::Boolean(false)
+                }
+            }
+            (_, Answer::Value(v)) => v.clone(),
+            (_, Answer::Set { .. }) => unreachable!("only IN collects a set"),
+        })
+    }
+}
+
+/// Numbers subqueries, so their results can be kept apart.
+static NEXT_SUBQUERY: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug)]
 pub struct ScopeColumn {
@@ -80,6 +269,7 @@ pub enum BExpr {
     Call(Function, Vec<BExpr>),
     Cast(Box<BExpr>, DataType),
     Case(Option<Box<BExpr>>, Vec<(BExpr, BExpr)>, Option<Box<BExpr>>),
+    Subquery(Box<Subquery>),
 }
 
 impl BExpr {
@@ -103,6 +293,46 @@ impl BExpr {
         });
     }
 
+    /// Renumbers every column the expression reads.
+    pub fn map_columns(&mut self, f: &dyn Fn(usize) -> usize) {
+        if let BExpr::Column(i) = self {
+            *i = f(*i);
+        }
+        let mut each = |e: &mut BExpr| e.map_columns(f);
+        match self {
+            BExpr::Literal(_) | BExpr::Column(_) | BExpr::Param(_) => {}
+            BExpr::Neg(e) | BExpr::Not(e) | BExpr::IsNull(e, _) | BExpr::Cast(e, _) => each(e),
+            BExpr::Binary(_, a, b) | BExpr::Like(a, b, ..) => {
+                each(a);
+                each(b);
+            }
+            BExpr::InList(e, list, _) => {
+                each(e);
+                list.iter_mut().for_each(each);
+            }
+            BExpr::Between(a, b, c, _) => {
+                each(a);
+                each(b);
+                each(c);
+            }
+            BExpr::Call(_, args) => args.iter_mut().for_each(each),
+            BExpr::Subquery(s) => {
+                s.outer.iter_mut().for_each(&mut each);
+                if let SubqueryKind::In(e) = &mut s.kind {
+                    each(e);
+                }
+            }
+            BExpr::Case(operand, branches, otherwise) => {
+                operand.iter_mut().for_each(|e| each(e));
+                for (when, then) in branches {
+                    each(when);
+                    each(then);
+                }
+                otherwise.iter_mut().for_each(|e| each(e));
+            }
+        }
+    }
+
     fn visit(&self, f: &mut dyn FnMut(&BExpr)) {
         f(self);
         match self {
@@ -122,6 +352,12 @@ impl BExpr {
                 c.visit(f);
             }
             BExpr::Call(_, args) => args.iter().for_each(|x| x.visit(f)),
+            BExpr::Subquery(s) => {
+                s.outer.iter().for_each(|x| x.visit(f));
+                if let SubqueryKind::In(e) = &s.kind {
+                    e.visit(f);
+                }
+            }
             BExpr::Case(operand, branches, otherwise) => {
                 operand.iter().for_each(|x| x.visit(f));
                 for (when, then) in branches {
@@ -131,6 +367,13 @@ impl BExpr {
                 otherwise.iter().for_each(|x| x.visit(f));
             }
         }
+    }
+
+    /// Whether a subquery appears anywhere in the expression.
+    pub fn has_subquery(&self) -> bool {
+        let mut found = false;
+        self.visit(&mut |e| found |= matches!(e, BExpr::Subquery(_)));
+        found
     }
 
     /// Splits `a AND b AND c` into `[a, b, c]`.
@@ -150,34 +393,34 @@ impl BExpr {
     }
 
     /// Evaluates the expression as a filter: only TRUE passes.
-    pub fn matches(&self, row: &[Value], params: &[Value]) -> Result<bool> {
-        Ok(self.eval(row, params)?.truth()? == Some(true))
+    pub fn matches(&self, row: &[Value], env: &Env) -> Result<bool> {
+        Ok(self.eval(row, env)?.truth()? == Some(true))
     }
 
-    /// Evaluates the expression against `row`, with `params` supplying the
-    /// values of query parameters.
-    pub fn eval(&self, row: &[Value], params: &[Value]) -> Result<Value> {
+    /// Evaluates the expression against `row`, with `env` supplying the
+    /// values of query parameters (and the transaction, for subqueries).
+    pub fn eval(&self, row: &[Value], env: &Env) -> Result<Value> {
         Ok(match self {
             BExpr::Literal(v) => v.clone(),
             BExpr::Column(i) => row[*i].clone(),
-            BExpr::Param(i) => param(params, *i)?.clone(),
-            BExpr::Neg(e) => match &*operand(e, row, params)? {
+            BExpr::Param(i) => param(env.params, *i)?.clone(),
+            BExpr::Neg(e) => match &*operand(e, row, env)? {
                 Value::Null => Value::Null,
                 Value::Integer(i) => Value::Integer(i.checked_neg().ok_or_else(|| sql_error("integer overflow"))?),
                 Value::Real(r) => Value::Real(-r),
                 v => return Err(sql_error(format!("cannot negate {}", v.type_name()))),
             },
-            BExpr::Not(e) => operand(e, row, params)?.truth()?.map_or(Value::Null, |b| Value::Boolean(!b)),
-            BExpr::Binary(op, a, b) => binary(*op, a, b, row, params)?,
-            BExpr::IsNull(e, negated) => Value::Boolean(operand(e, row, params)?.is_null() != *negated),
+            BExpr::Not(e) => operand(e, row, env)?.truth()?.map_or(Value::Null, |b| Value::Boolean(!b)),
+            BExpr::Binary(op, a, b) => binary(*op, a, b, row, env)?,
+            BExpr::IsNull(e, negated) => Value::Boolean(operand(e, row, env)?.is_null() != *negated),
             BExpr::InList(e, list, negated) => {
-                let v = operand(e, row, params)?;
+                let v = operand(e, row, env)?;
                 if v.is_null() {
                     return Ok(Value::Null);
                 }
                 let mut saw_null = false;
                 for item in list {
-                    match v.compare(&*operand(item, row, params)?)? {
+                    match v.compare(&*operand(item, row, env)?)? {
                         Some(Ordering::Equal) => return Ok(Value::Boolean(!negated)),
                         None => saw_null = true,
                         _ => {}
@@ -186,16 +429,16 @@ impl BExpr {
                 if saw_null { Value::Null } else { Value::Boolean(*negated) }
             }
             BExpr::Between(e, low, high, negated) => {
-                let v = operand(e, row, params)?;
-                let above = v.compare(&*operand(low, row, params)?)?.map(|o| o != Ordering::Less);
-                let below = v.compare(&*operand(high, row, params)?)?.map(|o| o != Ordering::Greater);
+                let v = operand(e, row, env)?;
+                let above = v.compare(&*operand(low, row, env)?)?.map(|o| o != Ordering::Less);
+                let below = v.compare(&*operand(high, row, env)?)?.map(|o| o != Ordering::Greater);
                 match and3(above, below) {
                     None => Value::Null,
                     Some(b) => Value::Boolean(b != *negated),
                 }
             }
             BExpr::Like(e, pattern, negated, case_insensitive) => {
-                match (&*operand(e, row, params)?, &*operand(pattern, row, params)?) {
+                match (&*operand(e, row, env)?, &*operand(pattern, row, env)?) {
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     (Value::Text(s), Value::Text(p)) => Value::Boolean(like(s, p, *case_insensitive) != *negated),
                     (a, b) => {
@@ -203,21 +446,22 @@ impl BExpr {
                     }
                 }
             }
-            BExpr::Call(f, args) => f.call(args.iter().map(|a| a.eval(row, params)).collect::<Result<_>>()?)?,
-            BExpr::Cast(e, ty) => operand(e, row, params)?.cast(*ty)?,
+            BExpr::Call(f, args) => f.call(args.iter().map(|a| a.eval(row, env)).collect::<Result<_>>()?, env)?,
+            BExpr::Cast(e, ty) => operand(e, row, env)?.cast(*ty)?,
             BExpr::Case(case, branches, otherwise) => {
-                let case = case.as_ref().map(|o| operand(o, row, params)).transpose()?;
+                let case = case.as_ref().map(|o| operand(o, row, env)).transpose()?;
                 for (when, then) in branches {
                     let hit = match &case {
-                        Some(v) => v.compare(&*operand(when, row, params)?)? == Some(Ordering::Equal),
-                        None => when.matches(row, params)?,
+                        Some(v) => v.compare(&*operand(when, row, env)?)? == Some(Ordering::Equal),
+                        None => when.matches(row, env)?,
                     };
                     if hit {
-                        return then.eval(row, params);
+                        return then.eval(row, env);
                     }
                 }
-                otherwise.as_ref().map_or(Ok(Value::Null), |e| e.eval(row, params))?
+                otherwise.as_ref().map_or(Ok(Value::Null), |e| e.eval(row, env))?
             }
+            BExpr::Subquery(s) => s.eval(row, env)?,
         })
     }
 }
@@ -229,12 +473,12 @@ fn param(params: &[Value], i: usize) -> Result<&Value> {
 /// Evaluates an operand, borrowing instead of copying when it is a column,
 /// literal or parameter. Filters compare values far more often than they
 /// produce them, so this saves a copy (and, for text, an allocation) per test.
-pub(super) fn operand<'a>(e: &'a BExpr, row: &'a [Value], params: &'a [Value]) -> Result<Cow<'a, Value>> {
+pub(super) fn operand<'a>(e: &'a BExpr, row: &'a [Value], env: &'a Env) -> Result<Cow<'a, Value>> {
     Ok(match e {
         BExpr::Column(i) => Cow::Borrowed(&row[*i]),
         BExpr::Literal(v) => Cow::Borrowed(v),
-        BExpr::Param(i) => Cow::Borrowed(param(params, *i)?),
-        e => Cow::Owned(e.eval(row, params)?),
+        BExpr::Param(i) => Cow::Borrowed(param(env.params, *i)?),
+        e => Cow::Owned(e.eval(row, env)?),
     })
 }
 
@@ -246,22 +490,22 @@ fn and3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     }
 }
 
-fn binary(op: BinaryOp, a: &BExpr, b: &BExpr, row: &[Value], params: &[Value]) -> Result<Value> {
+fn binary(op: BinaryOp, a: &BExpr, b: &BExpr, row: &[Value], env: &Env) -> Result<Value> {
     let to_value = |t: Option<bool>| t.map_or(Value::Null, Value::Boolean);
     match op {
         BinaryOp::And => {
-            let left = operand(a, row, params)?.truth()?;
+            let left = operand(a, row, env)?.truth()?;
             if left == Some(false) {
                 return Ok(Value::Boolean(false));
             }
-            Ok(to_value(and3(left, operand(b, row, params)?.truth()?)))
+            Ok(to_value(and3(left, operand(b, row, env)?.truth()?)))
         }
         BinaryOp::Or => {
-            let left = operand(a, row, params)?.truth()?;
+            let left = operand(a, row, env)?.truth()?;
             if left == Some(true) {
                 return Ok(Value::Boolean(true));
             }
-            let right = operand(b, row, params)?.truth()?;
+            let right = operand(b, row, env)?.truth()?;
             Ok(to_value(match (left, right) {
                 (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
@@ -269,7 +513,7 @@ fn binary(op: BinaryOp, a: &BExpr, b: &BExpr, row: &[Value], params: &[Value]) -
             }))
         }
         op if op.is_comparison() => {
-            let ordering = operand(a, row, params)?.compare(&*operand(b, row, params)?)?;
+            let ordering = operand(a, row, env)?.compare(&*operand(b, row, env)?)?;
             Ok(to_value(ordering.map(|o| match op {
                 BinaryOp::Eq => o == Ordering::Equal,
                 BinaryOp::NotEq => o != Ordering::Equal,
@@ -279,11 +523,11 @@ fn binary(op: BinaryOp, a: &BExpr, b: &BExpr, row: &[Value], params: &[Value]) -
                 _ => o != Ordering::Less,
             })))
         }
-        BinaryOp::Concat => match (&*operand(a, row, params)?, &*operand(b, row, params)?) {
+        BinaryOp::Concat => match (&*operand(a, row, env)?, &*operand(b, row, env)?) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             (x, y) => Ok(Value::Text(format!("{x}{y}"))),
         },
-        op => arithmetic(op, &*operand(a, row, params)?, &*operand(b, row, params)?),
+        op => arithmetic(op, &*operand(a, row, env)?, &*operand(b, row, env)?),
     }
 }
 
@@ -359,6 +603,21 @@ pub enum Function {
     Trim,
     Typeof,
     Upper,
+    Now,
+    CurrentDate,
+    CurrentTime,
+    Date,
+    Time,
+    Datetime,
+    Strftime,
+    Julianday,
+    Unixepoch,
+    DatePart,
+    DateTrunc,
+    DateAdd,
+    DateSub,
+    Datediff,
+    Interval,
 }
 
 impl Function {
@@ -375,6 +634,21 @@ impl Function {
             "trim" => (Function::Trim, args == 1),
             "typeof" => (Function::Typeof, args == 1),
             "upper" => (Function::Upper, args == 1),
+            "now" | "current_timestamp" | "localtimestamp" => (Function::Now, args == 0),
+            "current_date" => (Function::CurrentDate, args == 0),
+            "current_time" | "localtime" => (Function::CurrentTime, args == 0),
+            "date" => (Function::Date, args >= 1),
+            "time" => (Function::Time, args >= 1),
+            "datetime" => (Function::Datetime, args >= 1),
+            "strftime" => (Function::Strftime, args >= 2),
+            "julianday" => (Function::Julianday, args >= 1),
+            "unixepoch" => (Function::Unixepoch, args >= 1),
+            "date_part" => (Function::DatePart, args == 2),
+            "date_trunc" => (Function::DateTrunc, args == 2),
+            "date_add" | "adddate" => (Function::DateAdd, args == 2),
+            "date_sub" | "subdate" => (Function::DateSub, args == 2),
+            "datediff" => (Function::Datediff, args == 2),
+            "interval" => (Function::Interval, args == 1),
             _ => return Err(sql_error(format!("no such function: {name}"))),
         };
         if !arity_ok {
@@ -383,7 +657,7 @@ impl Function {
         Ok(function)
     }
 
-    fn call(self, mut args: Vec<Value>) -> Result<Value> {
+    fn call(self, mut args: Vec<Value>, env: &Env) -> Result<Value> {
         let text = |v: &Value| v.to_string();
         if !matches!(self, Function::Coalesce | Function::Nullif | Function::Typeof) && args.iter().any(Value::is_null)
         {
@@ -444,7 +718,34 @@ impl Function {
                 Value::Text(chars[from..to].iter().collect())
             }
             Function::Typeof => Value::Text(args[0].type_name().to_lowercase()),
+            Function::Now => Value::Text(env.now().format(Kind::Timestamp)?),
+            Function::CurrentDate => Value::Text(env.now().format(Kind::Date)?),
+            Function::CurrentTime => Value::Text(env.now().format(Kind::Time)?),
+            Function::Date => datetime::convert(&self.with_now(args, env), Kind::Date, "date")?,
+            Function::Time => datetime::convert(&self.with_now(args, env), Kind::Time, "time")?,
+            Function::Datetime => datetime::convert(&self.with_now(args, env), Kind::Timestamp, "datetime")?,
+            Function::Strftime => datetime::strftime(&self.with_now(args, env))?,
+            Function::Julianday => datetime::julianday(&self.with_now(args, env))?,
+            Function::Unixepoch => datetime::unixepoch(&self.with_now(args, env))?,
+            Function::DatePart => datetime::date_part(&args[0], &args[1])?,
+            Function::DateTrunc => datetime::date_trunc(&args[0], &args[1])?,
+            Function::DateAdd => datetime::date_add(&args[0], &args[1], 1)?,
+            Function::DateSub => datetime::date_add(&args[0], &args[1], -1)?,
+            Function::Datediff => datetime::datediff(&args[0], &args[1])?,
+            Function::Interval => datetime::interval(&args[0])?,
         })
+    }
+
+    /// The arguments with a time of `'now'` replaced by the statement's
+    /// time, so it agrees with `now()`.
+    fn with_now(self, mut args: Vec<Value>, env: &Env) -> Vec<Value> {
+        let at = usize::from(self == Function::Strftime);
+        if let Some(Value::Text(t)) = args.get(at)
+            && t.trim().eq_ignore_ascii_case("now")
+        {
+            args[at] = Value::Text(env.now().format(Kind::Timestamp).unwrap_or_default());
+        }
+        args
     }
 }
 
@@ -477,15 +778,52 @@ pub struct Grouping {
 /// Binds expressions. Parameters stay symbolic (`BExpr::Param`), so a plan
 /// can be reused with new values; `params` serves only expressions that are
 /// evaluated on the spot, such as INSERT values and DEFAULTs.
+#[derive(Clone, Copy)]
 pub struct Binder<'a> {
     pub params: &'a [Value],
+    /// The transaction, to plan subqueries against.
+    pub txn: Option<&'a Txn>,
+    /// Inside a subquery: the query around it, whose columns it may read.
+    pub outer: Option<&'a Outer<'a>>,
+    /// The common table expressions (`WITH`) in reach.
+    pub ctes: Option<&'a CteScope<'a>>,
 }
 
-impl Binder<'_> {
+/// The query around a subquery being bound.
+pub struct Outer<'a> {
+    pub scope: &'a Scope,
+    /// The outer query's columns the subquery reads, in the order of the
+    /// parameters they become (after the statement's own).
+    refs: RefCell<Vec<usize>>,
+}
+
+impl<'a> Binder<'a> {
+    pub fn new(params: &'a [Value], txn: &'a Txn) -> Self {
+        Binder { params, txn: Some(txn), outer: None, ctes: None }
+    }
+
+    /// Resolves a column: in `scope`, or failing that in the query around a
+    /// subquery, where it becomes a parameter of the subquery.
+    fn column(&self, scope: &Scope, table: Option<&str>, name: &str) -> Result<BExpr> {
+        match scope.resolve(table, name) {
+            Ok(i) => Ok(BExpr::Column(i)),
+            Err(e) => {
+                let Some(outer) = self.outer else { return Err(e) };
+                let Ok(i) = outer.scope.resolve(table, name) else { return Err(e) };
+                let mut refs = outer.refs.borrow_mut();
+                let k = refs.iter().position(|&r| r == i).unwrap_or_else(|| {
+                    refs.push(i);
+                    refs.len() - 1
+                });
+                Ok(BExpr::Param(self.params.len() + k))
+            }
+        }
+    }
+
     /// Binds `expr` against `scope`. `clause` names where it appears, for errors.
     pub fn bind(&self, expr: &Expr, scope: &Scope, clause: &str) -> Result<BExpr> {
-        self.tree(expr, &mut |e| match e {
-            Expr::Column { table, name } => Ok(Some(BExpr::Column(scope.resolve(table.as_deref(), name)?))),
+        self.tree(expr, Some(scope), &mut |e| match e {
+            Expr::Column { table, name } => Ok(Some(self.column(scope, table.as_deref(), name)?)),
             Expr::Function { name, .. } if is_aggregate(name) => {
                 Err(sql_error(format!("aggregate function {name}() is not allowed in {clause}")))
             }
@@ -495,7 +833,28 @@ impl Binder<'_> {
 
     /// Evaluates an expression that may not refer to any column.
     pub fn constant(&self, expr: &Expr, clause: &str) -> Result<Value> {
-        self.bind(expr, &Scope::default(), clause)?.eval(&[], self.params)
+        self.bind(expr, &Scope::default(), clause)?.eval(&[], &Env::new(self.params, self.txn))
+    }
+
+    /// Plans a subquery of a query whose rows look like `scope` (`None`: the
+    /// subquery may not read them).
+    fn subquery(&self, select: &Select, scope: Option<&Scope>, kind: SubqueryKind, one_column: bool) -> Result<BExpr> {
+        let txn = self.txn.ok_or_else(|| sql_error("a subquery can't be used here"))?;
+        let empty = Scope::default();
+        let outer = Outer { scope: scope.unwrap_or(&empty), refs: RefCell::default() };
+        let binder = Binder { txn: Some(txn), outer: Some(&outer), ..*self };
+        let plan = plan_select(txn, select, &binder)?;
+        if one_column && plan.columns.len() != 1 {
+            return Err(sql_error(format!("a subquery here must return one column, not {}", plan.columns.len())));
+        }
+        let outer = outer.refs.into_inner().into_iter().map(BExpr::Column).collect();
+        Ok(BExpr::Subquery(Box::new(Subquery {
+            id: NEXT_SUBQUERY.fetch_add(1, AtomicOrdering::Relaxed),
+            kind,
+            plan: Arc::new(plan),
+            outer,
+            params: self.params.len(),
+        })))
     }
 
     /// Binds an expression of an aggregate query, to be evaluated against the
@@ -503,7 +862,9 @@ impl Binder<'_> {
     /// of a GROUP BY expression.
     pub fn bind_grouped(&self, expr: &Expr, scope: &Scope, grouping: &mut Grouping) -> Result<BExpr> {
         let group_keys = grouping.keys.len();
-        self.tree(expr, &mut |e| {
+        // Subqueries here see the aggregated rows, not the table's: they may
+        // not read the outer query's columns.
+        self.tree(expr, None, &mut |e| {
             if !e.contains_aggregate()
                 && let Ok(bound) = self.bind(e, scope, "GROUP BY")
                 && let Some(i) = grouping.keys.iter().position(|k| *k == bound)
@@ -521,6 +882,10 @@ impl Binder<'_> {
                         }
                     };
                     Ok(Some(BExpr::Column(group_keys + position)))
+                }
+                // A window function's value, placed after the group's row later.
+                Expr::Column { table: Some(table), name } if table == WINDOW_TABLE => {
+                    Ok(Some(BExpr::Column(WINDOW_BASE + name.parse::<usize>().unwrap_or_default())))
                 }
                 Expr::Column { table, name } => {
                     scope.resolve(table.as_deref(), name)?; // report unknown columns first
@@ -550,11 +915,29 @@ impl Binder<'_> {
     }
 
     /// Binds every node, giving `leaf` the first chance at each one.
-    fn tree(&self, expr: &Expr, leaf: &mut dyn FnMut(&Expr) -> Result<Option<BExpr>>) -> Result<BExpr> {
+    fn tree(
+        &self,
+        expr: &Expr,
+        scope: Option<&Scope>,
+        leaf: &mut dyn FnMut(&Expr) -> Result<Option<BExpr>>,
+    ) -> Result<BExpr> {
         if let Some(bound) = leaf(expr)? {
             return Ok(bound);
         }
-        let mut sub = |e: &Expr| self.tree(e, leaf).map(Box::new);
+        match expr {
+            Expr::Subquery(select) => return self.subquery(select, scope, SubqueryKind::Scalar, true),
+            Expr::Exists { select, negated } => {
+                let exists = self.subquery(select, scope, SubqueryKind::Exists, false)?;
+                return Ok(if *negated { BExpr::Not(Box::new(exists)) } else { exists });
+            }
+            Expr::InSubquery { expr: left, select, negated } => {
+                let left = self.tree(left, scope, leaf)?;
+                let found = self.subquery(select, scope, SubqueryKind::In(Box::new(left)), true)?;
+                return Ok(if *negated { BExpr::Not(Box::new(found)) } else { found });
+            }
+            _ => {}
+        }
+        let mut sub = |e: &Expr| self.tree(e, scope, leaf).map(Box::new);
         Ok(match expr {
             Expr::Literal(v) => BExpr::Literal(v.clone()),
             Expr::Param(i) => BExpr::Param(*i),
@@ -588,17 +971,25 @@ impl Binder<'_> {
                 let branches = branches.iter().map(|(w, t)| Ok((*sub(w)?, *sub(t)?))).collect::<Result<_>>()?;
                 BExpr::Case(operand, branches, otherwise.as_deref().map(&mut sub).transpose()?)
             }
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => unreachable!("bound above"),
+            Expr::Window { name, .. } => {
+                return Err(sql_error(format!(
+                    "window function {name}() is allowed only in the select list and ORDER BY, and not inside another"
+                )));
+            }
         })
     }
 }
 
 /// Running state for one aggregate in one group.
+#[derive(Clone)]
 pub struct Accumulator {
     state: State,
     /// Values already counted, for DISTINCT aggregates.
     seen: Option<HashSet<Vec<u8>>>,
 }
 
+#[derive(Clone)]
 enum State {
     Count(i64),
     Sum(Value),
@@ -619,14 +1010,14 @@ impl Accumulator {
         Accumulator { state, seen: aggregate.distinct.then(HashSet::new) }
     }
 
-    pub fn add(&mut self, aggregate: &Aggregate, row: &[Value], params: &[Value]) -> Result<()> {
+    pub fn add(&mut self, aggregate: &Aggregate, row: &[Value], env: &Env) -> Result<()> {
         match &aggregate.arg {
             None => {
                 self.add_row();
                 Ok(())
             }
             // Borrowed: most values are only counted or summed, never kept.
-            Some(arg) => self.add_value(operand(arg, row, params)?),
+            Some(arg) => self.add_value(operand(arg, row, env)?),
         }
     }
 
@@ -905,7 +1296,7 @@ mod tests {
         let t = || Box::new(BExpr::Literal(Value::Boolean(true)));
         let f = || Box::new(BExpr::Literal(Value::Boolean(false)));
         let n = || Box::new(BExpr::Literal(Value::Null));
-        let eval = |e: BExpr| e.eval(&[], &[]).unwrap();
+        let eval = |e: BExpr| e.eval(&[], &Env::new(&[], None)).unwrap();
         assert_eq!(eval(BExpr::Binary(BinaryOp::And, n(), f())), Value::Boolean(false));
         assert_eq!(eval(BExpr::Binary(BinaryOp::And, n(), t())), Value::Null);
         assert_eq!(eval(BExpr::Binary(BinaryOp::Or, n(), t())), Value::Boolean(true));
@@ -924,7 +1315,7 @@ mod tests {
 
     #[test]
     fn substr_counts_from_one() {
-        let call = |args: Vec<Value>| Function::Substr.call(args).unwrap();
+        let call = |args: Vec<Value>| Function::Substr.call(args, &Env::new(&[], None)).unwrap();
         assert_eq!(call(vec!["hello".into(), 2.into(), 3.into()]), Value::Text("ell".into()));
         assert_eq!(call(vec!["hello".into(), 4.into()]), Value::Text("lo".into()));
         assert_eq!(call(vec!["hello".into(), 0.into(), 2.into()]), Value::Text("h".into()));

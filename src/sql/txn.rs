@@ -91,6 +91,18 @@ pub struct Txn {
     schema_changed: bool,
     /// The most threads a query may use; 0 means every core.
     scan_threads: usize,
+    /// Open savepoints, oldest first.
+    savepoints: Vec<Savepoint>,
+}
+
+/// The transaction's state when `SAVEPOINT name` ran, to go back to.
+struct Savepoint {
+    name: String,
+    /// The caller's own note of its state then.
+    tag: usize,
+    writes: BTreeMap<Key, Buffered>,
+    sequences: BTreeMap<Vec<u8>, i64>,
+    notifications: Vec<(String, String, u32)>,
 }
 
 impl Txn {
@@ -108,7 +120,47 @@ impl Txn {
             repl,
             schema_changed: false,
             scan_threads: 0,
+            savepoints: Vec::new(),
         }
+    }
+
+    /// Remembers the transaction's state as savepoint `name`, along with
+    /// `tag`, which `rollback_to` hands back.
+    pub fn savepoint(&mut self, name: &str, tag: usize) {
+        self.savepoints.push(Savepoint {
+            name: name.to_string(),
+            tag,
+            writes: self.writes.clone(),
+            sequences: self.sequences.clone(),
+            notifications: self.notifications.clone(),
+        });
+    }
+
+    fn find_savepoint(&self, name: &str) -> Result<usize> {
+        self.savepoints
+            .iter()
+            .rposition(|s| s.name == name)
+            .ok_or_else(|| Error::Sql(format!("no such savepoint: {name}")))
+    }
+
+    /// Forgets savepoint `name` and those after it, keeping every change.
+    pub fn release(&mut self, name: &str) -> Result<()> {
+        let i = self.find_savepoint(name)?;
+        self.savepoints.truncate(i);
+        Ok(())
+    }
+
+    /// Undoes every change since savepoint `name`, which stays open; those
+    /// after it are forgotten. Returns the savepoint's tag.
+    pub fn rollback_to(&mut self, name: &str) -> Result<usize> {
+        let i = self.find_savepoint(name)?;
+        self.savepoints.truncate(i + 1);
+        let savepoint = &self.savepoints[i];
+        self.writes = savepoint.writes.clone();
+        self.sequences = savepoint.sequences.clone();
+        self.notifications = savepoint.notifications.clone();
+        self.notified = self.notifications.iter().map(|(c, p, _)| (c.clone(), p.clone())).collect();
+        Ok(savepoint.tag)
     }
 
     /// Caps the threads a query in this transaction may use (0: every core).

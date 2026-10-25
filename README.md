@@ -22,16 +22,23 @@ println!("{}", rows.to_json()); // [{"name":"Alan"}]
 
 - `CREATE TABLE` (with `IF NOT EXISTS`) and `DROP TABLE` (with `IF EXISTS`)
 - `CREATE [UNIQUE] INDEX` and `DROP INDEX`, on one or more columns
+- `CREATE [OR REPLACE] VIEW name [(columns)] AS query` and `DROP VIEW`
+- `ALTER TABLE ... ADD [COLUMN]`, `DROP [COLUMN]`, `RENAME [COLUMN] ... TO ...` and `RENAME TO`
 - `INSERT ... VALUES` (many rows at once) and `INSERT ... SELECT`
+- Upserts: `ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`, plus SQLite's `INSERT OR IGNORE` and MySQL's `ON DUPLICATE KEY UPDATE`
 - `UPDATE` and `DELETE`
+- `RETURNING` on `INSERT`, `UPDATE` and `DELETE`
 - `SELECT` with `WHERE`, `[INNER | LEFT] JOIN ... ON`, `CROSS JOIN`, `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY` and `LIMIT`/`OFFSET`
-- `BEGIN`, `COMMIT`, `ROLLBACK`
+- `UNION [ALL]`, `INTERSECT [ALL]` and `EXCEPT [ALL]`, with `INTERSECT` binding first as in standard SQL; `ORDER BY` and `LIMIT` after them apply to the whole result
+- Subqueries: `(SELECT ...)` as a value, `[NOT] IN (SELECT ...)`, `[NOT] EXISTS (SELECT ...)`, and `FROM (SELECT ...) AS name [(columns)]`
+- `WITH name [(columns)] AS (query), ...` and `WITH RECURSIVE`
+- `BEGIN`, `COMMIT`, `ROLLBACK`, and `SAVEPOINT`, `RELEASE [SAVEPOINT]`, `ROLLBACK TO [SAVEPOINT]`
 - `EXPLAIN`, which shows whether a query scans or uses a primary key or index
 
 **Types and constraints**
 
-- Types are `INTEGER`, `REAL`, `TEXT` and `BOOLEAN`, plus the common aliases (`INT`, `BIGINT`, `VARCHAR(n)`, `DOUBLE PRECISION`, ...).
-- Constraints are `PRIMARY KEY` (including composite keys), `NOT NULL`, `UNIQUE` and `DEFAULT`.
+- Types are `INTEGER`, `REAL`, `TEXT`, `BOOLEAN`, `DATE`, `TIME` and `TIMESTAMP`, plus the common aliases (`INT`, `BIGINT`, `VARCHAR(n)`, `DOUBLE PRECISION`, `DATETIME`, `TIMESTAMPTZ`, ...).
+- Constraints are `PRIMARY KEY` (including composite keys), `NOT NULL`, `UNIQUE`, `CHECK`, `FOREIGN KEY`/`REFERENCES` and `DEFAULT`, including `DEFAULT CURRENT_TIMESTAMP` (or `CURRENT_DATE`, `CURRENT_TIME`). Table constraints may be named with `CONSTRAINT name`.
 - An `INTEGER PRIMARY KEY` is assigned automatically when omitted.
 
 **Expressions**
@@ -40,11 +47,69 @@ println!("{}", rows.to_json()); // [{"name":"Alan"}]
 - `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN`, `[NOT] BETWEEN`, and `[NOT] LIKE`/`ILIKE`
 - `CASE`, `CAST`
 - Aggregates: `count(*)`, `count`, `sum`, `avg`, `min` and `max`, each optionally with `DISTINCT`
+- Window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, and the aggregates, with `OVER (PARTITION BY ... ORDER BY ... [ROWS | RANGE frame])` and named windows (`WINDOW w AS (...)`)
 - Functions: `lower`, `upper`, `length`, `trim`, `substr`, `replace`, `abs`, `round`, `coalesce`, `nullif` and `typeof`
+- Dates and times: see below
+
+**Subqueries** may refer to the columns of the query around them (*correlated* subqueries), one level out:
+
+```sql
+SELECT name, (SELECT count(*) FROM orders o WHERE o.user_id = u.id) AS orders
+FROM users u
+WHERE EXISTS (SELECT 1 FROM orders WHERE user_id = u.id AND total > 100);
+```
+
+A subquery that reads no outer column runs once per statement; a correlated one runs once per distinct set of outer values it reads. `IN (SELECT ...)` collects the subquery's values into a hash set, and follows SQL's rules for NULL: `x NOT IN (...)` is unknown when the subquery returns a NULL. A subquery used as a value must return one column and at most one row (no rows reads as NULL).
+
+**Common table expressions.** A `WITH` query can name those before it. `WITH RECURSIVE` runs `anchor UNION [ALL] recursive part`: the recursive part reads the rows the previous round added, until a round adds none. `UNION` drops rows already found, so walks over cyclic graphs end. Rows are produced as they are found, so a `LIMIT` stops even an endless query.
+
+```sql
+WITH RECURSIVE chain AS (
+    SELECT id, name, 0 AS depth FROM staff WHERE boss IS NULL
+    UNION ALL
+    SELECT s.id, s.name, c.depth + 1 FROM staff s JOIN chain c ON s.boss = c.id
+)
+SELECT name, depth FROM chain ORDER BY depth;
+```
+
+**Window functions** see the rows left after `WHERE`, `GROUP BY` and `HAVING`, so they can rank groups too (`rank() OVER (ORDER BY sum(total) DESC)`). Without a frame, an ordered window runs from the start of the partition to the current row and the rows that tie with it, as in standard SQL; an unordered one covers the whole partition. Frames are `ROWS` with offsets (`ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`) or `RANGE` with `UNBOUNDED`/`CURRENT ROW` bounds. Aggregates whose frames only grow are computed as running totals. To filter on a window value, wrap the query: `SELECT * FROM (SELECT ..., row_number() OVER (...) AS n FROM t) AS ranked WHERE n = 1`.
+
+**Views** are stored queries that read like tables, in joins, subqueries and `WITH` queries alike. They are planned afresh each time they are used, so they see the tables' current columns and data; they can't be written to, and can't refer to themselves, even through other views. `.schema` in the shell shows them as written.
+
+**Dates and times.** `DATE`, `TIME` and `TIMESTAMP` values are checked when stored and kept as ISO 8601 text in UTC: `2024-03-15`, `09:30:00`, `2024-03-15 09:30:00.25`. Input may use `T` instead of the space and end in `Z` or an offset such as `+02:00`, which is converted to UTC. These forms sort as text in time order, so comparisons, `ORDER BY`, `BETWEEN` and indexes need nothing special. Compare against literals in the same form (`at >= '2024-03-01'`).
+
+- Literals: `DATE '2024-03-15'`, `TIME '09:30'`, `TIMESTAMP '2024-03-15 09:30'`, and `CAST(x AS DATE)`
+- The current time: `now()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE` and `CURRENT_TIME`, which read the clock once per statement
+- Arithmetic: `at + INTERVAL '1 day 2 hours'`, `day - INTERVAL 3 MONTH`, `date_add(x, '2 weeks')` and `date_sub`. Adding a month to the 31st gives the last day of a shorter month, as in PostgreSQL.
+- PostgreSQL's `EXTRACT(field FROM x)`, `date_part` and `date_trunc` (`year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, plus `dow`, `doy`, `epoch`, ...)
+- SQLite's `date`, `time`, `datetime`, `strftime`, `julianday` and `unixepoch`, with modifiers such as `'+1 day'`, `'start of month'`, `'weekday 1'` and `'unixepoch'`
+- MySQL's `datediff(a, b)`, the number of days from `b` to `a`
+
+**Foreign keys** refer to a primary key or unique columns, by default the referenced table's primary key. A reference with a NULL in it refers to nothing. `ON DELETE` and `ON UPDATE` take `NO ACTION` (the default), `RESTRICT`, `CASCADE`, `SET NULL` or `SET DEFAULT`, and actions chain through further foreign keys. References are checked when the statement's writes are done, so rows of one statement may refer to each other, and `UPDATE staff SET id = id + 10` works on a table that refers to itself. A table can't be dropped while another refers to it. Finding the rows that refer to a deleted or changed row uses an index on the referencing columns when there is one, and reads the whole referencing table when there isn't, so index foreign key columns of large tables.
+
+**CHECK** constraints refuse rows for which the expression is false; unknown (NULL) passes, as in standard SQL.
+
+```sql
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
+    total REAL CHECK (total >= 0)
+);
+```
+
+**Upserts.** A row whose primary key or unique value is already taken can be skipped or merged into the stored row. In `DO UPDATE`, `excluded.column` is the value the insert proposed, and a bare column name is the stored row's. MySQL's `VALUES(column)` means the same as `excluded.column`. Naming columns in `ON CONFLICT (...)` limits which constraint counts. A collision on any other constraint still fails.
+
+```sql
+INSERT INTO page_views (path, views) VALUES ('/home', 1)
+ON CONFLICT (path) DO UPDATE SET views = views + excluded.views
+RETURNING views;
+```
+
+`RETURNING` gives back the rows as written: auto-assigned ids and defaults included, the new versions for `UPDATE`, the removed rows for `DELETE`. An upsert returns the rows it inserted or updated, not the ones it skipped.
 
 **Parameters.** Use `?` or `$1` placeholders with `execute_with` and `query`, or `prepare` a statement once and run it many times. Parameters are always values, never SQL, so they are safe from injection.
 
-**Transactions.** Every statement is atomic: if it fails partway, none of its changes remain. A session can group statements with `BEGIN` ... `COMMIT`. Uncommitted changes are visible only to their own session, and a failing statement inside a transaction is undone without aborting the rest. `BEGIN` takes the database's write lock, like SQLite's `BEGIN IMMEDIATE`. Writers therefore take turns and transactions are serializable. Reads outside a transaction never wait and see the latest committed data.
+**Transactions.** Every statement is atomic: if it fails partway, none of its changes remain. A session can group statements with `BEGIN` ... `COMMIT`. Inside one, `SAVEPOINT name` marks a point that `ROLLBACK TO name` returns to, undoing only the changes since; the savepoint stays open, and `RELEASE name` forgets it. Uncommitted changes are visible only to their own session, and a failing statement inside a transaction is undone without aborting the rest. `BEGIN` takes the database's write lock, like SQLite's `BEGIN IMMEDIATE`. Writers therefore take turns and transactions are serializable. Reads outside a transaction never wait and see the latest committed data.
 
 **Notifications.** `LISTEN`, `UNLISTEN` and `NOTIFY` work as in PostgreSQL:
 
@@ -67,7 +132,7 @@ The shell prints notifications after each statement, as `psql` does. The Node cl
 
 Embedded, notifications travel between the sessions of one process, because only one process can open a database directory. Through [`spiro-server`](#server-and-replication) they reach any client, and replicas deliver them too.
 
-**Not supported yet:** subqueries, `UNION`, `RIGHT`/`FULL` joins, `ALTER TABLE`, foreign keys and `CHECK` constraints. The parser reports each of these with a clear error.
+**Not supported yet:** `RIGHT`/`FULL` joins, which the parser reports with a clear error.
 
 ### How SQL maps onto the storage engine
 
@@ -414,7 +479,7 @@ bench/compare.sh                             # side by side with SQLite and Post
 
 ## Roadmap
 
-- **SQL:** subqueries, `UNION`, `ALTER TABLE`, foreign keys, and a cost-based join order.
+- **SQL:** `RIGHT` and `FULL` joins, and a cost-based join order.
 - **Concurrency:** snapshots and MVCC through sequence numbers, so transactions read a consistent point in time and readers never see a half-applied scan.
 - **Storage:** leveled compaction across L1–L6 with 10× size ratios (today's two levels re-merge all of level 1 as data grows), and group commit so concurrent writers share one log write and one fsync.
 - **Speed:** keys and values of the memtable in one contiguous arena (recent writes interleaved with older data are now the slowest part of a full scan), batched execution for joins and plain scans as well as aggregates, and block compression implemented from scratch.

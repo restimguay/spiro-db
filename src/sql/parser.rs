@@ -50,6 +50,7 @@ const RESERVED: &[&str] = &[
     "OR",
     "ORDER",
     "OUTER",
+    "RETURNING",
     "RIGHT",
     "SELECT",
     "SET",
@@ -61,7 +62,14 @@ const RESERVED: &[&str] = &[
     "VALUES",
     "WHEN",
     "WHERE",
+    "WINDOW",
+    "WITH",
 ];
+
+/// Whether `e` is an `INTERVAL '...'` literal.
+fn is_interval(e: &Expr) -> bool {
+    matches!(e, Expr::Function { name, .. } if name == "interval")
+}
 
 fn is_reserved(word: &str) -> bool {
     RESERVED.iter().any(|r| r.eq_ignore_ascii_case(word))
@@ -78,7 +86,7 @@ const P_UNARY: u8 = 7;
 
 /// Parses every statement in `sql`, each with the number of parameters it takes.
 pub fn parse_statements(sql: &str) -> Result<Vec<(Statement, usize)>> {
-    let mut p = Parser { tokens: tokenize(sql)?, pos: 0, positional: 0, params: 0 };
+    let mut p = Parser { source: sql, tokens: tokenize(sql)?, pos: 0, positional: 0, params: 0 };
     let mut out = Vec::new();
     loop {
         while p.eat(&Token::Semicolon) {}
@@ -105,7 +113,29 @@ pub fn parse_statement(sql: &str) -> Result<(Statement, usize)> {
     }
 }
 
-struct Parser {
+/// Parses a query on its own, as stored for a view.
+pub fn parse_query(sql: &str) -> Result<Select> {
+    let mut p = Parser { source: sql, tokens: tokenize(sql)?, pos: 0, positional: 0, params: 0 };
+    let query = p.query()?;
+    if *p.peek() != Token::Eof {
+        return Err(p.unexpected("end of query"));
+    }
+    Ok(query)
+}
+
+/// Parses an expression on its own, as stored for a CHECK constraint.
+pub fn parse_expression(sql: &str) -> Result<Expr> {
+    let mut p = Parser { source: sql, tokens: tokenize(sql)?, pos: 0, positional: 0, params: 0 };
+    let expr = p.expr()?;
+    if *p.peek() != Token::Eof {
+        return Err(p.unexpected("end of expression"));
+    }
+    Ok(expr)
+}
+
+struct Parser<'a> {
+    /// The SQL being parsed, for keeping a view's query as written.
+    source: &'a str,
     tokens: Vec<Located>,
     pos: usize,
     /// `?` parameters seen so far in this statement.
@@ -114,7 +144,7 @@ struct Parser {
     params: usize,
 }
 
-impl Parser {
+impl Parser<'_> {
     fn peek(&self) -> &Token {
         &self.tokens[self.pos].token
     }
@@ -200,13 +230,17 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Statement> {
+        if *self.peek() == Token::LParen {
+            return Ok(Statement::Select(Box::new(self.query()?)));
+        }
         let Token::Word(word) = self.peek() else { return Err(self.unexpected("a statement")) };
         match word.to_ascii_uppercase().as_str() {
-            "SELECT" => Ok(Statement::Select(Box::new(self.select()?))),
+            "SELECT" | "WITH" => Ok(Statement::Select(Box::new(self.query()?))),
             "INSERT" => self.insert(),
             "UPDATE" => self.update(),
             "DELETE" => self.delete(),
             "CREATE" => self.create(),
+            "ALTER" => self.alter(),
             "DROP" => self.drop(),
             "BEGIN" => {
                 self.advance();
@@ -225,8 +259,23 @@ impl Parser {
             }
             "ROLLBACK" => {
                 self.advance();
-                self.eat_kw("TRANSACTION");
+                if !self.eat_kw("TRANSACTION") {
+                    self.eat_kw("WORK");
+                }
+                if self.eat_kw("TO") {
+                    self.eat_kw("SAVEPOINT");
+                    return Ok(Statement::RollbackTo(self.ident()?));
+                }
                 Ok(Statement::Rollback)
+            }
+            "SAVEPOINT" => {
+                self.advance();
+                Ok(Statement::Savepoint(self.ident()?))
+            }
+            "RELEASE" => {
+                self.advance();
+                self.eat_kw("SAVEPOINT");
+                Ok(Statement::Release(self.ident()?))
             }
             "EXPLAIN" => {
                 self.advance();
@@ -253,6 +302,95 @@ impl Parser {
         }
     }
 
+    /// A whole query: SELECTs combined with UNION, INTERSECT and EXCEPT,
+    /// then ORDER BY, LIMIT and OFFSET for the result. INTERSECT binds more
+    /// tightly than the other two, as in standard SQL.
+    fn query(&mut self) -> Result<Select> {
+        if self.eat_kw("WITH") {
+            let recursive = self.eat_kw("RECURSIVE");
+            let mut ctes = Vec::new();
+            loop {
+                let name = self.ident()?;
+                let columns = if *self.peek() == Token::LParen { self.ident_list()? } else { Vec::new() };
+                self.expect_kw("AS")?;
+                self.expect(Token::LParen)?;
+                let query = self.query()?;
+                self.expect(Token::RParen)?;
+                ctes.push(Cte { name, columns, query });
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            let mut query = self.query()?;
+            if query.with.is_some() {
+                query = Select::wrapping(query);
+            }
+            query.with = Some(Box::new(With { recursive, ctes }));
+            return Ok(query);
+        }
+        let mut query = self.operand()?;
+        loop {
+            let op = if self.eat_kw("UNION") {
+                SetOp::Union
+            } else if self.eat_kw("INTERSECT") {
+                SetOp::Intersect
+            } else if self.eat_kw("EXCEPT") {
+                SetOp::Except
+            } else {
+                break;
+            };
+            let all = self.eat_kw("ALL");
+            if !all {
+                self.eat_kw("DISTINCT");
+            }
+            let right = if op == SetOp::Intersect { self.operand()? } else { self.intersect_group()? };
+            query.compound.push((op, all, right));
+        }
+        if self.eat_kw("ORDER") {
+            self.expect_kw("BY")?;
+            query.order_by = self.order_items()?;
+        }
+        query.limit = if self.eat_kw("LIMIT") { Some(self.expr()?) } else { None };
+        query.offset = if self.eat_kw("OFFSET") { Some(self.expr()?) } else { None };
+        Ok(query)
+    }
+
+    /// One part of a compound query: a SELECT, or a query in parentheses.
+    fn operand(&mut self) -> Result<Select> {
+        if *self.peek() == Token::LParen
+            && (self.is_kw_at(1, "SELECT") || self.is_kw_at(1, "WITH") || *self.peek_nth(1) == Token::LParen)
+        {
+            self.advance();
+            let inner = self.query()?;
+            self.expect(Token::RParen)?;
+            // Its own ORDER BY, LIMIT or parts stay its own.
+            let alone = inner.order_by.is_empty() && inner.limit.is_none() && inner.offset.is_none();
+            return Ok(if alone && inner.compound.is_empty() { inner } else { Select::wrapping(inner) });
+        }
+        self.select()
+    }
+
+    /// The right side of UNION or EXCEPT: an operand with any INTERSECTs
+    /// that follow it, since those bind first.
+    fn intersect_group(&mut self) -> Result<Select> {
+        let mut group = self.operand()?;
+        if !self.is_kw("INTERSECT") {
+            return Ok(group);
+        }
+        if !group.compound.is_empty() {
+            group = Select::wrapping(group);
+        }
+        while self.eat_kw("INTERSECT") {
+            let all = self.eat_kw("ALL");
+            if !all {
+                self.eat_kw("DISTINCT");
+            }
+            group.compound.push((SetOp::Intersect, all, self.operand()?));
+        }
+        Ok(Select::wrapping(group))
+    }
+
+    /// A single SELECT, up to HAVING.
     fn select(&mut self) -> Result<Select> {
         self.expect_kw("SELECT")?;
         let distinct = self.eat_kw("DISTINCT");
@@ -271,27 +409,31 @@ impl Parser {
             group_by = self.expr_list()?;
         }
         let having = if self.eat_kw("HAVING") { Some(self.expr()?) } else { None };
-        let mut order_by = Vec::new();
-        if self.eat_kw("ORDER") {
-            self.expect_kw("BY")?;
+        let mut windows = Vec::new();
+        if self.eat_kw("WINDOW") {
             loop {
-                let expr = self.expr()?;
-                let desc = self.eat_kw("DESC");
-                if !desc {
-                    self.eat_kw("ASC");
-                }
-                order_by.push(OrderBy { expr, desc });
+                let name = self.ident()?;
+                self.expect_kw("AS")?;
+                windows.push((name, self.window_spec()?));
                 if !self.eat(&Token::Comma) {
                     break;
                 }
             }
         }
-        let limit = if self.eat_kw("LIMIT") { Some(self.expr()?) } else { None };
-        let offset = if self.eat_kw("OFFSET") { Some(self.expr()?) } else { None };
-        if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|kw| self.is_kw(kw)) {
-            return Err(self.error(format!("{} is not supported yet", self.peek().describe().to_uppercase())));
-        }
-        Ok(Select { distinct, items, from, filter, group_by, having, order_by, limit, offset })
+        Ok(Select {
+            distinct,
+            items,
+            from,
+            filter,
+            group_by,
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            compound: Vec::new(),
+            with: None,
+            windows,
+        })
     }
 
     fn select_item(&mut self) -> Result<SelectItem> {
@@ -324,9 +466,18 @@ impl Parser {
     }
 
     fn table_ref(&mut self) -> Result<TableRef> {
+        if self.eat(&Token::LParen) {
+            // `(SELECT ...) AS name`: a query read like a table.
+            let query = self.query()?;
+            self.expect(Token::RParen)?;
+            let alias = self.alias()?;
+            let columns =
+                if alias.is_some() && *self.peek() == Token::LParen { self.ident_list()? } else { Vec::new() };
+            return Ok(TableRef { name: "subquery".into(), alias, columns, subquery: Some(Box::new(query)) });
+        }
         let name = self.ident()?;
         let alias = self.alias()?;
-        Ok(TableRef { name, alias })
+        Ok(TableRef { name, alias, columns: Vec::new(), subquery: None })
     }
 
     fn from(&mut self) -> Result<From> {
@@ -366,6 +517,11 @@ impl Parser {
 
     fn insert(&mut self) -> Result<Statement> {
         self.expect_kw("INSERT")?;
+        // SQLite's INSERT OR IGNORE: ON CONFLICT DO NOTHING.
+        let ignore = self.eat_kw("OR");
+        if ignore {
+            self.expect_kw("IGNORE")?;
+        }
         self.expect_kw("INTO")?;
         let table = self.ident()?;
         let columns = if *self.peek() == Token::LParen { Some(self.ident_list()?) } else { None };
@@ -380,29 +536,84 @@ impl Parser {
                 }
             }
             InsertSource::Values(rows)
-        } else if self.is_kw("SELECT") {
-            InsertSource::Select(Box::new(self.select()?))
+        } else if self.is_kw("SELECT") || self.is_kw("WITH") || *self.peek() == Token::LParen {
+            InsertSource::Select(Box::new(self.query()?))
         } else {
             return Err(self.unexpected("VALUES or SELECT"));
         };
-        Ok(Statement::Insert(Insert { table, columns, source }))
+        let mut on_conflict = ignore.then(|| OnConflict { target: Vec::new(), action: ConflictAction::Nothing });
+        if self.is_kw("ON") && self.is_kw_at(1, "CONFLICT") {
+            self.advance();
+            self.advance();
+            let target = if *self.peek() == Token::LParen { self.ident_list()? } else { Vec::new() };
+            self.expect_kw("DO")?;
+            let action = if self.eat_kw("NOTHING") {
+                ConflictAction::Nothing
+            } else {
+                self.expect_kw("UPDATE")?;
+                self.expect_kw("SET")?;
+                let assignments = self.assignments()?;
+                let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+                ConflictAction::Update { assignments, filter }
+            };
+            on_conflict = Some(OnConflict { target, action });
+        } else if self.is_kw("ON") && self.is_kw_at(1, "DUPLICATE") {
+            // MySQL's spelling, where VALUES(column) is the proposed value.
+            self.advance();
+            self.advance();
+            self.expect_kw("KEY")?;
+            self.expect_kw("UPDATE")?;
+            let mut assignments = self.assignments()?;
+            for (_, e) in &mut assignments {
+                e.rewrite(&mut |e| {
+                    if let Expr::Function { name, args, .. } = e
+                        && name == "values"
+                        && let [Expr::Column { name: column, .. }] = args.as_slice()
+                    {
+                        *e = Expr::Column { table: Some("excluded".into()), name: column.clone() };
+                    }
+                });
+            }
+            on_conflict =
+                Some(OnConflict { target: Vec::new(), action: ConflictAction::Update { assignments, filter: None } });
+        }
+        let returning = self.returning()?;
+        Ok(Statement::Insert(Insert { table, columns, source, on_conflict, returning }))
     }
 
-    fn update(&mut self) -> Result<Statement> {
-        self.expect_kw("UPDATE")?;
-        let table = self.ident()?;
-        self.expect_kw("SET")?;
+    /// `column = expr, ...` after SET.
+    fn assignments(&mut self) -> Result<Vec<(String, Expr)>> {
         let mut assignments = Vec::new();
         loop {
             let column = self.ident()?;
             self.expect(Token::Eq)?;
             assignments.push((column, self.expr()?));
             if !self.eat(&Token::Comma) {
-                break;
+                return Ok(assignments);
             }
         }
+    }
+
+    /// `RETURNING item, ...`, if present.
+    fn returning(&mut self) -> Result<Vec<SelectItem>> {
+        let mut items = Vec::new();
+        if self.eat_kw("RETURNING") {
+            items.push(self.select_item()?);
+            while self.eat(&Token::Comma) {
+                items.push(self.select_item()?);
+            }
+        }
+        Ok(items)
+    }
+
+    fn update(&mut self) -> Result<Statement> {
+        self.expect_kw("UPDATE")?;
+        let table = self.ident()?;
+        self.expect_kw("SET")?;
+        let assignments = self.assignments()?;
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
-        Ok(Statement::Update(Update { table, assignments, filter }))
+        let returning = self.returning()?;
+        Ok(Statement::Update(Update { table, assignments, filter, returning }))
     }
 
     fn delete(&mut self) -> Result<Statement> {
@@ -410,7 +621,8 @@ impl Parser {
         self.expect_kw("FROM")?;
         let table = self.ident()?;
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
-        Ok(Statement::Delete(Delete { table, filter }))
+        let returning = self.returning()?;
+        Ok(Statement::Delete(Delete { table, filter, returning }))
     }
 
     fn if_not_exists(&mut self) -> Result<bool> {
@@ -435,6 +647,25 @@ impl Parser {
         if self.eat_kw("TABLE") {
             return self.create_table();
         }
+        let or_replace = self.eat_kw("OR");
+        if or_replace {
+            self.expect_kw("REPLACE")?;
+        }
+        if self.eat_kw("VIEW") {
+            let if_not_exists = self.if_not_exists()?;
+            let name = self.ident()?;
+            let columns = if *self.peek() == Token::LParen { self.ident_list()? } else { Vec::new() };
+            self.expect_kw("AS")?;
+            let start = self.tokens[self.pos].offset;
+            let query = Box::new(self.query()?);
+            let end = self.tokens[self.pos].offset;
+            let sql: String = self.source.chars().skip(start).take(end - start).collect();
+            let sql = sql.trim().to_string();
+            return Ok(Statement::CreateView { name, columns, query, sql, or_replace, if_not_exists });
+        }
+        if or_replace {
+            return Err(self.unexpected("VIEW"));
+        }
         let unique = self.eat_kw("UNIQUE");
         if !self.eat_kw("INDEX") {
             return Err(self.unexpected(if unique { "INDEX" } else { "TABLE or INDEX" }));
@@ -452,8 +683,16 @@ impl Parser {
         let name = self.ident()?;
         self.expect(Token::LParen)?;
         let (mut columns, mut primary_key, mut unique) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut checks, mut foreign_keys) = (Vec::new(), Vec::new());
         loop {
-            if self.is_kw("PRIMARY") {
+            let constraint = if self.eat_kw("CONSTRAINT") { Some(self.ident()?) } else { None };
+            if self.is_kw("CHECK") {
+                checks.push(self.check(constraint)?);
+            } else if self.eat_kw("FOREIGN") {
+                self.expect_kw("KEY")?;
+                let columns = self.ident_list()?;
+                foreign_keys.push(self.references(constraint, columns)?);
+            } else if self.is_kw("PRIMARY") {
                 self.advance();
                 self.expect_kw("KEY")?;
                 if !primary_key.is_empty() {
@@ -463,24 +702,82 @@ impl Parser {
             } else if self.is_kw("UNIQUE") && *self.peek_nth(1) == Token::LParen {
                 self.advance();
                 unique.push(self.ident_list()?);
-            } else if ["FOREIGN", "CHECK", "CONSTRAINT"].iter().any(|kw| self.is_kw(kw)) {
-                return Err(self.error(format!("{} constraints are not supported yet", self.peek().describe())));
+            } else if constraint.is_some() {
+                return Err(self.unexpected("CHECK, FOREIGN KEY, PRIMARY KEY or UNIQUE"));
             } else {
-                columns.push(self.column_def()?);
+                let mut column = self.column_def()?;
+                checks.append(&mut column.checks);
+                foreign_keys.extend(column.references.take());
+                columns.push(column);
             }
             if !self.eat(&Token::Comma) {
                 break;
             }
         }
         self.expect(Token::RParen)?;
-        Ok(Statement::CreateTable(CreateTable { name, if_not_exists, columns, primary_key, unique }))
+        Ok(Statement::CreateTable(CreateTable {
+            name,
+            if_not_exists,
+            columns,
+            primary_key,
+            unique,
+            checks,
+            foreign_keys,
+        }))
+    }
+
+    fn alter(&mut self) -> Result<Statement> {
+        self.expect_kw("ALTER")?;
+        self.expect_kw("TABLE")?;
+        let table = self.ident()?;
+        let action = if self.eat_kw("ADD") {
+            self.eat_kw("COLUMN");
+            AlterAction::AddColumn(self.column_def()?)
+        } else if self.eat_kw("DROP") {
+            self.eat_kw("COLUMN");
+            AlterAction::DropColumn(self.ident()?)
+        } else if self.eat_kw("RENAME") {
+            if self.eat_kw("TO") {
+                AlterAction::RenameTable(self.ident()?)
+            } else {
+                self.eat_kw("COLUMN");
+                let from = self.ident()?;
+                self.expect_kw("TO")?;
+                AlterAction::RenameColumn { from, to: self.ident()? }
+            }
+        } else {
+            return Err(self.unexpected("ADD, DROP or RENAME"));
+        };
+        Ok(Statement::AlterTable { table, action })
     }
 
     fn column_def(&mut self) -> Result<ColumnDef> {
         let name = self.ident()?;
         let ty = self.data_type()?;
-        let mut column = ColumnDef { name, ty, primary_key: false, not_null: false, unique: false, default: None };
+        let mut column = ColumnDef {
+            name,
+            ty,
+            primary_key: false,
+            not_null: false,
+            unique: false,
+            default: None,
+            checks: Vec::new(),
+            references: None,
+        };
         loop {
+            let constraint = if self.eat_kw("CONSTRAINT") { Some(self.ident()?) } else { None };
+            if self.is_kw("CHECK") {
+                column.checks.push(self.check(constraint)?);
+                continue;
+            }
+            if self.is_kw("REFERENCES") {
+                let columns = vec![column.name.clone()];
+                column.references = Some(self.references(constraint, columns)?);
+                continue;
+            }
+            if let Some(name) = constraint {
+                return Err(self.error(format!("constraint {name} must be CHECK or REFERENCES here")));
+            }
             if self.eat_kw("PRIMARY") {
                 self.expect_kw("KEY")?;
                 column.primary_key = true;
@@ -493,12 +790,66 @@ impl Parser {
                 column.unique = true;
             } else if self.eat_kw("DEFAULT") {
                 column.default = Some(self.expr_bp(P_CMP + 1)?);
-            } else if self.is_kw("REFERENCES") || self.is_kw("CHECK") {
-                return Err(self.error(format!("{} constraints are not supported yet", self.peek().describe())));
             } else {
                 return Ok(column);
             }
         }
+    }
+
+    /// `CHECK (expr)`
+    fn check(&mut self, name: Option<String>) -> Result<CheckDef> {
+        self.expect_kw("CHECK")?;
+        self.expect(Token::LParen)?;
+        let expr = self.expr()?;
+        self.expect(Token::RParen)?;
+        Ok(CheckDef { name, expr })
+    }
+
+    /// `REFERENCES table [(columns)] [ON DELETE action] [ON UPDATE action]`
+    fn references(&mut self, name: Option<String>, columns: Vec<String>) -> Result<ForeignKeyDef> {
+        self.expect_kw("REFERENCES")?;
+        let table = self.ident()?;
+        let references = if *self.peek() == Token::LParen { self.ident_list()? } else { Vec::new() };
+        let mut fk = ForeignKeyDef {
+            name,
+            columns,
+            table,
+            references,
+            on_delete: FkAction::NoAction,
+            on_update: FkAction::NoAction,
+        };
+        while self.is_kw("ON") && (self.is_kw_at(1, "DELETE") || self.is_kw_at(1, "UPDATE")) {
+            self.advance();
+            let deleting = self.eat_kw("DELETE");
+            if !deleting {
+                self.expect_kw("UPDATE")?;
+            }
+            let action = if self.eat_kw("CASCADE") {
+                FkAction::Cascade
+            } else if self.eat_kw("RESTRICT") {
+                FkAction::Restrict
+            } else if self.eat_kw("NO") {
+                self.expect_kw("ACTION")?;
+                FkAction::NoAction
+            } else {
+                self.expect_kw("SET")?;
+                if self.eat_kw("NULL") {
+                    FkAction::SetNull
+                } else {
+                    self.expect_kw("DEFAULT")?;
+                    FkAction::SetDefault
+                }
+            };
+            if deleting {
+                fk.on_delete = action;
+            } else {
+                fk.on_update = action;
+            }
+        }
+        if self.is_kw("DEFERRABLE") || self.is_kw("MATCH") {
+            return Err(self.error(format!("{} is not supported", self.peek().describe())));
+        }
+        Ok(fk)
     }
 
     fn data_type(&mut self) -> Result<DataType> {
@@ -509,9 +860,18 @@ impl Parser {
             "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "NUMERIC" | "DECIMAL" => DataType::Real,
             "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "STRING" | "CLOB" => DataType::Text,
             "BOOLEAN" | "BOOL" => DataType::Boolean,
+            "DATE" => DataType::Date,
+            "TIME" => DataType::Time,
+            "TIMESTAMP" | "DATETIME" | "TIMESTAMPTZ" => DataType::Timestamp,
             _ => return Err(self.error(format!("unknown type {word}"))),
         };
         self.advance();
+        // TIMESTAMP WITH[OUT] TIME ZONE: either way, stored in UTC.
+        if ty.is_temporal() && (self.is_kw("WITH") || self.is_kw("WITHOUT")) && self.is_kw_at(1, "TIME") {
+            self.advance();
+            self.advance();
+            self.expect_kw("ZONE")?;
+        }
         self.eat_kw("PRECISION"); // DOUBLE PRECISION
         self.eat_kw("VARYING"); // CHARACTER VARYING
         // Length and precision modifiers, as in VARCHAR(255), are accepted and ignored.
@@ -538,8 +898,11 @@ impl Parser {
         } else if self.eat_kw("INDEX") {
             let if_exists = self.if_exists()?;
             Ok(Statement::DropIndex { if_exists, name: self.ident()? })
+        } else if self.eat_kw("VIEW") {
+            let if_exists = self.if_exists()?;
+            Ok(Statement::DropView { if_exists, name: self.ident()? })
         } else {
-            Err(self.unexpected("TABLE or INDEX"))
+            Err(self.unexpected("TABLE, INDEX or VIEW"))
         }
     }
 
@@ -580,8 +943,11 @@ impl Parser {
                 let expr = Box::new(lhs);
                 lhs = if self.eat_kw("IN") {
                     self.expect(Token::LParen)?;
-                    if self.is_kw("SELECT") {
-                        return Err(self.error("subqueries are not supported yet"));
+                    if self.is_kw("SELECT") || self.is_kw("WITH") {
+                        let select = Box::new(self.query()?);
+                        self.expect(Token::RParen)?;
+                        lhs = Expr::InSubquery { expr, select, negated };
+                        continue;
                     }
                     let list = self.expr_list()?;
                     self.expect(Token::RParen)?;
@@ -623,7 +989,16 @@ impl Parser {
             }
             self.advance();
             let rhs = self.expr_bp(prec + 1)?;
-            lhs = Expr::Binary { op, left: Box::new(lhs), right: Box::new(rhs) };
+            lhs = match (op, lhs, rhs) {
+                // time ± INTERVAL '...' shifts the time.
+                (BinaryOp::Add | BinaryOp::Sub, time, interval) | (BinaryOp::Add, interval, time)
+                    if is_interval(&interval) =>
+                {
+                    let name = if op == BinaryOp::Add { "date_add" } else { "date_sub" };
+                    Expr::Function { name: name.into(), args: vec![time, interval], distinct: false, star: false }
+                }
+                (op, lhs, rhs) => Expr::Binary { op, left: Box::new(lhs), right: Box::new(rhs) },
+            };
         }
         Ok(lhs)
     }
@@ -665,8 +1040,10 @@ impl Parser {
             }
             Token::LParen => {
                 self.advance();
-                if self.is_kw("SELECT") {
-                    return Err(self.error("subqueries are not supported yet"));
+                if self.is_kw("SELECT") || self.is_kw("WITH") {
+                    let select = self.query()?;
+                    self.expect(Token::RParen)?;
+                    return Ok(Expr::Subquery(Box::new(select)));
                 }
                 let expr = self.expr()?;
                 self.expect(Token::RParen)?;
@@ -695,7 +1072,69 @@ impl Parser {
                     self.expect(Token::RParen)?;
                     Ok(Expr::Cast { expr, ty })
                 }
-                "EXISTS" => Err(self.error("subqueries are not supported yet")),
+                "EXISTS" => {
+                    self.advance();
+                    self.expect(Token::LParen)?;
+                    let select = Box::new(self.query()?);
+                    self.expect(Token::RParen)?;
+                    Ok(Expr::Exists { select, negated: false })
+                }
+                // Typed literals: DATE '2024-03-15', TIMESTAMP '...', TIME '...'.
+                "DATE" | "TIME" | "TIMESTAMP" if matches!(self.peek_nth(1), Token::String(_)) => {
+                    let ty = self.data_type()?;
+                    let Token::String(s) = self.advance() else { unreachable!() };
+                    Ok(Expr::Cast { expr: Box::new(Expr::Literal(Value::Text(s))), ty })
+                }
+                // INTERVAL '1 day', INTERVAL '3' HOUR or INTERVAL 3 HOUR.
+                "INTERVAL" if matches!(self.peek_nth(1), Token::String(_) | Token::Number(_)) => {
+                    self.advance();
+                    let mut text = match self.advance() {
+                        Token::String(s) | Token::Number(s) => s,
+                        _ => unreachable!(),
+                    };
+                    if let Token::Word(unit) = self.peek().clone()
+                        && !is_reserved(&unit)
+                        && !unit.eq_ignore_ascii_case("AS")
+                    {
+                        self.advance();
+                        text = format!("{text} {}", unit.to_ascii_lowercase());
+                    }
+                    let literal = Expr::Literal(Value::Text(text));
+                    Ok(Expr::Function { name: "interval".into(), args: vec![literal], distinct: false, star: false })
+                }
+                "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME"
+                    if *self.peek_nth(1) != Token::LParen =>
+                {
+                    self.advance();
+                    Ok(Expr::Function {
+                        name: word.to_ascii_lowercase(),
+                        args: Vec::new(),
+                        distinct: false,
+                        star: false,
+                    })
+                }
+                // EXTRACT(field FROM time) is date_part('field', time).
+                "EXTRACT" if *self.peek_nth(1) == Token::LParen => {
+                    self.advance();
+                    self.advance();
+                    let field = match self.advance() {
+                        Token::Word(w) | Token::String(w) => w.to_ascii_lowercase(),
+                        _ => return Err(self.unexpected("a date field")),
+                    };
+                    self.expect_kw("FROM")?;
+                    let time = self.expr()?;
+                    self.expect(Token::RParen)?;
+                    let args = vec![Expr::Literal(Value::Text(field)), time];
+                    Ok(Expr::Function { name: "date_part".into(), args, distinct: false, star: false })
+                }
+                // MySQL's VALUES(column) in ON DUPLICATE KEY UPDATE.
+                "VALUES" if *self.peek_nth(1) == Token::LParen => {
+                    self.advance();
+                    self.advance();
+                    let column = self.column()?;
+                    self.expect(Token::RParen)?;
+                    Ok(Expr::Function { name: "values".into(), args: vec![column], distinct: false, star: false })
+                }
                 _ if *self.peek_nth(1) == Token::LParen && !is_reserved(&word) => self.function(),
                 _ => self.column(),
             },
@@ -724,14 +1163,108 @@ impl Parser {
     fn function(&mut self) -> Result<Expr> {
         let name = self.ident()?;
         self.expect(Token::LParen)?;
-        if self.eat(&Token::Star) {
-            self.expect(Token::RParen)?;
-            return Ok(Expr::Function { name, args: Vec::new(), distinct: false, star: true });
-        }
-        let distinct = self.eat_kw("DISTINCT");
-        let args = if *self.peek() == Token::RParen { Vec::new() } else { self.expr_list()? };
+        let (args, distinct, star) = if self.eat(&Token::Star) {
+            (Vec::new(), false, true)
+        } else {
+            let distinct = self.eat_kw("DISTINCT");
+            let args = if *self.peek() == Token::RParen { Vec::new() } else { self.expr_list()? };
+            (args, distinct, false)
+        };
         self.expect(Token::RParen)?;
-        Ok(Expr::Function { name, args, distinct, star: false })
+        if self.eat_kw("OVER") {
+            if distinct {
+                return Err(self.error("DISTINCT is not supported in window functions"));
+            }
+            let over = if *self.peek() == Token::LParen {
+                self.window_spec()?
+            } else {
+                WindowSpec { base: Some(self.ident()?), ..WindowSpec::default() }
+            };
+            return Ok(Expr::Window { name, args, star, over: Box::new(over) });
+        }
+        Ok(Expr::Function { name, args, distinct, star })
+    }
+
+    /// `expr [ASC | DESC], ...` after ORDER BY.
+    fn order_items(&mut self) -> Result<Vec<OrderBy>> {
+        let mut items = Vec::new();
+        loop {
+            let expr = self.expr()?;
+            let desc = self.eat_kw("DESC");
+            if !desc {
+                self.eat_kw("ASC");
+            }
+            items.push(OrderBy { expr, desc });
+            if !self.eat(&Token::Comma) {
+                return Ok(items);
+            }
+        }
+    }
+
+    /// `([name] [PARTITION BY ...] [ORDER BY ...] [frame])`
+    fn window_spec(&mut self) -> Result<WindowSpec> {
+        self.expect(Token::LParen)?;
+        let mut spec = WindowSpec::default();
+        if let Token::Word(w) = self.peek()
+            && !["PARTITION", "ORDER", "ROWS", "RANGE"].iter().any(|k| w.eq_ignore_ascii_case(k))
+        {
+            spec.base = Some(self.ident()?);
+        }
+        if self.eat_kw("PARTITION") {
+            self.expect_kw("BY")?;
+            spec.partition_by = self.expr_list()?;
+        }
+        if self.eat_kw("ORDER") {
+            self.expect_kw("BY")?;
+            spec.order_by = self.order_items()?;
+        }
+        let rows = self.is_kw("ROWS");
+        if rows || self.is_kw("RANGE") {
+            self.advance();
+            let (start, end) = if self.eat_kw("BETWEEN") {
+                let start = self.frame_bound()?;
+                self.expect_kw("AND")?;
+                (start, self.frame_bound()?)
+            } else {
+                (self.frame_bound()?, FrameBound::CurrentRow)
+            };
+            if start == FrameBound::UnboundedFollowing || end == FrameBound::UnboundedPreceding || start > end {
+                return Err(self.error("the window frame ends before it starts"));
+            }
+            if !rows
+                && (matches!(start, FrameBound::Preceding(_) | FrameBound::Following(_))
+                    || matches!(end, FrameBound::Preceding(_) | FrameBound::Following(_)))
+            {
+                return Err(self.error("RANGE with an offset is not supported; use ROWS"));
+            }
+            spec.frame = Some(Frame { rows, start, end });
+        }
+        self.expect(Token::RParen)?;
+        Ok(spec)
+    }
+
+    fn frame_bound(&mut self) -> Result<FrameBound> {
+        if self.eat_kw("UNBOUNDED") {
+            return if self.eat_kw("PRECEDING") {
+                Ok(FrameBound::UnboundedPreceding)
+            } else {
+                self.expect_kw("FOLLOWING")?;
+                Ok(FrameBound::UnboundedFollowing)
+            };
+        }
+        if self.eat_kw("CURRENT") {
+            self.expect_kw("ROW")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let Token::Number(n) = self.peek().clone() else { return Err(self.unexpected("a frame bound")) };
+        let n: u64 = n.parse().map_err(|_| self.error(format!("frame offset must be a whole number, not {n}")))?;
+        self.advance();
+        if self.eat_kw("PRECEDING") {
+            Ok(FrameBound::Preceding(n))
+        } else {
+            self.expect_kw("FOLLOWING")?;
+            Ok(FrameBound::Following(n))
+        }
     }
 
     fn case(&mut self) -> Result<Expr> {
@@ -814,6 +1347,22 @@ mod tests {
         let err = parse_statement("SELECT name FROM WHERE x = 1").unwrap_err().to_string();
         assert!(err.contains("column 18") && err.contains("expected an identifier, found WHERE"), "{err}");
         assert!(parse_statement("SELECT (1 + 2").unwrap_err().to_string().contains("expected ')'"));
-        assert!(parse_statement("SELECT * FROM t WHERE id IN (SELECT 1)").is_err());
+        assert!(parse_statement("SELECT * FROM t WHERE id IN (SELECT 1").is_err());
+        assert!(parse_statement("SELECT 1 UNION").is_err());
+    }
+
+    #[test]
+    fn compound_queries_group_intersect_first() {
+        let Statement::Select(q) = parse_statement("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3 ORDER BY 1").unwrap().0
+        else {
+            panic!()
+        };
+        // a UNION (b INTERSECT c), ordered as a whole.
+        assert_eq!(q.compound.len(), 1);
+        assert_eq!(q.order_by.len(), 1);
+        let (op, all, right) = &q.compound[0];
+        assert_eq!((*op, *all), (SetOp::Union, false));
+        let inner = right.from.as_ref().unwrap().base.subquery.as_ref().unwrap();
+        assert_eq!(inner.compound[0].0, SetOp::Intersect);
     }
 }

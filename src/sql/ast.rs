@@ -12,6 +12,10 @@ pub enum Statement {
         if_exists: bool,
     },
     CreateIndex(CreateIndex),
+    AlterTable {
+        table: String,
+        action: AlterAction,
+    },
     DropIndex {
         name: String,
         if_exists: bool,
@@ -20,9 +24,28 @@ pub enum Statement {
     Select(Box<Select>),
     Update(Update),
     Delete(Delete),
+    /// `CREATE [OR REPLACE] VIEW name [(columns)] AS query`
+    CreateView {
+        name: String,
+        columns: Vec<String>,
+        query: Box<Select>,
+        /// The query as written, which is what is stored.
+        sql: String,
+        or_replace: bool,
+        if_not_exists: bool,
+    },
+    DropView {
+        name: String,
+        if_exists: bool,
+    },
     Begin,
     Commit,
     Rollback,
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] name`
+    Release(String),
+    /// `ROLLBACK TO [SAVEPOINT] name`
+    RollbackTo(String),
     Explain(Box<Statement>),
     /// `LISTEN channel`
     Listen(String),
@@ -51,6 +74,54 @@ pub struct CreateTable {
     pub primary_key: Vec<String>,
     /// Table-level `UNIQUE (a, b)` constraints.
     pub unique: Vec<Vec<String>>,
+    /// `CHECK (expr)` constraints, the column-level ones included.
+    pub checks: Vec<CheckDef>,
+    /// `FOREIGN KEY (a) REFERENCES t (b)`, the column-level ones included.
+    pub foreign_keys: Vec<ForeignKeyDef>,
+}
+
+/// `[CONSTRAINT name] CHECK (expr)`: rows for which `expr` is false are refused.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckDef {
+    pub name: Option<String>,
+    pub expr: Expr,
+}
+
+/// `[CONSTRAINT name] FOREIGN KEY (columns) REFERENCES table [(columns)] [ON DELETE ...] [ON UPDATE ...]`
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForeignKeyDef {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub table: String,
+    /// Empty: the referenced table's primary key.
+    pub references: Vec<String>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
+/// What happens to referencing rows when the row they reference is deleted
+/// or its key changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FkAction {
+    /// Refuse, unless the statement leaves the referencing rows valid.
+    #[default]
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+impl fmt::Display for FkAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            FkAction::NoAction => "NO ACTION",
+            FkAction::Restrict => "RESTRICT",
+            FkAction::Cascade => "CASCADE",
+            FkAction::SetNull => "SET NULL",
+            FkAction::SetDefault => "SET DEFAULT",
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +132,18 @@ pub struct ColumnDef {
     pub not_null: bool,
     pub unique: bool,
     pub default: Option<Expr>,
+    pub checks: Vec<CheckDef>,
+    /// `REFERENCES table [(column)] ...`, with this column as the only one.
+    pub references: Option<ForeignKeyDef>,
+}
+
+/// What `ALTER TABLE` changes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterAction {
+    AddColumn(ColumnDef),
+    DropColumn(String),
+    RenameTable(String),
+    RenameColumn { from: String, to: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -77,6 +160,27 @@ pub struct Insert {
     pub table: String,
     pub columns: Option<Vec<String>>,
     pub source: InsertSource,
+    pub on_conflict: Option<OnConflict>,
+    pub returning: Vec<SelectItem>,
+}
+
+/// `ON CONFLICT [(columns)] DO ...`: what to do with a row whose key or
+/// unique values are taken. No columns: any unique constraint.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OnConflict {
+    pub target: Vec<String>,
+    pub action: ConflictAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConflictAction {
+    Nothing,
+    /// `DO UPDATE SET ... [WHERE ...]`, where `excluded.column` is the
+    /// value the insert proposed.
+    Update {
+        assignments: Vec<(String, Expr)>,
+        filter: Option<Expr>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -90,12 +194,14 @@ pub struct Update {
     pub table: String,
     pub assignments: Vec<(String, Expr)>,
     pub filter: Option<Expr>,
+    pub returning: Vec<SelectItem>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Delete {
     pub table: String,
     pub filter: Option<Expr>,
+    pub returning: Vec<SelectItem>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +215,165 @@ pub struct Select {
     pub order_by: Vec<OrderBy>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+    /// `UNION`, `INTERSECT` and `EXCEPT` with further queries, applied left
+    /// to right. ORDER BY, LIMIT and OFFSET above then apply to the result.
+    pub compound: Vec<(SetOp, bool, Select)>,
+    /// `WITH [RECURSIVE] name AS (query), ...` before the query.
+    pub with: Option<Box<With>>,
+    /// `WINDOW name AS (...), ...`: windows that `OVER name` refers to.
+    pub windows: Vec<(String, WindowSpec)>,
+}
+
+/// What `OVER (...)` describes: how rows are grouped and ordered for a
+/// window function, and which of them it sees.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WindowSpec {
+    /// A window named in the WINDOW clause that this one builds on.
+    pub base: Option<String>,
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderBy>,
+    pub frame: Option<Frame>,
+}
+
+/// `ROWS | RANGE BETWEEN start AND end`
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frame {
+    /// ROWS counts rows; RANGE also takes in the current row's peers.
+    pub rows: bool,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+impl fmt::Display for WindowSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts = Vec::new();
+        parts.extend(self.base.clone());
+        if !self.partition_by.is_empty() {
+            let exprs: Vec<String> = self.partition_by.iter().map(ToString::to_string).collect();
+            parts.push(format!("PARTITION BY {}", exprs.join(", ")));
+        }
+        if !self.order_by.is_empty() {
+            let exprs: Vec<String> =
+                self.order_by.iter().map(|o| format!("{}{}", o.expr, if o.desc { " DESC" } else { "" })).collect();
+            parts.push(format!("ORDER BY {}", exprs.join(", ")));
+        }
+        if let Some(frame) = &self.frame {
+            let bound = |b: FrameBound| match b {
+                FrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+                FrameBound::Preceding(n) => format!("{n} PRECEDING"),
+                FrameBound::CurrentRow => "CURRENT ROW".to_string(),
+                FrameBound::Following(n) => format!("{n} FOLLOWING"),
+                FrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+            };
+            let unit = if frame.rows { "ROWS" } else { "RANGE" };
+            parts.push(format!("{unit} BETWEEN {} AND {}", bound(frame.start), bound(frame.end)));
+        }
+        write!(f, "({})", parts.join(" "))
+    }
+}
+
+/// The common table expressions of a `WITH` clause.
+#[derive(Clone, Debug, PartialEq)]
+pub struct With {
+    pub recursive: bool,
+    pub ctes: Vec<Cte>,
+}
+
+/// `name [(columns)] AS (query)`
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub query: Select,
+}
+
+impl Select {
+    /// Calls `f` with every table this query names, in any FROM, join,
+    /// compound part or subquery within it.
+    pub fn visit_tables(&self, f: &mut dyn FnMut(&TableRef)) {
+        if let Some(with) = &self.with {
+            with.ctes.iter().for_each(|cte| cte.query.visit_tables(f));
+        }
+        let mut exprs: Vec<&Expr> = Vec::new();
+        if let Some(from) = &self.from {
+            for table in std::iter::once(&from.base).chain(from.joins.iter().map(|j| &j.table)) {
+                f(table);
+                if let Some(query) = &table.subquery {
+                    query.visit_tables(f);
+                }
+            }
+            exprs.extend(from.joins.iter().filter_map(|j| j.on.as_ref()));
+        }
+        for item in &self.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                exprs.push(expr);
+            }
+        }
+        exprs.extend(self.filter.iter().chain(&self.group_by).chain(&self.having));
+        exprs.extend(self.order_by.iter().map(|o| &o.expr));
+        for expr in exprs {
+            expr.walk(&mut |e| {
+                if let Expr::Subquery(select) | Expr::Exists { select, .. } | Expr::InSubquery { select, .. } = e {
+                    select.visit_tables(f);
+                }
+            });
+        }
+        self.compound.iter().for_each(|(_, _, part)| part.visit_tables(f));
+    }
+
+    /// `SELECT * FROM (query)`: the query as a single operand, keeping its
+    /// own ORDER BY, LIMIT and compound parts to itself.
+    pub fn wrapping(query: Select) -> Select {
+        Select {
+            distinct: false,
+            items: vec![SelectItem::Wildcard],
+            from: Some(From {
+                base: TableRef {
+                    name: "subquery".into(),
+                    alias: None,
+                    columns: Vec::new(),
+                    subquery: Some(Box::new(query)),
+                },
+                joins: Vec::new(),
+            }),
+            filter: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            compound: Vec::new(),
+            with: None,
+            windows: Vec::new(),
+        }
+    }
+}
+
+/// How a compound query combines its parts; the flag beside it means `ALL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl fmt::Display for SetOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SetOp::Union => "UNION",
+            SetOp::Intersect => "INTERSECT",
+            SetOp::Except => "EXCEPT",
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -133,6 +398,10 @@ pub struct From {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    /// Names for its columns: `AS name (a, b)`. Empty: their own names.
+    pub columns: Vec<String>,
+    /// A query in place of a table: `FROM (SELECT ...) AS name`.
+    pub subquery: Option<Box<Select>>,
 }
 
 impl TableRef {
@@ -207,6 +476,13 @@ pub enum Expr {
         distinct: bool,
         star: bool,
     },
+    /// `name(args) OVER (...)`: a window function.
+    Window {
+        name: String,
+        args: Vec<Expr>,
+        star: bool,
+        over: Box<WindowSpec>,
+    },
     Cast {
         expr: Box<Expr>,
         ty: DataType,
@@ -216,6 +492,19 @@ pub enum Expr {
         branches: Vec<(Expr, Expr)>,
         otherwise: Option<Box<Expr>>,
     },
+    /// `(SELECT ...)` as a value.
+    Subquery(Box<Select>),
+    /// `[NOT] EXISTS (SELECT ...)`
+    Exists {
+        select: Box<Select>,
+        negated: bool,
+    },
+    /// `expr [NOT] IN (SELECT ...)`
+    InSubquery {
+        expr: Box<Expr>,
+        select: Box<Select>,
+        negated: bool,
+    },
 }
 
 impl Expr {
@@ -223,8 +512,12 @@ impl Expr {
     pub fn walk(&self, f: &mut dyn FnMut(&Expr)) {
         f(self);
         match self {
-            Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) => {}
-            Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => expr.walk(f),
+            // A subquery's own expressions belong to it, not to this query.
+            Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) | Expr::Subquery(_) | Expr::Exists { .. } => {}
+            Expr::Unary { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::InSubquery { expr, .. } => expr.walk(f),
             Expr::Binary { left, right, .. } => {
                 left.walk(f);
                 right.walk(f);
@@ -243,6 +536,11 @@ impl Expr {
                 pattern.walk(f);
             }
             Expr::Function { args, .. } => args.iter().for_each(|e| e.walk(f)),
+            Expr::Window { args, over, .. } => {
+                args.iter().for_each(|e| e.walk(f));
+                over.partition_by.iter().for_each(|e| e.walk(f));
+                over.order_by.iter().for_each(|o| o.expr.walk(f));
+            }
             Expr::Case { operand, branches, otherwise } => {
                 operand.iter().for_each(|e| e.walk(f));
                 for (when, then) in branches {
@@ -250,6 +548,54 @@ impl Expr {
                     then.walk(f);
                 }
                 otherwise.iter().for_each(|e| e.walk(f));
+            }
+        }
+    }
+
+    /// Rewrites every node bottom-up with `f`.
+    pub fn rewrite(&mut self, f: &mut dyn FnMut(&mut Expr)) {
+        self.for_each_child(&mut |child| child.rewrite(f));
+        f(self);
+    }
+
+    /// Calls `f` with each direct child expression (not those inside subqueries).
+    pub fn for_each_child(&mut self, f: &mut dyn FnMut(&mut Expr)) {
+        match self {
+            Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) | Expr::Subquery(_) | Expr::Exists { .. } => {}
+            Expr::Unary { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::InSubquery { expr, .. } => f(expr),
+            Expr::Binary { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            Expr::InList { expr, list, .. } => {
+                f(expr);
+                list.iter_mut().for_each(&mut *f);
+            }
+            Expr::Between { expr, low, high, .. } => {
+                f(expr);
+                f(low);
+                f(high);
+            }
+            Expr::Like { expr, pattern, .. } => {
+                f(expr);
+                f(pattern);
+            }
+            Expr::Function { args, .. } => args.iter_mut().for_each(&mut *f),
+            Expr::Window { args, over, .. } => {
+                args.iter_mut().for_each(&mut *f);
+                over.partition_by.iter_mut().for_each(&mut *f);
+                over.order_by.iter_mut().for_each(|o| f(&mut o.expr));
+            }
+            Expr::Case { operand, branches, otherwise } => {
+                operand.iter_mut().for_each(|e| f(e));
+                for (when, then) in branches {
+                    f(when);
+                    f(then);
+                }
+                otherwise.iter_mut().for_each(|e| f(e));
             }
         }
     }
@@ -357,6 +703,24 @@ impl fmt::Display for Expr {
                 write!(f, "{} {}{op} {}", operand(expr), not(negated), operand(pattern))
             }
             Expr::Function { name, star: true, .. } => write!(f, "{name}(*)"),
+            // Written without parentheses, as SQL spells them.
+            Expr::Function { name, args, .. }
+                if args.is_empty()
+                    && matches!(
+                        name.as_str(),
+                        "current_timestamp" | "current_date" | "current_time" | "localtimestamp" | "localtime"
+                    ) =>
+            {
+                f.write_str(&name.to_ascii_uppercase())
+            }
+            Expr::Window { name, args, star, over } => {
+                let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+                let args = if *star { "*".to_string() } else { args.join(", ") };
+                write!(f, "{name}({args}) OVER {over}")
+            }
+            Expr::Function { name, args, .. } if name == "interval" && args.len() == 1 => {
+                write!(f, "INTERVAL {}", args[0])
+            }
             Expr::Function { name, args, distinct, .. } => {
                 let args: Vec<String> = args.iter().map(ToString::to_string).collect();
                 write!(f, "{name}({}{})", if *distinct { "DISTINCT " } else { "" }, args.join(", "))
@@ -375,6 +739,9 @@ impl fmt::Display for Expr {
                 }
                 f.write_str(" END")
             }
+            Expr::Subquery(_) => f.write_str("(SELECT ...)"),
+            Expr::Exists { negated, .. } => write!(f, "{}EXISTS (SELECT ...)", not(negated)),
+            Expr::InSubquery { expr, negated, .. } => write!(f, "{} {}IN (SELECT ...)", operand(expr), not(negated)),
         }
     }
 }

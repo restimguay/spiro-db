@@ -15,7 +15,7 @@ use spirodb::sql::{Database, Session, Value};
 const HELP: &str = "\
 Enter SQL statements ending with ';' (they may span several lines).
 
-  .tables            list tables
+  .tables            list tables and views
   .schema [table]    show CREATE statements
   .mode table|json   print results as tables or as JSON
   .timer on|off      show how long each statement takes
@@ -172,8 +172,12 @@ impl Shell {
 
     fn fallible_command(&mut self, line: &str, words: &[&str]) {
         let result = match words {
-            [".tables"] => self.db.table_names().map(|names| names.iter().for_each(|n| println!("{n}"))),
-            [".schema"] => self.db.table_names().and_then(|names| {
+            [".tables"] => self.db.table_names().and_then(|tables| {
+                tables.iter().for_each(|n| println!("{n}"));
+                self.db.view_names().map(|views| views.iter().for_each(|n| println!("{n} (view)")))
+            }),
+            [".schema"] => self.db.table_names().and_then(|mut names| {
+                names.extend(self.db.view_names()?);
                 for name in names {
                     println!("{}", self.db.schema(&name)?.unwrap_or_default());
                 }

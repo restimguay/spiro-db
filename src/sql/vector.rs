@@ -33,7 +33,7 @@ use super::catalog::TableSchema;
 use super::columnar::{self, Chunk, ColumnView, Kind};
 use super::encoding::{RawValue, encode_key, visit_row};
 use super::exec::{ReadSpec, read};
-use super::expr::{Accumulator, Aggregate, BExpr};
+use super::expr::{Accumulator, Aggregate, BExpr, Env};
 use super::plan::{Access, GroupPlan, SelectPlan};
 use super::txn::Txn;
 use super::value::{DataType, Value, cmp_f64};
@@ -66,7 +66,7 @@ pub fn applies(plan: &SelectPlan) -> bool {
     if DISABLED.with(|d| d.get()) {
         return false;
     }
-    plan.base.is_some() && plan.joins.is_empty() && plan.grouping.is_some()
+    plan.base.is_some() && plan.joins.is_empty() && plan.grouping.is_some() && plan.is_simple()
 }
 
 /// Runs the query's read, filters and aggregation. Only for plans that
@@ -92,7 +92,7 @@ pub fn aggregate(txn: &Txn, plan: &Arc<SelectPlan>, params: &[Value]) -> Result<
         return merge(vec![worker.groups]);
     }
     let spec = ReadSpec::new(&base.schema, &base.access, Some(&base.needed));
-    read(txn, &spec, &[], params, &mut |_, row| {
+    read(txn, &spec, &[], &Env::new(params, Some(txn)), &mut |_, row| {
         worker.narrowed = spec.narrowed.get();
         worker.push(row)?;
         Ok(true)
@@ -853,7 +853,7 @@ impl Column {
         match ty {
             DataType::Integer => Column::Int(Vec::new(), Vec::new()),
             DataType::Real => Column::Real(Vec::new(), Vec::new()),
-            DataType::Text | DataType::Boolean => Column::Any(Vec::new()),
+            _ => Column::Any(Vec::new()),
         }
     }
 
@@ -1106,7 +1106,7 @@ impl Batch {
                     *slot = column.get(i);
                 }
             }
-            out.push(e.eval(&row, params)?);
+            out.push(e.eval(&row, &Env::new(params, None))?);
         }
         Ok(Vector::Any(out))
     }
@@ -1190,7 +1190,7 @@ fn fast(e: &BExpr, batch: &Batch, params: &[Value]) -> Result<Option<Vector>> {
     let n = batch.len;
     Ok(match e {
         BExpr::Literal(v) => Some(Vector::Const(v.clone())),
-        BExpr::Param(_) => Some(Vector::Const(e.eval(&[], params)?)),
+        BExpr::Param(_) => Some(Vector::Const(e.eval(&[], &Env::new(params, None))?)),
         BExpr::Column(c) => Some(match &batch.columns[*c] {
             Some(column) => column.vector(),
             None => Vector::Const(Value::Null), // not read, as in the row executor
@@ -1776,7 +1776,7 @@ mod tests {
                         crate::sql::ast::Statement::Select(s) => s,
                         _ => unreachable!(),
                     },
-                    &super::super::expr::Binder { params: &[] },
+                    &super::super::expr::Binder::new(&[], &txn),
                 )
                 .unwrap(),
             );

@@ -75,6 +75,8 @@ pub struct Located {
     pub token: Token,
     pub line: usize,
     pub column: usize,
+    /// Where the token starts in the SQL, in characters.
+    pub offset: usize,
 }
 
 pub fn syntax_error(line: usize, column: usize, msg: impl std::fmt::Display) -> Error {
@@ -135,7 +137,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Located>> {
     let mut lx = Lexer { chars: sql.chars().collect(), pos: 0, line: 1, column: 1 };
     let mut tokens = Vec::new();
     while let Some(c) = lx.peek(0) {
-        let (line, column) = (lx.line, lx.column);
+        let (line, column, offset) = (lx.line, lx.column, lx.pos);
         let token = match c {
             c if c.is_whitespace() => {
                 lx.bump();
@@ -222,9 +224,9 @@ pub fn tokenize(sql: &str) -> Result<Vec<Located>> {
                 }
             }
         };
-        tokens.push(Located { token, line, column });
+        tokens.push(Located { token, line, column, offset });
     }
-    tokens.push(Located { token: Token::Eof, line: lx.line, column: lx.column });
+    tokens.push(Located { token: Token::Eof, line: lx.line, column: lx.column, offset: lx.pos });
     Ok(tokens)
 }
 

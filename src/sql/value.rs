@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+use super::datetime;
 use crate::error::{Error, Result};
 
 pub(crate) fn sql_error(msg: impl Into<String>) -> Error {
@@ -16,6 +17,18 @@ pub enum DataType {
     Real,
     Text,
     Boolean,
+    /// Stored as `YYYY-MM-DD` text.
+    Date,
+    /// Stored as `HH:MM:SS[.ffffff]` text.
+    Time,
+    /// Stored as `YYYY-MM-DD HH:MM:SS[.ffffff]` text, in UTC.
+    Timestamp,
+}
+
+impl DataType {
+    pub fn is_temporal(self) -> bool {
+        matches!(self, DataType::Date | DataType::Time | DataType::Timestamp)
+    }
 }
 
 impl fmt::Display for DataType {
@@ -25,6 +38,9 @@ impl fmt::Display for DataType {
             DataType::Real => "REAL",
             DataType::Text => "TEXT",
             DataType::Boolean => "BOOLEAN",
+            DataType::Date => "DATE",
+            DataType::Time => "TIME",
+            DataType::Timestamp => "TIMESTAMP",
         })
     }
 }
@@ -148,6 +164,10 @@ impl Value {
     pub(crate) fn assign_to(self, ty: DataType) -> Result<Value, Value> {
         match (self, ty) {
             (Value::Null, _) => Ok(Value::Null),
+            (Value::Text(s), ty) if ty.is_temporal() => match datetime::normalize(&s, ty) {
+                Some(normal) => Ok(Value::Text(normal)),
+                None => Err(Value::Text(s)),
+            },
             (Value::Integer(i), DataType::Real) => Ok(Value::Real(i as f64)),
             (Value::Real(r), DataType::Integer) if r.fract() == 0.0 && r >= i64::MIN as f64 && r < i64::MAX as f64 => {
                 Ok(Value::Integer(r as i64))
@@ -162,6 +182,8 @@ impl Value {
         let fail = || sql_error(format!("cannot cast {} to {ty}", self.literal()));
         Ok(match (self, ty) {
             (Value::Null, _) => Value::Null,
+            (Value::Text(s), ty) if ty.is_temporal() => Value::Text(datetime::normalize(s, ty).ok_or_else(fail)?),
+            (_, DataType::Date | DataType::Time | DataType::Timestamp) => return Err(fail()),
             (Value::Integer(_), DataType::Integer) => self.clone(),
             (Value::Real(r), DataType::Integer) => {
                 if !r.is_finite() || *r < i64::MIN as f64 || *r >= i64::MAX as f64 {

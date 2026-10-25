@@ -26,9 +26,11 @@
 mod ast;
 mod catalog;
 mod columnar;
+mod datetime;
 mod encoding;
 mod exec;
 mod expr;
+mod integrity;
 mod lexer;
 mod notify;
 mod parser;
@@ -37,6 +39,7 @@ pub(crate) mod repl;
 mod txn;
 mod value;
 mod vector;
+mod window;
 
 use std::fmt;
 use std::path::Path;
@@ -306,10 +309,17 @@ impl Database {
         Ok(catalog::list_tables(&txn)?.into_iter().map(|t| t.name).collect())
     }
 
+    pub fn view_names(&self) -> Result<Vec<String>> {
+        let txn = self.read_txn();
+        Ok(catalog::list_views(&txn)?.into_iter().map(|v| v.name).collect())
+    }
+
     /// The CREATE statements for a table and its indexes.
     pub fn schema(&self, table: &str) -> Result<Option<String>> {
         let txn = self.read_txn();
-        let Some(schema) = catalog::get_table(&txn, table)? else { return Ok(None) };
+        let Some(schema) = catalog::get_table(&txn, table)? else {
+            return Ok(catalog::get_view(&txn, table)?.map(|view| view.to_sql() + ";"));
+        };
         let mut statements = vec![schema.to_sql()];
         statements.extend(catalog::indexes_of(&txn, table)?.iter().map(|i| i.to_sql(&schema)));
         Ok(Some(statements.join(";\n") + ";"))
@@ -708,6 +718,25 @@ impl Session {
                 self.txn.take().ok_or_else(|| Error::Sql("no transaction is open".into()))?;
                 self.pending_listens.clear();
                 Ok(QueryResult::Done("ROLLBACK"))
+            }
+            Statement::Savepoint(name) | Statement::Release(name) | Statement::RollbackTo(name) => {
+                let txn =
+                    self.txn.as_mut().ok_or_else(|| Error::Sql("savepoints need a transaction (BEGIN)".into()))?;
+                Ok(QueryResult::Done(match statement {
+                    Statement::Savepoint(_) => {
+                        txn.savepoint(name, self.pending_listens.len());
+                        "SAVEPOINT"
+                    }
+                    Statement::Release(_) => {
+                        txn.release(name)?;
+                        "RELEASE"
+                    }
+                    _ => {
+                        let listens = txn.rollback_to(name)?;
+                        self.pending_listens.truncate(listens);
+                        "ROLLBACK"
+                    }
+                }))
             }
             Statement::Listen(_) | Statement::Unlisten(_) => {
                 if self.txn.is_some() {

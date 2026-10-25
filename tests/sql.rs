@@ -795,3 +795,847 @@ fn query_each_streams_the_same_rows_as_query() {
     assert_eq!(last, Some(Value::Integer(1000)));
     session.execute("ROLLBACK").unwrap();
 }
+
+/// Users and their orders, for subquery tests.
+fn shop(db: &Database) {
+    run(
+        db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL);
+         INSERT INTO users VALUES (1, 'Ada', 'London'), (2, 'Alan', 'London'), (3, 'Grace', 'NYC'), (4, 'Edsger', NULL);
+         INSERT INTO orders VALUES (1, 1, 10.0), (2, 1, 25.5), (3, 3, 7.25), (4, 3, 100.0), (5, 3, 1.0), (6, NULL, 3.0)",
+    );
+}
+
+#[test]
+fn scalar_subqueries() {
+    let (_dir, db) = open("subq-scalar");
+    shop(&db);
+    assert_eq!(query(&db, "SELECT (SELECT max(total) FROM orders)"), rows![[100.0]]);
+    assert_eq!(
+        query(&db, "SELECT name FROM users WHERE id = (SELECT user_id FROM orders WHERE total = 100.0)"),
+        rows![["Grace"]]
+    );
+    // No rows: NULL. More than one: an error.
+    assert_eq!(query(&db, "SELECT (SELECT id FROM orders WHERE total > 1000)"), vec![vec![Value::Null]]);
+    assert!(error(&db, "SELECT (SELECT id FROM orders)").contains("more than one row"));
+    assert!(error(&db, "SELECT (SELECT id, total FROM orders WHERE id = 1)").contains("one column"));
+    // Correlated: each user's order count and largest order.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT name, (SELECT count(*) FROM orders o WHERE o.user_id = u.id),
+                    (SELECT max(total) FROM orders WHERE user_id = u.id)
+             FROM users u ORDER BY id"
+        ),
+        rows![["Ada", 2, 25.5], ["Alan", 0, NULL], ["Grace", 3, 100.0], ["Edsger", 0, NULL]]
+    );
+    // In WHERE, comparing with a correlated aggregate.
+    assert_eq!(
+        query(&db, "SELECT id FROM orders o WHERE total > (SELECT avg(total) FROM orders WHERE user_id = o.user_id)"),
+        rows![[2], [4]]
+    );
+}
+
+#[test]
+fn in_and_exists_subqueries() {
+    let (_dir, db) = open("subq-in");
+    shop(&db);
+    assert_eq!(
+        query(&db, "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders) ORDER BY id"),
+        rows![["Ada"], ["Grace"]]
+    );
+    // NOT IN with a NULL in the subquery: unknown for everyone, as in SQL.
+    assert_eq!(
+        query(&db, "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)"),
+        Vec::<Vec<Value>>::new()
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE user_id IS NOT NULL) ORDER BY id"
+        ),
+        rows![["Alan"], ["Edsger"]]
+    );
+    // An empty subquery: IN is false, NOT IN true, even for NULL.
+    assert_eq!(
+        query(&db, "SELECT count(*) FROM users WHERE city NOT IN (SELECT name FROM users WHERE id > 99)"),
+        rows![[4]]
+    );
+    // 1 and 1.0 are equal, as in comparisons.
+    assert_eq!(query(&db, "SELECT count(*) FROM orders WHERE total IN (SELECT 10)"), rows![[1]]);
+    // Correlated EXISTS and NOT EXISTS.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT name FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE user_id = u.id AND total > 20) ORDER BY id"
+        ),
+        rows![["Ada"], ["Grace"]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT name FROM users u WHERE NOT EXISTS (SELECT * FROM orders o WHERE o.user_id = u.id) ORDER BY id"
+        ),
+        rows![["Alan"], ["Edsger"]]
+    );
+    // Subqueries with parameters.
+    let prepared =
+        db.prepare("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > ?)").unwrap();
+    let rows = db.session().execute_prepared(&prepared, &[Value::Real(50.0)]).unwrap();
+    assert_eq!(rows.rows().unwrap().rows, rows![["Grace"]]);
+}
+
+#[test]
+fn queries_in_from() {
+    let (_dir, db) = open("subq-from");
+    shop(&db);
+    assert_eq!(
+        query(
+            &db,
+            "SELECT t.user_id, t.n FROM (SELECT user_id, count(*) AS n FROM orders GROUP BY user_id) AS t
+             WHERE t.n > 1 ORDER BY t.n DESC"
+        ),
+        rows![[3, 3], [1, 2]]
+    );
+    // Joined with a table, by alias.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT u.name, big.total FROM users u JOIN (SELECT user_id, total FROM orders WHERE total >= 25) big
+             ON big.user_id = u.id ORDER BY big.total"
+        ),
+        rows![["Ada", 25.5], ["Grace", 100.0]]
+    );
+    assert_eq!(query(&db, "SELECT count(*) FROM (SELECT DISTINCT city FROM users) AS c"), rows![[3]]);
+}
+
+#[test]
+fn union_intersect_except() {
+    let (_dir, db) = open("set-ops");
+    run(
+        &db,
+        "CREATE TABLE a (x INTEGER); CREATE TABLE b (x INTEGER);
+         INSERT INTO a VALUES (1), (2), (2), (3), (NULL);
+         INSERT INTO b VALUES (2), (3), (3), (4), (NULL)",
+    );
+    let sorted = |sql: &str| query(&db, &format!("{sql} ORDER BY 1"));
+    assert_eq!(sorted("SELECT x FROM a UNION SELECT x FROM b"), rows![[NULL], [1], [2], [3], [4]]);
+    assert_eq!(query(&db, "SELECT count(*) FROM (SELECT x FROM a UNION ALL SELECT x FROM b) AS u"), rows![[10]]);
+    assert_eq!(sorted("SELECT x FROM a INTERSECT SELECT x FROM b"), rows![[NULL], [2], [3]]);
+    assert_eq!(sorted("SELECT x FROM a INTERSECT ALL SELECT x FROM b"), rows![[NULL], [2], [3]]);
+    assert_eq!(sorted("SELECT x FROM a EXCEPT SELECT x FROM b"), rows![[1]]);
+    assert_eq!(sorted("SELECT x FROM a EXCEPT ALL SELECT x FROM b"), rows![[1], [2]]);
+    // INTERSECT binds first: a UNION (b INTERSECT a).
+    assert_eq!(sorted("SELECT 9 UNION SELECT x FROM b INTERSECT SELECT x FROM a"), rows![[NULL], [2], [3], [9]]);
+    // ORDER BY and LIMIT apply to the whole; parts in parentheses keep their own.
+    assert_eq!(query(&db, "SELECT x FROM a UNION SELECT x FROM b ORDER BY x DESC LIMIT 2"), rows![[4], [3]]);
+    assert_eq!(
+        query(
+            &db,
+            "(SELECT x FROM a WHERE x IS NOT NULL ORDER BY x LIMIT 1) UNION ALL (SELECT x FROM b ORDER BY x DESC LIMIT 1)"
+        ),
+        rows![[1], [4]]
+    );
+    assert_eq!(
+        query(&db, "SELECT 'a' AS label, 1 UNION ALL SELECT 'b', 2 ORDER BY label DESC"),
+        rows![["b", 2], ["a", 1]]
+    );
+    assert!(error(&db, "SELECT x FROM a UNION SELECT x, x FROM b").contains("same number of columns"));
+    assert!(error(&db, "SELECT x FROM a UNION SELECT x FROM b ORDER BY x + 1").contains("result column"));
+    // In INSERT ... SELECT.
+    run(&db, "CREATE TABLE c (x INTEGER); INSERT INTO c SELECT x FROM a UNION SELECT x FROM b");
+    assert_eq!(query(&db, "SELECT count(*) FROM c"), rows![[5]]);
+}
+
+#[test]
+fn subqueries_in_writes() {
+    let (_dir, db) = open("subq-writes");
+    shop(&db);
+    run(&db, "UPDATE users SET city = (SELECT city FROM users WHERE id = 1) WHERE city IS NULL");
+    assert_eq!(query(&db, "SELECT city FROM users WHERE id = 4"), rows![["London"]]);
+    run(&db, "DELETE FROM orders WHERE user_id NOT IN (SELECT id FROM users WHERE city = 'London') OR user_id IS NULL");
+    assert_eq!(query(&db, "SELECT id FROM orders ORDER BY id"), rows![[1], [2]]);
+    run(
+        &db,
+        "INSERT INTO orders (user_id, total) VALUES ((SELECT id FROM users WHERE name = 'Alan'), (SELECT sum(total) FROM orders))",
+    );
+    assert_eq!(query(&db, "SELECT user_id, total FROM orders WHERE id = 7"), rows![[2, 35.5]]);
+    // Inside a transaction, subqueries see its own writes.
+    let mut s = db.session();
+    s.execute("BEGIN").unwrap();
+    s.execute("INSERT INTO users VALUES (5, 'Barbara', 'Boston')").unwrap();
+    let rows =
+        s.execute("SELECT count(*) FROM users WHERE id IN (SELECT id FROM users WHERE city = 'Boston')").unwrap();
+    assert_eq!(rows.rows().unwrap().rows, rows![[1]]);
+    s.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn alter_table() {
+    let (dir, db) = open("alter");
+    run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER); CREATE INDEX t_score ON t (score);");
+    run(&db, "INSERT INTO t (name, score) VALUES ('a', 10), ('b', 20)");
+    let by_name = db.prepare("SELECT id FROM t WHERE name = 'b'").unwrap();
+    db.session().execute_prepared(&by_name, &[]).unwrap();
+
+    // ADD COLUMN: existing rows get the default (or NULL without one).
+    run(&db, "ALTER TABLE t ADD COLUMN level INTEGER NOT NULL DEFAULT 1");
+    run(&db, "ALTER TABLE t ADD note TEXT");
+    run(&db, "INSERT INTO t (name, score, level, note) VALUES ('c', 30, 5, 'new')");
+    assert_eq!(
+        query(&db, "SELECT name, level, note FROM t ORDER BY id"),
+        rows![["a", 1, NULL], ["b", 1, NULL], ["c", 5, "new"]]
+    );
+    assert!(error(&db, "ALTER TABLE t ADD COLUMN must INTEGER NOT NULL").contains("need a DEFAULT"));
+    assert!(error(&db, "ALTER TABLE t ADD COLUMN name TEXT").contains("already exists"));
+    assert!(error(&db, "INSERT INTO t (name, level) VALUES ('x', NULL)").contains("NOT NULL"));
+
+    // UNIQUE builds an index, and fails on duplicates.
+    run(&db, "ALTER TABLE t ADD COLUMN code TEXT UNIQUE");
+    run(&db, "UPDATE t SET code = name");
+    assert!(error(&db, "INSERT INTO t (name, code) VALUES ('d', 'a')").contains("UNIQUE"));
+    assert!(error(&db, "ALTER TABLE t ADD COLUMN flag INTEGER UNIQUE DEFAULT 0").contains("UNIQUE"));
+
+    // RENAME COLUMN and RENAME TO.
+    run(&db, "ALTER TABLE t RENAME COLUMN score TO points; ALTER TABLE t RENAME TO items");
+    assert!(error(&db, "SELECT * FROM t").contains("no such table"));
+    assert_eq!(query(&db, "SELECT name FROM items WHERE points = 20"), rows![["b"]]);
+    let explain = query(&db, "EXPLAIN SELECT name FROM items WHERE points = 20");
+    assert!(format!("{explain:?}").contains("t_score"), "{explain:?}");
+    // The prepared statement re-plans against the new schema (and fails, since t is gone).
+    assert!(db.session().execute_prepared(&by_name, &[]).is_err());
+
+    // DROP COLUMN: indexes on it go, the others keep working.
+    run(&db, "ALTER TABLE items DROP COLUMN name");
+    assert_eq!(
+        query(&db, "SELECT id, points, level FROM items WHERE points >= 20 ORDER BY id"),
+        rows![[2, 20, 1], [3, 30, 5]]
+    );
+    run(&db, "ALTER TABLE items DROP COLUMN points");
+    assert_eq!(query(&db, "SELECT count(*) FROM items WHERE level = 1"), rows![[2]]);
+    assert!(error(&db, "ALTER TABLE items DROP COLUMN id").contains("primary key"));
+    assert!(error(&db, "ALTER TABLE items DROP COLUMN nope").contains("no such column"));
+
+    // All of it survives reopening.
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(
+        query(&db, "SELECT id, level, note, code FROM items ORDER BY id"),
+        rows![[1, 1, NULL, "a"], [2, 1, NULL, "b"], [3, 5, "new", "c"]]
+    );
+    assert_eq!(
+        db.schema("items").unwrap().unwrap(),
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, level INTEGER NOT NULL DEFAULT 1, note TEXT, code TEXT);\n\
+         CREATE UNIQUE INDEX t_code_key ON items (code);"
+    );
+}
+
+#[test]
+fn upsert() {
+    let (_dir, db) = open("upsert");
+    run(&db, "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER, hits INTEGER DEFAULT 0)");
+    run(&db, "INSERT INTO kv (k, v) VALUES ('a', 1), ('b', 2)");
+
+    // DO NOTHING skips taken keys and inserts the rest.
+    let result = db.execute("INSERT INTO kv (k, v) VALUES ('a', 10), ('c', 3) ON CONFLICT DO NOTHING").unwrap();
+    assert_eq!(result.to_string(), "INSERT 1");
+    run(&db, "INSERT OR IGNORE INTO kv (k, v) VALUES ('b', 20)");
+    assert_eq!(query(&db, "SELECT k, v FROM kv ORDER BY k"), rows![["a", 1], ["b", 2], ["c", 3]]);
+
+    // DO UPDATE sees the stored row and the proposed one as excluded.
+    run(
+        &db,
+        "INSERT INTO kv (k, v) VALUES ('a', 5), ('d', 4) ON CONFLICT (k) DO UPDATE SET v = kv.v + excluded.v, hits = hits + 1",
+    );
+    assert_eq!(
+        query(&db, "SELECT k, v, hits FROM kv ORDER BY k"),
+        rows![["a", 6, 1], ["b", 2, 0], ["c", 3, 0], ["d", 4, 0]]
+    );
+    // ... unless its WHERE rejects the row.
+    run(
+        &db,
+        "INSERT INTO kv (k, v) VALUES ('a', 100), ('b', 100) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE kv.v < 5",
+    );
+    assert_eq!(query(&db, "SELECT k, v FROM kv WHERE k IN ('a', 'b') ORDER BY k"), rows![["a", 6], ["b", 100]]);
+    // MySQL's spelling.
+    run(&db, "INSERT INTO kv (k, v) VALUES ('c', 30) ON DUPLICATE KEY UPDATE v = VALUES(v) + 1");
+    assert_eq!(query(&db, "SELECT v FROM kv WHERE k = 'c'"), rows![[31]]);
+
+    // Unique indexes conflict too, and the target picks which ones count.
+    run(&db, "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)");
+    run(&db, "INSERT INTO users (email, name) VALUES ('x@a', 'X'), ('y@a', 'Y')");
+    run(
+        &db,
+        "INSERT INTO users (email, name) VALUES ('x@a', 'X2') ON CONFLICT (email) DO UPDATE SET name = excluded.name",
+    );
+    assert_eq!(query(&db, "SELECT id, email, name FROM users ORDER BY id"), rows![[1, "x@a", "X2"], [2, "y@a", "Y"]]);
+    assert_eq!(query(&db, "SELECT name FROM users WHERE email = 'x@a'"), rows![["X2"]]);
+    // A conflict on a constraint the target doesn't name still fails.
+    assert!(
+        error(&db, "INSERT INTO users (id, email) VALUES (1, 'z@a') ON CONFLICT (email) DO NOTHING").contains("UNIQUE")
+    );
+    assert!(error(&db, "INSERT INTO users (name) VALUES ('n') ON CONFLICT (name) DO NOTHING").contains("matches no"));
+    // An update that moves onto another row's unique value fails.
+    assert!(
+        error(&db, "INSERT INTO users (id, email) VALUES (2, 'q@a') ON CONFLICT (id) DO UPDATE SET email = 'x@a'")
+            .contains("UNIQUE")
+    );
+    assert_eq!(query(&db, "SELECT count(*) FROM users"), rows![[2]]);
+}
+
+#[test]
+fn returning() {
+    let (_dir, db) = open("returning");
+    run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER DEFAULT 0)");
+    // Auto-assigned ids and defaults come back.
+    let rows = query(&db, "INSERT INTO t (name) VALUES ('a'), ('b') RETURNING *");
+    assert_eq!(rows, rows![[1, "a", 0], [2, "b", 0]]);
+    let result =
+        db.query("INSERT INTO t (name, score) VALUES ('c', 5) RETURNING id, upper(name) AS shout", &[]).unwrap();
+    assert_eq!(result.columns, vec!["id", "shout"]);
+    assert_eq!(result.rows, rows![[3, "C"]]);
+
+    assert_eq!(
+        query(&db, "UPDATE t SET score = score + 10 WHERE id <= 2 RETURNING id, score"),
+        rows![[1, 10], [2, 10]]
+    );
+    assert_eq!(query(&db, "DELETE FROM t WHERE score = 10 RETURNING name"), rows![["a"], ["b"]]);
+    assert_eq!(query(&db, "SELECT name FROM t"), rows![["c"]]);
+
+    // An upsert returns the rows it inserted or updated, not the ones it skipped.
+    let rows = query(
+        &db,
+        "INSERT INTO t (id, name) VALUES (3, 'c2'), (4, 'd') ON CONFLICT (id) DO UPDATE SET name = excluded.name RETURNING id, name",
+    );
+    assert_eq!(rows, rows![[3, "c2"], [4, "d"]]);
+    assert!(query(&db, "INSERT INTO t (id, name) VALUES (3, 'x') ON CONFLICT DO NOTHING RETURNING id").is_empty());
+    assert!(error(&db, "DELETE FROM t RETURNING nope").contains("no such column"));
+}
+
+#[test]
+fn dates_and_times() {
+    let (dir, db) = open("dates");
+    run(
+        &db,
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, day DATE, at TIMESTAMP, starts TIME,
+             created TIMESTAMP DEFAULT CURRENT_TIMESTAMP, logged DATE DEFAULT CURRENT_DATE);
+         CREATE INDEX events_at ON events (at)",
+    );
+    // Values are checked and stored in canonical form, in UTC.
+    run(
+        &db,
+        "INSERT INTO events (day, at, starts) VALUES
+             ('2024-03-15', '2024-03-15T09:30:00Z', '09:30'),
+             ('2024-02-29', '2024-02-29 23:15:00.5+02:00', '21:15:00'),
+             (DATE '2025-01-01', TIMESTAMP '2025-01-01', TIME '00:00:01')",
+    );
+    assert_eq!(
+        query(&db, "SELECT day, at, starts FROM events ORDER BY at"),
+        rows![
+            ["2024-02-29", "2024-02-29 21:15:00.5", "21:15:00"],
+            ["2024-03-15", "2024-03-15 09:30:00", "09:30:00"],
+            ["2025-01-01", "2025-01-01 00:00:00", "00:00:01"],
+        ]
+    );
+    assert!(error(&db, "INSERT INTO events (day) VALUES ('2023-02-29')").contains("cannot store"));
+    assert!(error(&db, "INSERT INTO events (at) VALUES ('noon')").contains("cannot store"));
+    assert!(error(&db, "INSERT INTO events (day) VALUES (20240101)").contains("cannot store"));
+    assert!(error(&db, "SELECT CAST('13:00' AS DATE)").contains("cannot cast"));
+
+    // Comparisons and ranges work on the text, and can use an index.
+    assert_eq!(query(&db, "SELECT id FROM events WHERE at >= '2024-03-01' AND at < '2024-04-01'"), rows![[1]]);
+    let explain = query(&db, "EXPLAIN SELECT id FROM events WHERE at BETWEEN '2024-01-01' AND '2024-12-31'");
+    assert!(format!("{explain:?}").contains("events_at"), "{explain:?}");
+
+    // Clock defaults: every row of one statement gets the same time.
+    let rows = query(&db, "SELECT DISTINCT created, logged FROM events");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let created = rows[0][0].to_string();
+    assert!(created.len() >= 19, "{created}");
+    assert_eq!(rows[0][1].to_string(), created[..10]);
+    assert!(db.schema("events").unwrap().unwrap().contains("created TIMESTAMP DEFAULT CURRENT_TIMESTAMP"));
+    assert_eq!(query(&db, "SELECT now() = current_timestamp, current_date = date('now')"), rows![[true, true]]);
+
+    // Arithmetic and functions.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT day + INTERVAL '1 month', at - INTERVAL '30 minutes', starts + INTERVAL 3 HOUR,
+                    date_add(day, '2 days'), date_sub(day, INTERVAL '1 year')
+             FROM events WHERE id = 2"
+        ),
+        rows![["2024-03-29", "2024-02-29 20:45:00.5", "00:15:00", "2024-03-02", "2023-02-28"]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT EXTRACT(year FROM at), date_part('month', at), extract(dow FROM day), extract(second FROM at),
+                    date_trunc('month', at), strftime('%d/%m/%Y %H:%M', at), datediff('2024-03-15', day)
+             FROM events WHERE id = 2"
+        ),
+        rows![[2024, 2, 4, 0.5, "2024-02-01 00:00:00", "29/02/2024 21:15", 15]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT date('2024-03-15 10:00', 'start of month', '+1 month', '-1 day'), time('2024-03-15 10:20:30'),
+                    datetime(0, 'unixepoch'), unixepoch('1970-01-02'), julianday('2000-01-01 12:00')"
+        ),
+        rows![["2024-03-31", "10:20:30", "1970-01-01 00:00:00", 86400, 2_451_545.0]]
+    );
+    assert_eq!(
+        query(&db, "SELECT count(*), min(day), max(at) FROM events GROUP BY date_trunc('year', at) ORDER BY 2"),
+        rows![[2, "2024-02-29", "2024-03-15 09:30:00"], [1, "2025-01-01", "2025-01-01 00:00:00"]]
+    );
+    assert!(error(&db, "SELECT INTERVAL '3 fortnights'").contains("invalid interval"));
+    assert!(error(&db, "SELECT date('2024-01-01', 'localtime')").contains("UTC"));
+    assert!(error(&db, "CREATE TABLE bad (n INTEGER DEFAULT CURRENT_TIMESTAMP)").contains("current time"));
+
+    // ALTER TABLE ADD COLUMN with a clock default fills existing rows.
+    run(&db, "ALTER TABLE events ADD COLUMN seen TIMESTAMP DEFAULT now()");
+    assert_eq!(query(&db, "SELECT count(*) FROM events WHERE seen IS NULL"), rows![[0]]);
+
+    // Types and clock defaults survive a reopen.
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    assert!(error(&db, "INSERT INTO events (day) VALUES ('soon')").contains("DATE"));
+    run(&db, "INSERT INTO events (day) VALUES ('2030-06-01')");
+    assert_eq!(query(&db, "SELECT count(*) FROM events WHERE created IS NOT NULL AND id = 4"), rows![[1]]);
+}
+
+#[test]
+fn common_table_expressions() {
+    let (_dir, db) = open("ctes");
+    shop(&db);
+    // A CTE reads like a table; later ones can use earlier ones.
+    assert_eq!(
+        query(
+            &db,
+            "WITH spend AS (SELECT user_id, sum(total) AS total FROM orders GROUP BY user_id),
+                  big AS (SELECT user_id FROM spend WHERE total > 100)
+             SELECT u.name FROM users u JOIN big ON big.user_id = u.id ORDER BY u.name"
+        ),
+        query(
+            &db,
+            "SELECT name FROM users WHERE id IN
+                 (SELECT user_id FROM orders GROUP BY user_id HAVING sum(total) > 100) ORDER BY name"
+        )
+    );
+    // Column names, use in subqueries, and a CTE named twice.
+    assert_eq!(
+        query(
+            &db,
+            "WITH t(a, b) AS (SELECT 1, 2 UNION ALL SELECT 3, 4) SELECT b, a FROM t WHERE a > (SELECT min(a) FROM t)"
+        ),
+        rows![[4, 3]]
+    );
+    assert_eq!(query(&db, "WITH t AS (SELECT 1 AS n) SELECT x.n + y.n FROM t x, t y"), rows![[2]]);
+    assert_eq!(query(&db, "SELECT x FROM (SELECT 1, 2) AS s (x, y)"), rows![[1]]);
+    // A CTE hides a table of the same name.
+    assert_eq!(query(&db, "WITH users AS (SELECT 'nobody' AS name) SELECT name FROM users"), rows![["nobody"]]);
+    // Inside INSERT ... SELECT and in parentheses.
+    run(&db, "CREATE TABLE squares (n INTEGER PRIMARY KEY, sq INTEGER)");
+    run(&db, "INSERT INTO squares WITH n(v) AS (SELECT 1 UNION ALL SELECT 2) SELECT v, v * v FROM n");
+    assert_eq!(query(&db, "(WITH x AS (SELECT sq FROM squares) SELECT sum(sq) FROM x)"), rows![[5]]);
+
+    assert!(error(&db, "WITH t AS (SELECT 1), t AS (SELECT 2) SELECT * FROM t").contains("more than once"));
+    assert!(error(&db, "WITH t(a, b) AS (SELECT 1) SELECT * FROM t").contains("names are given"));
+    // Without RECURSIVE, a CTE can't see itself.
+    assert!(error(&db, "WITH t AS (SELECT 1 UNION SELECT n FROM t) SELECT * FROM t").contains("no such table"));
+}
+
+#[test]
+fn recursive_queries() {
+    let (_dir, db) = open("recursive");
+    assert_eq!(
+        query(
+            &db,
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT sum(i), count(*) FROM n"
+        ),
+        rows![[15, 5]]
+    );
+    // An endless query stops at the LIMIT above it.
+    assert_eq!(
+        query(&db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i * 2 FROM n) SELECT i FROM n LIMIT 4"),
+        rows![[1], [2], [4], [8]]
+    );
+    // Walking a tree, with depth and path.
+    run(
+        &db,
+        "CREATE TABLE staff (id INTEGER PRIMARY KEY, name TEXT, boss INTEGER);
+         INSERT INTO staff VALUES (1, 'ceo', NULL), (2, 'cto', 1), (3, 'cfo', 1), (4, 'dev', 2), (5, 'intern', 4)",
+    );
+    assert_eq!(
+        query(
+            &db,
+            "WITH RECURSIVE chain AS (
+                 SELECT id, name, 0 AS depth, name AS path FROM staff WHERE boss IS NULL
+                 UNION ALL
+                 SELECT s.id, s.name, c.depth + 1, c.path || '/' || s.name FROM staff s JOIN chain c ON s.boss = c.id
+             )
+             SELECT name, depth, path FROM chain ORDER BY depth, name"
+        ),
+        rows![
+            ["ceo", 0, "ceo"],
+            ["cfo", 1, "ceo/cfo"],
+            ["cto", 1, "ceo/cto"],
+            ["dev", 2, "ceo/cto/dev"],
+            ["intern", 3, "ceo/cto/dev/intern"],
+        ]
+    );
+    // UNION drops rows already found, so a cycle ends.
+    run(&db, "CREATE TABLE edges (a INTEGER, b INTEGER); INSERT INTO edges VALUES (1, 2), (2, 3), (3, 1), (3, 4)");
+    assert_eq!(
+        query(
+            &db,
+            "WITH RECURSIVE reach(n) AS (SELECT 1 UNION SELECT b FROM edges JOIN reach ON a = n)
+             SELECT n FROM reach ORDER BY n"
+        ),
+        rows![[1], [2], [3], [4]]
+    );
+    // A recursive CTE used beside a plain one, and inside a subquery.
+    assert_eq!(
+        query(
+            &db,
+            "WITH RECURSIVE days(d) AS (SELECT DATE '2024-02-27' UNION ALL SELECT d + INTERVAL '1 day' FROM days WHERE d < '2024-03-01'),
+                  wanted AS (SELECT d FROM days WHERE d >= '2024-02-29')
+             SELECT (SELECT count(*) FROM days), d FROM wanted ORDER BY d"
+        ),
+        rows![[4, "2024-02-29"], [4, "2024-03-01"]]
+    );
+
+    assert!(
+        error(&db, "WITH RECURSIVE t(n) AS (SELECT n FROM t UNION SELECT 1) SELECT * FROM t")
+            .contains("only the last part")
+    );
+    assert!(
+        error(&db, "WITH RECURSIVE t(n) AS (SELECT 1 EXCEPT SELECT n FROM t) SELECT * FROM t").contains("anchor UNION")
+    );
+    assert!(
+        error(&db, "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT 1, 2 FROM t) SELECT * FROM t")
+            .contains("same number")
+    );
+    assert!(
+        error(
+            &db,
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT b FROM edges WHERE a IN (SELECT n FROM t)) SELECT * FROM t"
+        )
+        .contains("not in a subquery")
+    );
+}
+
+#[test]
+fn window_functions() {
+    let (_dir, db) = open("windows");
+    run(
+        &db,
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, rep TEXT, amount INTEGER);
+         INSERT INTO sales (region, rep, amount) VALUES
+             ('east', 'ann', 100), ('east', 'bob', 300), ('east', 'cat', 300), ('east', 'dan', 50),
+             ('west', 'eve', 200), ('west', 'fay', 400), ('west', 'gus', 100)",
+    );
+    // Ranking within partitions.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT rep, row_number() OVER w, rank() OVER w, dense_rank() OVER w, ntile(2) OVER w
+             FROM sales WINDOW w AS (PARTITION BY region ORDER BY amount DESC) ORDER BY region, 2"
+        ),
+        rows![
+            ["bob", 1, 1, 1, 1],
+            ["cat", 2, 1, 1, 1],
+            ["ann", 3, 3, 2, 2],
+            ["dan", 4, 4, 3, 2],
+            ["fay", 1, 1, 1, 1],
+            ["eve", 2, 2, 2, 1],
+            ["gus", 3, 3, 3, 2],
+        ]
+    );
+    // Aggregates over the partition, running totals (peers included), and a sliding frame.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT rep, sum(amount) OVER (PARTITION BY region), count(*) OVER (),
+                    sum(amount) OVER (ORDER BY amount),
+                    avg(amount) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+             FROM sales ORDER BY id"
+        ),
+        rows![
+            ["ann", 750, 7, 250, 200.0],
+            ["bob", 750, 7, 1050, 700.0 / 3.0],
+            ["cat", 750, 7, 1050, 650.0 / 3.0],
+            ["dan", 750, 7, 50, 550.0 / 3.0],
+            ["eve", 700, 7, 450, 650.0 / 3.0],
+            ["fay", 700, 7, 1450, 700.0 / 3.0],
+            ["gus", 700, 7, 250, 250.0],
+        ]
+    );
+    // Neighbours and frame values.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT rep, lag(rep) OVER o, lead(amount, 2, 0) OVER o, first_value(rep) OVER o,
+                    last_value(rep) OVER (o ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING), nth_value(rep, 2) OVER o
+             FROM sales WHERE region = 'west' WINDOW o AS (ORDER BY id)"
+        ),
+        rows![
+            ["eve", NULL, 100, "eve", "gus", NULL],
+            ["fay", "eve", 0, "eve", "gus", "fay"],
+            ["gus", "fay", 0, "eve", "gus", "fay"],
+        ]
+    );
+    // Over grouped rows, in ORDER BY, and with percent_rank/cume_dist.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT region, sum(amount) AS total, rank() OVER (ORDER BY sum(amount) DESC), sum(sum(amount)) OVER ()
+             FROM sales GROUP BY region ORDER BY rank() OVER (ORDER BY sum(amount) DESC)"
+        ),
+        rows![["east", 750, 1, 1450], ["west", 700, 2, 1450]]
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT percent_rank() OVER (ORDER BY amount), cume_dist() OVER (ORDER BY amount) FROM sales WHERE region = 'east' ORDER BY id"
+        ),
+        rows![[1.0 / 3.0, 0.5], [2.0 / 3.0, 1.0], [2.0 / 3.0, 1.0], [0.0, 0.25]]
+    );
+    // Filtering on a window value takes a query around it.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT region, rep FROM (SELECT region, rep, row_number() OVER (PARTITION BY region ORDER BY amount DESC, rep) AS n FROM sales) AS ranked
+             WHERE n = 1 ORDER BY region"
+        ),
+        rows![["east", "bob"], ["west", "fay"]]
+    );
+    let explain = query(&db, "EXPLAIN SELECT rank() OVER (ORDER BY amount) FROM sales");
+    assert!(format!("{explain:?}").contains("WINDOW"), "{explain:?}");
+
+    assert!(
+        error(&db, "SELECT rep FROM sales WHERE rank() OVER (ORDER BY amount) = 1").contains("only in the select list")
+    );
+    assert!(error(&db, "SELECT sum(rank() OVER (ORDER BY amount)) FROM sales").contains("only in the select list"));
+    assert!(error(&db, "SELECT upper(rep) OVER () FROM sales").contains("not a window function"));
+    assert!(error(&db, "SELECT rank() OVER nope FROM sales").contains("no such window"));
+    assert!(error(&db, "SELECT ntile(0) OVER () FROM sales").contains("positive integer"));
+    assert!(error(&db, "SELECT rank(amount) OVER () FROM sales").contains("wrong number of arguments"));
+    assert!(
+        error(&db, "SELECT sum(amount) OVER (ORDER BY id RANGE 1 PRECEDING) FROM sales")
+            .contains("RANGE with an offset")
+    );
+    assert!(error(&db, "SELECT region, rank() OVER (ORDER BY amount) FROM sales GROUP BY region").contains("GROUP BY"));
+}
+
+#[test]
+fn check_constraints() {
+    let (dir, db) = open("checks");
+    run(
+        &db,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, price REAL CHECK (price > 0), qty INTEGER DEFAULT 0,
+             name TEXT, CONSTRAINT stock CHECK (qty >= 0 AND qty <= 1000), CHECK (length(name) > 1))",
+    );
+    run(&db, "INSERT INTO items (price, qty, name) VALUES (9.5, 3, 'pen')");
+    // NULL is unknown, which passes.
+    run(&db, "INSERT INTO items (price, name) VALUES (NULL, NULL)");
+    assert!(
+        error(&db, "INSERT INTO items (price, name) VALUES (0, 'cup')")
+            .contains("CHECK constraint failed: items: price > 0")
+    );
+    assert!(
+        error(&db, "INSERT INTO items (price, qty, name) VALUES (1, -1, 'cup')")
+            .contains("CHECK constraint failed: stock")
+    );
+    assert!(error(&db, "UPDATE items SET qty = 5000 WHERE id = 1").contains("stock"));
+    assert!(error(&db, "INSERT INTO items (price, name) VALUES (1, 'x')").contains("length(name) > 1"));
+    assert_eq!(query(&db, "SELECT count(*) FROM items WHERE price IS NOT NULL"), rows![[1]]);
+    assert!(error(&db, "CREATE TABLE bad (n INTEGER CHECK (sum(n) > 0))").contains("aggregate"));
+    assert!(error(&db, "CREATE TABLE bad (n INTEGER CHECK (m > 0))").contains("no such column"));
+    assert!(error(&db, "CREATE TABLE bad (n INTEGER CHECK (n > (SELECT 1)))").contains("subquery"));
+
+    // ALTER TABLE keeps checks working, and checks existing rows for new ones.
+    run(&db, "ALTER TABLE items RENAME COLUMN price TO cost");
+    assert!(error(&db, "INSERT INTO items (cost, name) VALUES (-3, 'cup')").contains("cost > 0"));
+    assert!(error(&db, "ALTER TABLE items DROP COLUMN qty").contains("CHECK"));
+    assert!(error(&db, "ALTER TABLE items ADD COLUMN weight INTEGER DEFAULT 0 CHECK (weight > 0)").contains("CHECK"));
+    run(&db, "ALTER TABLE items ADD COLUMN weight INTEGER DEFAULT 1 CHECK (weight > 0)");
+
+    // Constraints survive a reopen and show in the schema.
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    let schema = db.schema("items").unwrap().unwrap();
+    assert!(schema.contains("CONSTRAINT stock CHECK ((qty >= 0) AND (qty <= 1000))"), "{schema}");
+    assert!(error(&db, "INSERT INTO items (cost, name, weight) VALUES (1, 'cup', 0)").contains("weight > 0"));
+}
+
+#[test]
+fn foreign_keys() {
+    let (dir, db) = open("fks");
+    run(
+        &db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users ON DELETE CASCADE, total REAL);
+         CREATE TABLE notes (id INTEGER PRIMARY KEY, order_id INTEGER, author TEXT,
+             FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE SET NULL,
+             CONSTRAINT by_email FOREIGN KEY (author) REFERENCES users (email) ON UPDATE CASCADE);
+         INSERT INTO users VALUES (1, 'a@x'), (2, 'b@x');
+         INSERT INTO orders VALUES (10, 1, 5.0), (11, 1, 7.5), (12, 2, 1.0);
+         INSERT INTO notes VALUES (100, 10, 'a@x'), (101, 12, 'b@x'), (102, NULL, NULL)",
+    );
+    // References must exist; NULL refers to nothing.
+    assert!(
+        error(&db, "INSERT INTO orders VALUES (13, 99, 1.0)")
+            .contains("FOREIGN KEY constraint failed: orders(user_id) references users(id)")
+    );
+    assert!(error(&db, "UPDATE orders SET user_id = 3 WHERE id = 10").contains("FOREIGN KEY"));
+    assert!(error(&db, "INSERT INTO notes (order_id, author) VALUES (10, 'z@x')").contains("by_email"));
+    run(&db, "INSERT INTO orders VALUES (13, NULL, 2.0)");
+
+    // ON UPDATE CASCADE through a unique column; NO ACTION refuses to orphan rows.
+    run(&db, "UPDATE users SET email = 'a@y' WHERE id = 1");
+    assert_eq!(query(&db, "SELECT author FROM notes WHERE id = 100"), rows![["a@y"]]);
+    assert!(error(&db, "UPDATE users SET id = 5 WHERE id = 2").contains("still referenced by orders(user_id)"));
+
+    // ON DELETE CASCADE, which sets off ON DELETE SET NULL further down.
+    assert!(error(&db, "DELETE FROM users WHERE id = 1").contains("still referenced by by_email"));
+    run(&db, "UPDATE notes SET author = NULL WHERE id = 100");
+    run(&db, "DELETE FROM users WHERE id = 1");
+    assert_eq!(query(&db, "SELECT id FROM orders ORDER BY id"), rows![[12], [13]]);
+    assert_eq!(query(&db, "SELECT id, order_id FROM notes ORDER BY id"), rows![[100, NULL], [101, 12], [102, NULL]]);
+    // A failed statement leaves everything as it was.
+    assert!(error(&db, "DELETE FROM users").contains("still referenced by by_email"));
+    assert_eq!(query(&db, "SELECT count(*) FROM orders"), rows![[2]]);
+
+    // A table referring to itself: rows of one statement may refer to each other.
+    run(
+        &db,
+        "CREATE TABLE staff (id INTEGER PRIMARY KEY, boss INTEGER REFERENCES staff (id) ON DELETE CASCADE ON UPDATE CASCADE);
+         INSERT INTO staff VALUES (2, 1), (1, NULL), (3, 2), (4, 3)",
+    );
+    run(&db, "UPDATE staff SET id = id + 10");
+    assert_eq!(query(&db, "SELECT id, boss FROM staff ORDER BY id"), rows![[11, NULL], [12, 11], [13, 12], [14, 13]]);
+    run(&db, "DELETE FROM staff WHERE id = 12");
+    assert_eq!(query(&db, "SELECT id FROM staff"), rows![[11]]);
+
+    // Upserts and RESTRICT.
+    run(
+        &db,
+        "CREATE TABLE tags (name TEXT PRIMARY KEY); CREATE TABLE tagged (tag TEXT REFERENCES tags ON DELETE RESTRICT)",
+    );
+    run(&db, "INSERT INTO tags VALUES ('red'); INSERT INTO tagged VALUES ('red')");
+    assert!(error(&db, "INSERT INTO tagged VALUES ('blue') ON CONFLICT DO NOTHING").contains("FOREIGN KEY"));
+    assert!(error(&db, "DELETE FROM tags").contains("still referenced"));
+
+    // Schema rules.
+    assert!(error(&db, "DROP TABLE users").contains("referenced by a foreign key of"));
+    assert!(error(&db, "ALTER TABLE orders DROP COLUMN user_id").contains("foreign key"));
+    assert!(
+        error(&db, "CREATE TABLE bad (x INTEGER REFERENCES orders (total))").contains("not a primary key or unique")
+    );
+    assert!(error(&db, "CREATE TABLE bad (x INTEGER REFERENCES nowhere)").contains("no such table"));
+    assert!(
+        error(&db, "CREATE TABLE bad (x INTEGER, y INTEGER, FOREIGN KEY (x, y) REFERENCES users)")
+            .contains("references 1")
+    );
+    run(&db, "ALTER TABLE users RENAME TO people; ALTER TABLE people RENAME COLUMN id TO pid");
+    assert!(db.schema("orders").unwrap().unwrap().contains("REFERENCES people (pid) ON DELETE CASCADE"));
+    assert!(error(&db, "INSERT INTO orders VALUES (20, 77, 1.0)").contains("references people(pid)"));
+
+    // Survives a reopen.
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    run(&db, "INSERT INTO orders VALUES (20, 2, 1.0)");
+    assert!(error(&db, "INSERT INTO orders VALUES (21, 77, 1.0)").contains("FOREIGN KEY"));
+    run(&db, "UPDATE notes SET author = NULL; DELETE FROM people WHERE pid = 2");
+    assert_eq!(query(&db, "SELECT count(*) FROM orders WHERE user_id IS NOT NULL"), rows![[0]]);
+}
+
+#[test]
+fn views() {
+    let (dir, db) = open("views");
+    shop(&db);
+    run(
+        &db,
+        "CREATE VIEW spenders (user_id, spent) AS
+             SELECT user_id, sum(total) FROM orders GROUP BY user_id;
+         CREATE VIEW big_spenders AS SELECT u.name, s.spent FROM users u JOIN spenders s ON s.user_id = u.id WHERE s.spent > 100",
+    );
+    // A view reads like a table, sees later changes, and can be used anywhere a table can.
+    let direct = query(
+        &db,
+        "SELECT name, sum(total) FROM users JOIN orders ON orders.user_id = users.id
+         GROUP BY name HAVING sum(total) > 100 ORDER BY name",
+    );
+    assert_eq!(query(&db, "SELECT name, spent FROM big_spenders ORDER BY name"), direct);
+    run(&db, "INSERT INTO orders (user_id, total) VALUES (2, 1000)");
+    assert_eq!(query(&db, "SELECT name FROM big_spenders ORDER BY name"), rows![["Alan"], ["Grace"]]);
+    assert_eq!(
+        query(&db, "WITH t AS (SELECT max(spent) AS m FROM spenders) SELECT count(*) FROM spenders, t WHERE spent = m"),
+        rows![[1]]
+    );
+    assert!(error(&db, "INSERT INTO spenders VALUES (1, 2)").contains("is a view"));
+    assert!(error(&db, "CREATE VIEW spenders AS SELECT 1").contains("already exists"));
+    assert!(error(&db, "CREATE TABLE spenders (x INTEGER)").contains("view named spenders"));
+    assert!(error(&db, "CREATE VIEW users AS SELECT 1").contains("table named users"));
+    assert!(error(&db, "CREATE VIEW bad (a, b) AS SELECT 1").contains("names are given"));
+    assert!(error(&db, "CREATE VIEW bad AS SELECT * FROM nowhere").contains("no such table"));
+    // OR REPLACE, but not into a loop.
+    assert!(error(&db, "CREATE OR REPLACE VIEW spenders AS SELECT * FROM big_spenders").contains("refer to itself"));
+    run(
+        &db,
+        "CREATE OR REPLACE VIEW spenders (user_id, spent) AS SELECT user_id, count(*) FROM orders GROUP BY user_id",
+    );
+    assert!(query(&db, "SELECT count(*) FROM big_spenders WHERE spent > 100") == rows![[0]]);
+
+    // Survives a reopen, and shows in the schema.
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(
+        db.schema("spenders").unwrap().unwrap(),
+        "CREATE VIEW spenders (user_id, spent) AS SELECT user_id, count(*) FROM orders GROUP BY user_id;"
+    );
+    assert_eq!(db.view_names().unwrap(), vec!["big_spenders", "spenders"]);
+    run(&db, "DROP VIEW big_spenders; DROP VIEW IF EXISTS big_spenders");
+    assert!(error(&db, "SELECT * FROM big_spenders").contains("no such table"));
+    assert!(error(&db, "DROP VIEW big_spenders").contains("no such view"));
+}
+
+#[test]
+fn savepoints() {
+    let (_dir, db) = open("savepoints");
+    run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    let mut s = db.session();
+    assert!(s.execute("SAVEPOINT a").unwrap_err().to_string().contains("need a transaction"));
+    for sql in [
+        "BEGIN",
+        "INSERT INTO t (v) VALUES ('kept')",
+        "SAVEPOINT a",
+        "INSERT INTO t (v) VALUES ('undone')",
+        "SAVEPOINT b",
+        "UPDATE t SET v = 'changed'",
+        "ROLLBACK TO b",
+    ] {
+        s.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let rows = s.query("SELECT v FROM t ORDER BY id", &[]).unwrap().rows;
+    assert_eq!(rows, rows![["kept"], ["undone"]]);
+    // ROLLBACK TO keeps the savepoint; savepoints after it are gone.
+    s.execute("INSERT INTO t (v) VALUES ('x')").unwrap();
+    s.execute("ROLLBACK TO SAVEPOINT a").unwrap();
+    assert!(s.execute("RELEASE b").unwrap_err().to_string().contains("no such savepoint"));
+    s.execute("INSERT INTO t (v) VALUES ('after')").unwrap();
+    s.execute("ROLLBACK TO a").unwrap();
+    s.execute("INSERT INTO t (v) VALUES ('last')").unwrap();
+    s.execute("RELEASE SAVEPOINT a").unwrap();
+    assert!(s.execute("ROLLBACK TO a").unwrap_err().to_string().contains("no such savepoint"));
+    s.execute("COMMIT").unwrap();
+    assert_eq!(query(&db, "SELECT v FROM t ORDER BY id"), rows![["kept"], ["last"]]);
+    // A whole ROLLBACK still undoes everything, savepoints or not.
+    s.execute("BEGIN").unwrap();
+    s.execute("SAVEPOINT a").unwrap();
+    s.execute("DELETE FROM t").unwrap();
+    s.execute("RELEASE a").unwrap();
+    s.execute("ROLLBACK").unwrap();
+    assert_eq!(query(&db, "SELECT count(*) FROM t"), rows![[2]]);
+}

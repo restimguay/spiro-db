@@ -171,7 +171,6 @@ pub fn encode_row(row: &[Value]) -> Vec<u8> {
 }
 
 /// Decodes a row, padding it with NULLs to `width` columns.
-#[cfg(test)]
 pub fn decode_row(data: &[u8], width: usize) -> Result<Vec<Value>> {
     let mut row = Vec::with_capacity(width);
     decode_row_into(data, width, None, &mut row)?;
